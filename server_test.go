@@ -8,7 +8,13 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+func initTest() {
+	// Import "os" at the top of your file if not already imported
+	isTerminal = true
+}
+
 func TestServerConnection(t *testing.T) {
+	initTest()
 	server := NewServer()
 	go server.Start(":5672")
 	time.Sleep(100 * time.Millisecond)
@@ -27,6 +33,7 @@ func TestServerConnection(t *testing.T) {
 }
 
 func TestServerExchangeDeclare(t *testing.T) {
+	initTest()
 	server := NewServer()
 	go server.Start(":5673")
 	time.Sleep(100 * time.Millisecond)
@@ -58,6 +65,7 @@ func TestServerExchangeDeclare(t *testing.T) {
 }
 
 func TestServerQueueDeclare(t *testing.T) {
+	initTest()
 	server := NewServer()
 	go server.Start(":5674")
 	time.Sleep(100 * time.Millisecond)
@@ -88,6 +96,7 @@ func TestServerQueueDeclare(t *testing.T) {
 }
 
 func TestServerPublishConsume(t *testing.T) {
+	initTest()
 	server := NewServer()
 	go server.Start(":5675")
 	time.Sleep(100 * time.Millisecond)
@@ -179,6 +188,7 @@ func TestServerPublishConsume(t *testing.T) {
 }
 
 func TestServerDirectRouting(t *testing.T) {
+	initTest()
 	server := NewServer()
 	go server.Start(":5676")
 	time.Sleep(100 * time.Millisecond)
@@ -225,6 +235,10 @@ func TestServerDirectRouting(t *testing.T) {
 		t.Fatalf("Failed to consume from queue2: %v", err)
 	}
 
+	// Give consumers time to register
+	time.Sleep(50 * time.Millisecond)
+
+	// Publish messages
 	err = ch.Publish("", "key1", false, false, amqp.Publishing{
 		Body: []byte("Message for queue1"),
 	})
@@ -239,21 +253,35 @@ func TestServerDirectRouting(t *testing.T) {
 		t.Fatalf("Failed to publish to key2: %v", err)
 	}
 
-	select {
-	case msg := <-msgs1:
-		if string(msg.Body) != "Message for queue1" {
-			t.Fatalf("Unexpected message in queue1: %s", string(msg.Body))
+	// Wait for messages with timeout
+	timeout := time.After(500 * time.Millisecond)
+	var msg1Received, msg2Received bool
+
+	for !msg1Received || !msg2Received {
+		select {
+		case msg := <-msgs1:
+			if string(msg.Body) == "Message for queue1" {
+				msg1Received = true
+				t.Logf("Received message in queue1: %s", string(msg.Body))
+			} else {
+				t.Errorf("Unexpected message in queue1: %s", string(msg.Body))
+			}
+		case msg := <-msgs2:
+			if string(msg.Body) == "Message for queue2" {
+				msg2Received = true
+				t.Logf("Received message in queue2: %s", string(msg.Body))
+			} else {
+				t.Errorf("Unexpected message in queue2: %s", string(msg.Body))
+			}
+		case <-timeout:
+			if !msg1Received {
+				t.Fatal("Timeout waiting for message in queue1")
+			}
+			if !msg2Received {
+				t.Fatal("Timeout waiting for message in queue2")
+			}
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for message in queue1")
 	}
 
-	select {
-	case msg := <-msgs2:
-		if string(msg.Body) != "Message for queue2" {
-			t.Fatalf("Unexpected message in queue2: %s", string(msg.Body))
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timeout waiting for message in queue2")
-	}
+	t.Log("Both messages received successfully")
 }
