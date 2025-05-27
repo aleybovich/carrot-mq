@@ -133,3 +133,76 @@ This implementation is designed for simulation and development purposes:
 ## Development Status
 
 This is an educational project/work in progress. Not intended for production use.
+
+# Missing Features
+
+## Core Messaging
+- [ ] **Message Acknowledgments**
+  - `basic.ack` - acknowledge message delivery
+  - `basic.nack` - negative acknowledgment with requeue option
+  - `basic.reject` - reject single message
+  - Unacknowledged message tracking and redelivery
+- [ ] **Quality of Service (QoS)**
+  - `basic.qos` - prefetch count/size limits
+  - Per-consumer and per-channel flow control
+- [ ] **Additional Exchange Types**
+  - Fanout exchanges (broadcast to all bound queues)
+  - Topic exchanges (wildcard pattern matching with `*` and `#`)
+  - Headers exchanges (routing based on message headers)
+
+## Queue & Exchange Management
+- [ ] **Queue Operations**
+  - `queue.delete` - remove queues
+  - `queue.purge` - clear queue contents
+  - `queue.unbind` - remove queue bindings
+  - Auto-delete queues when last consumer disconnects
+  - Proper exclusive queue handling (per-connection isolation)
+- [ ] **Exchange Operations**
+  - `exchange.delete` - remove exchanges
+  - `exchange.bind` / `exchange.unbind` - exchange-to-exchange bindings
+
+## Reliability & Error Handling
+- [ ] **AMQP Error Codes**
+  - Proper error responses with standard AMQP reply codes
+  - Channel exceptions (close channel on recoverable errors)
+  - Connection exceptions (close connection on fatal errors)
+- [ ] **Dead Letter Exchanges**
+  - Route failed/rejected messages to alternate exchanges
+  - TTL (Time-To-Live) support for messages and queues
+- [ ] **Heartbeat Management**
+  - Connection timeout detection and automatic closure
+  - Configurable heartbeat intervals
+
+## Persistence & Durability
+- [ ] **Message Persistence**
+  - Durable queues and exchanges (survive server restart)
+  - Persistent messages (delivery mode 2)
+  - Recovery of durable entities on startup
+- [ ] **Transaction Support**
+  - `tx.select` / `tx.commit` / `tx.rollback`
+  - Atomic message publishing and acknowledgments
+
+## Advanced Features
+- [ ] **Publisher Confirms**
+  - `confirm.select` - enable publisher acknowledgments
+  - `basic.ack` for published messages
+  - Message sequence numbering
+- [ ] **Consumer Cancel Notifications**
+  - `basic.cancel` - stop consuming from queue
+  - Server-initiated consumer cancellation
+- [ ] **Connection/Channel Flow Control**
+  - `connection.blocked` / `connection.unblocked`
+  - `channel.flow` - pause/resume message delivery
+
+## Monitoring & Management
+- [ ] **Server Statistics**
+  - Queue depths, consumer counts
+  - Message rates, connection counts
+  - Memory usage monitoring
+- [ ] **Management Interface**
+  - HTTP API for queue/exchange inspection
+  - Administrative operations (queue purge, connection close)
+
+---
+
+**Priority Recommendation:** Start with message acknowledgments and QoS as they're fundamental to reliable messaging, followed by additional exchange types for routing flexibility.
