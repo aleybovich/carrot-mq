@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // colorize adds ANSI color to a string if the output is a terminal
@@ -112,6 +113,8 @@ func getMethodName(classId uint16, methodId uint16) string {
 			return "publish"
 		case MethodBasicDeliver:
 			return "deliver"
+		case MethodBasicReturn:
+			return "return"
 		}
 	}
 	return fmt.Sprintf("unknown(%d)", methodId)
@@ -122,38 +125,51 @@ func getFullMethodName(classId uint16, methodId uint16) string {
 	return fmt.Sprintf("%s.%s", getClassName(classId), getMethodName(classId, methodId))
 }
 
-func readShortString(reader *bytes.Reader) string {
+func readShortString(reader *bytes.Reader) (string, error) {
 	var length uint8
-	err := binary.Read(reader, binary.BigEndian, &length)
-	if err != nil {
-		return ""
+	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+		return "", fmt.Errorf("reading short string length: %w", err)
 	}
+
 	if length == 0 {
-		return ""
+		return "", nil // Successfully read an empty string
 	}
+
+	// Check if enough bytes are available before attempting to read.
+	// This is particularly useful if the reader is not guaranteed to block.
+	if int(length) > reader.Len() {
+		return "", fmt.Errorf("not enough data for short string: expected %d, available %d", length, reader.Len())
+	}
+
 	data := make([]byte, length)
-	n, err := reader.Read(data)
-	if err != nil || n != int(length) {
-		return ""
+	// Use io.ReadFull to ensure all 'length' bytes are read, or an error is returned.
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return "", fmt.Errorf("reading short string data (expected %d bytes): %w", length, err)
 	}
-	return string(data)
+	return string(data), nil
 }
 
-func readLongString(reader *bytes.Reader) string {
+func readLongString(reader *bytes.Reader) (string, error) {
 	var length uint32
-	err := binary.Read(reader, binary.BigEndian, &length)
-	if err != nil {
-		return ""
+	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+		return "", fmt.Errorf("reading long string length: %w", err)
 	}
+
 	if length == 0 {
-		return ""
+		return "", nil // Successfully read an empty string
 	}
+
+	// Check if enough bytes are available.
+	if int(length) > reader.Len() {
+		return "", fmt.Errorf("not enough data for long string: expected %d, available %d", length, reader.Len())
+	}
+
 	data := make([]byte, length)
-	n, err := reader.Read(data)
-	if err != nil || n != int(length) {
-		return ""
+	// Use io.ReadFull to ensure all 'length' bytes are read.
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return "", fmt.Errorf("reading long string data (expected %d bytes): %w", length, err)
 	}
-	return string(data)
+	return string(data), nil
 }
 
 func writeShortString(writer *bytes.Buffer, s string) {
@@ -220,15 +236,12 @@ func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
 		if err := binary.Read(reader, binary.BigEndian, &val); err != nil {
 			return nil, fmt.Errorf("reading decimal value: %w", err)
 		}
-		return AmqpDecimal{Scale: scale, Value: val}, nil
+		return AmqpDecimal{Scale: scale, Value: val}, nil // AmqpDecimal must be defined or imported
 	case 'S': // long-string
-		// Assuming readLongString does not return an error itself but returns "" on failure.
-		// For robust error handling, readLongString should ideally also return an error.
-		// If readLongString could fail and corrupt the reader's state, that's a deeper issue.
-		strVal := readLongString(reader)
-		// If readLongString's contract is that it might return "" for an actual empty string
-		// or "" on error, we can't distinguish here without it returning an error.
-		// We'll assume it consumes correctly or the caller of readTable handles this.
+		strVal, err := readLongString(reader)
+		if err != nil {
+			return nil, fmt.Errorf("reading long string field value: %w", err)
+		}
 		return strVal, nil
 	case 'A': // field-array
 		var arrayPayloadLength uint32
@@ -239,13 +252,14 @@ func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
 			return []interface{}{}, nil
 		}
 
-		arrayPayloadBytes := make([]byte, arrayPayloadLength)
-		n, err := io.ReadFull(reader, arrayPayloadBytes)
-		if err != nil {
-			return nil, fmt.Errorf("reading field array payload bytes (expected %d): %w", arrayPayloadLength, err)
+		// Check if enough bytes are available for the array payload.
+		if int(arrayPayloadLength) > reader.Len() {
+			return nil, fmt.Errorf("not enough data for field array payload: expected %d, available %d", arrayPayloadLength, reader.Len())
 		}
-		if n != int(arrayPayloadLength) { // Should be caught by io.ReadFull returning io.ErrUnexpectedEOF
-			return nil, fmt.Errorf("short read for field array payload: got %d, expected %d", n, arrayPayloadLength)
+
+		arrayPayloadBytes := make([]byte, arrayPayloadLength)
+		if _, err := io.ReadFull(reader, arrayPayloadBytes); err != nil { // Use io.ReadFull
+			return nil, fmt.Errorf("reading field array payload bytes (expected %d): %w", arrayPayloadLength, err)
 		}
 
 		arrayDataReader := bytes.NewReader(arrayPayloadBytes)
@@ -256,15 +270,16 @@ func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
 			if err != nil {
 				return nil, fmt.Errorf("reading type in field array: %w", err)
 			}
-			val, err := readFieldValue(arrayDataReader, valueTypeInArray) // Recursive call
-			if err != nil {
-				return nil, fmt.Errorf("reading value in field array (type %c): %w", valueTypeInArray, err)
+			val, errVal := readFieldValue(arrayDataReader, valueTypeInArray) // Recursive call
+			if errVal != nil {
+				return nil, fmt.Errorf("reading value in field array (type %c): %w", valueTypeInArray, errVal)
 			}
 			arr = append(arr, val)
 		}
-		if arrayDataReader.Len() > 0 { // Should not happen if parsing is correct
-			return arr, fmt.Errorf("field array parsing finished with %d unconsumed bytes in array payload", arrayDataReader.Len())
-		}
+		// This check might be redundant if arrayPayloadLength was honored correctly.
+		// if arrayDataReader.Len() > 0 {
+		// 	return arr, fmt.Errorf("field array parsing finished with %d unconsumed bytes in array payload", arrayDataReader.Len())
+		// }
 		return arr, nil
 	case 'T': // timestamp (uint64 - seconds since Epoch)
 		var val uint64
@@ -274,8 +289,7 @@ func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
 		}
 		return val, nil
 	case 'F': // nested field-table
-		// readTable will now return (map[string]interface{}, error)
-		nestedTable, err := readTable(reader) // Recursive call
+		nestedTable, err := readTable(reader) // Recursive call, readTable itself needs to be in scope
 		if err != nil {
 			return nil, fmt.Errorf("reading nested field table: %w", err)
 		}
@@ -288,13 +302,14 @@ func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
 		if length == 0 {
 			return []byte{}, nil
 		}
-		data := make([]byte, length)
-		n, err := io.ReadFull(reader, data)
-		if err != nil {
-			return nil, fmt.Errorf("reading byte array data (expected %d): %w", length, err)
+
+		if int(length) > reader.Len() {
+			return nil, fmt.Errorf("not enough data for byte array: expected %d, available %d", length, reader.Len())
 		}
-		if n != int(length) { // Should be caught by io.ReadFull
-			return nil, fmt.Errorf("short read for byte array data: got %d, expected %d", n, length)
+
+		data := make([]byte, length)
+		if _, err := io.ReadFull(reader, data); err != nil { // Use io.ReadFull
+			return nil, fmt.Errorf("reading byte array data (expected %d): %w", length, err)
 		}
 		return data, nil
 	case 'V': // void
@@ -375,34 +390,184 @@ func writeFieldValue(writer *bytes.Buffer, value interface{}) error {
 	return nil
 }
 
-func topicMatchHelper(patternParts []string, routingParts []string) bool {
-	if len(patternParts) == 0 {
-		return len(routingParts) == 0
+// topicMatch checks if a topic pattern matches a routing key
+// Supports AMQP wildcards: * (exactly one word) and # (zero or more words)
+func topicMatch(pattern string, routingKey string) bool {
+	// Handle empty pattern case - only matches empty routing key
+	if pattern == "" {
+		return routingKey == ""
 	}
 
-	i, j := 0, 0
-	for i < len(patternParts) && j < len(routingParts) {
-		if patternParts[i] == "#" {
-			if i == len(patternParts)-1 {
-				return true
-			}
-			for k := j; k <= len(routingParts); k++ {
-				if topicMatchHelper(patternParts[i+1:], routingParts[k:]) {
-					return true
+	// Handle single # pattern - matches everything
+	if pattern == "#" {
+		return true
+	}
+
+	// Split into parts
+	patternParts := strings.Split(pattern, ".")
+	routingParts := strings.Split(routingKey, ".")
+
+	// Handle empty routing key after split
+	// strings.Split("", ".") returns [""], but we want []
+	if routingKey == "" {
+		routingParts = []string{}
+	}
+
+	return matchParts(patternParts, routingParts)
+}
+
+// matchParts performs iterative matching with backtracking for #
+func matchParts(patternParts, routingParts []string) bool {
+	// Stack for backtracking: stores (patternIndex, routingIndex)
+	type state struct {
+		pi, ri int
+	}
+	stack := []state{{0, 0}}
+
+	for len(stack) > 0 {
+		// Pop from stack
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		pi, ri := current.pi, current.ri
+
+		// Success condition: consumed all parts
+		if pi >= len(patternParts) && ri >= len(routingParts) {
+			return true
+		}
+
+		// If pattern is exhausted but routing key isn't
+		if pi >= len(patternParts) {
+			continue // This path didn't match
+		}
+
+		// If routing key is exhausted but pattern isn't
+		if ri >= len(routingParts) {
+			// Check if remaining pattern parts are all #
+			allHash := true
+			for i := pi; i < len(patternParts); i++ {
+				if patternParts[i] != "#" {
+					allHash = false
+					break
 				}
 			}
-			return false
-		} else if patternParts[i] == "*" {
-			i++
-			j++
-		} else if patternParts[i] == routingParts[j] {
-			i++
-			j++
-		} else {
-			return false
+			if allHash {
+				return true
+			}
+			continue
+		}
+
+		pattern := patternParts[pi]
+
+		switch pattern {
+		case "#":
+			// Try matching # with different number of words (0 to remaining)
+			// Add states in reverse order so we try matching MORE words first
+			// This is just a search strategy - either order works for correctness
+			for i := len(routingParts); i >= ri; i-- {
+				stack = append(stack, state{pi + 1, i})
+			}
+
+		case "*":
+			// * matches exactly one word (even if empty)
+			// Following common AMQP implementations where * can match empty segments
+			stack = append(stack, state{pi + 1, ri + 1})
+
+		default:
+			// Literal match required (including empty strings)
+			if pattern == routingParts[ri] {
+				stack = append(stack, state{pi + 1, ri + 1})
+			}
 		}
 	}
 
-	return (i == len(patternParts) && j == len(routingParts)) ||
-		(i == len(patternParts)-1 && patternParts[i] == "#" && j == len(routingParts))
+	return false
+}
+
+func readTable(reader *bytes.Reader) (map[string]interface{}, error) {
+	var tablePayloadLength uint32
+	if err := binary.Read(reader, binary.BigEndian, &tablePayloadLength); err != nil {
+		return nil, fmt.Errorf("reading table payload length: %w", err)
+	}
+
+	if tablePayloadLength == 0 {
+		return make(map[string]interface{}), nil
+	}
+
+	tablePayloadBytes := make([]byte, tablePayloadLength)
+	n, err := io.ReadFull(reader, tablePayloadBytes)
+	if err != nil {
+		// err will be io.ErrUnexpectedEOF if fewer than tablePayloadLength bytes were read
+		return nil, fmt.Errorf("reading table payload bytes (expected %d, read %d): %w", tablePayloadLength, n, err)
+	}
+	// This check is redundant if io.ReadFull is used correctly, as it returns an error for short reads.
+	// if n != int(tablePayloadLength) {
+	// 	return nil, fmt.Errorf("short read for table payload: got %d, expected %d", n, tablePayloadLength)
+	// }
+
+	tableReader := bytes.NewReader(tablePayloadBytes)
+	table := make(map[string]interface{})
+
+	for tableReader.Len() > 0 {
+		// Assuming readShortString does not return an error itself.
+		// If readShortString could fail (e.g. EOF mid-string), it should return an error.
+		key, err := readShortString(tableReader)
+		if err != nil {
+			// This error means reading the key string itself failed (e.g., length byte read, but data was short).
+			return table, fmt.Errorf("malformed table: error reading field key: %w", err)
+		}
+
+		// If after reading a key, there's no more data for its value type, it's malformed.
+		if tableReader.Len() == 0 {
+			if key != "" { // We read a key but no value followed.
+				return table, fmt.Errorf("malformed table: key '%s' read but no value type followed", key)
+			}
+			// If key is "" and tableReader.Len() is 0, it might be a valid empty key at the end,
+			// or readShortString failed silently. This depends on readShortString's contract.
+			// For now, if key is "" and no more data, we assume loop termination is fine.
+			break
+		}
+
+		valueType, err := tableReader.ReadByte()
+		if err != nil {
+			return table, fmt.Errorf("reading value type for key '%s' (or after last key): %w", key, err)
+		}
+
+		value, err := readFieldValue(tableReader, valueType)
+		if err != nil {
+			return table, fmt.Errorf("reading value for key '%s' (type %c): %w", key, valueType, err)
+		}
+		table[key] = value
+	}
+
+	if tableReader.Len() > 0 {
+		// This means not all bytes of the declared table payload were consumed.
+		return table, fmt.Errorf("%d unread bytes remaining in table payload after parsing; table may be malformed or contain extra data", tableReader.Len())
+	}
+
+	return table, nil
+}
+
+func writeTable(writer *bytes.Buffer, table map[string]interface{}) error {
+	tablePayloadBuffer := &bytes.Buffer{}
+
+	for key, value := range table {
+		// Assuming writeShortString does not return an error.
+		// If it could fail, its error would need to be handled here.
+		writeShortString(tablePayloadBuffer, key)
+
+		if err := writeFieldValue(tablePayloadBuffer, value); err != nil {
+			return fmt.Errorf("serializing value for key '%s' (type %T): %w", key, value, err)
+		}
+	}
+
+	// Write the total length of the table payload first
+	if err := binary.Write(writer, binary.BigEndian, uint32(tablePayloadBuffer.Len())); err != nil {
+		return fmt.Errorf("writing table payload length: %w", err)
+	}
+	// Then write the actual table payload
+	if _, err := writer.Write(tablePayloadBuffer.Bytes()); err != nil {
+		return fmt.Errorf("writing table payload bytes: %w", err)
+	}
+	return nil
 }

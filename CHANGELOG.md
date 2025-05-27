@@ -1,5 +1,11 @@
 # Changelog
 
+## [unreleased]
+
+### Added 
+- Basic.Return for unroutable messages
+- Improved error handling for frame reading - now returns 502 SYNTAX_ERROR when fails to read
+
 ## [0.0.1] 2025-05-27
 
 ### Added
@@ -10,13 +16,14 @@
   - Direct exchange
   - Fanout exchange
   - Topic exchange with pattern matching
-  - Headers exchange (basic structure only)
+  - Headers exchange not supported 
 - Queue management:
   - Queue declaration with durable, exclusive, and auto-delete flags
   - Queue binding to exchanges
 - Message handling:
   - Basic.Publish
   - Basic.Consume
+  - Basic.Return for unroutable messages
   - Message delivery to consumers
   - Support for mandatory and immediate flags (structure only)
 - Topic exchange pattern matching with # and * wildcards
@@ -36,7 +43,6 @@
 - Basic.Get
 - Basic.Ack/Nack/Reject
 - Basic.Recover
-- Basic.Return for unroutable messages
 - Channel flow control
 - Heartbeat monitoring
 - SSL/TLS support

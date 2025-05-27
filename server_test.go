@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1137,5 +1138,502 @@ func TestServerPublishConsume(t *testing.T) {
 		assert.Equal(t, body, string(msg.Body), "Message content should match")
 	case <-time.After(2 * time.Second):
 		assert.Fail(t, "Timeout waiting for message in PubCons test")
+	}
+}
+
+func TestTopicMatching_Comprehensive(t *testing.T) {
+	testCases := []struct {
+		name        string
+		pattern     string
+		routingKey  string
+		shouldMatch bool
+	}{
+		// Exact Matches
+		{"ExactMatch_Simple", "stock.usd.nyse", "stock.usd.nyse", true},
+		{"ExactMatch_SingleWord", "logs", "logs", true},
+		{"ExactMismatch_Simple", "stock.usd.nyse", "stock.eur.nyse", false},
+		{"ExactMismatch_Length_PatternShorter", "stock.usd", "stock.usd.nyse", false}, // Corrected based on previous failure
+		{"ExactMismatch_Length_KeyShorter", "stock.usd.nyse", "stock.usd", false},
+
+		// Star (*) Wildcard
+		{"Star_MatchMiddle", "stock.*.nyse", "stock.usd.nyse", true},
+		{"Star_MatchEnd", "stock.usd.*", "stock.usd.nyse", true},
+		{"Star_MatchStart", "*.usd.nyse", "stock.usd.nyse", true},
+		{"Star_Multiple", "*.usd.*", "stock.usd.nyse", true},
+		{"Star_MismatchMiddle", "stock.*.nyse", "stock.eur.nasdaq", false},
+		{"Star_MismatchTooFewPartsForStar_PatternNeeds3_KeyHas2", "stock.*.nyse", "stock.nyse", false},
+		{"Star_MismatchTooManyPartsForStar_PatternNeeds3_KeyHas4", "stock.*.nyse", "stock.usd.nyse.fast", false}, // Corrected
+		{"Star_OnlyStar_MatchOneWord", "*", "word", true},
+		{"Star_OnlyStar_MismatchTwoWords", "*", "word.another", false}, // Corrected
+		{"Star_OnlyStar_MismatchEmptyWordFromSplit", "*", "", false},   // routingKey="" -> routingParts=[]
+		{"Star_AdjacentStars", "a.*.*.d", "a.b.c.d", true},
+		{"Star_AdjacentStars_MismatchNotEnoughParts", "a.*.*.d", "a.b.d", false},
+
+		// Hash (#) Wildcard
+		{"Hash_MatchEnd_ZeroWords_AfterDot", "stock.usd.#", "stock.usd", true},
+		{"Hash_MatchEnd_OneWord_AfterDot", "stock.usd.#", "stock.usd.nyse", true},
+		{"Hash_MatchEnd_MultipleWords_AfterDot", "stock.usd.#", "stock.usd.nyse.fast.quotes", true},
+		{"Hash_MatchStart_ZeroWords_BeforeDot", "#.nyse", "nyse", true},
+		{"Hash_MatchStart_OneWord_BeforeDot", "#.usd.nyse", "stock.usd.nyse", true},
+		{"Hash_MatchStart_MultipleWords_BeforeDot", "#.nyse.fast.quotes", "stock.usd.nyse.fast.quotes", true},
+		{"Hash_MatchOnlyHash_AnyWords", "#", "anything.goes.here", true},
+		{"Hash_MatchOnlyHash_SingleWord", "#", "word", true},
+		{"Hash_MatchOnlyHash_EmptyRoutingKey", "#", "", true},
+		{"Hash_NoMatch_HashRequiresPrefixMatch", "stock.#", "other.usd", false},
+		{"Hash_NoMatch_HashRequiresSuffixMatch", "#.quotes", "stock.usd.nyse", false},
+		{"Hash_PatternIsJustWord_KeyIsEmpty", "word", "", false},
+
+		// Hash (#) in the Middle
+		{"Hash_Middle_MultipleWords", "a.#.d", "a.b.c.d", true},
+		{"Hash_Middle_OneWord", "a.#.d", "a.b.d", true},
+		{"Hash_Middle_ZeroWords", "a.#.d", "a.d", true},
+		{"Hash_Middle_NoMatchPrefix", "a.#.d", "x.b.c.d", false},
+		{"Hash_Middle_NoMatchSuffix", "a.#.d", "a.b.c.y", false},
+		{"Hash_Middle_NoMatchTooShort_KeyIsAPrefix", "a.#.d", "a", false},
+		{"Hash_Middle_NoMatchTooShort_KeyIsEmpty", "a.#.d", "", false},
+
+		// Combinations of Star and Hash
+		{"Combo_StarHash_KeyHasMoreForHash", "*.usd.#", "stock.usd.nyse.fast", true},
+		{"Combo_StarHash_HashMatchesZero", "*.usd.#", "stock.usd", true},
+		{"Combo_StarHash_PatternMoreSpecific", "stock.*.#", "stock.usd.nyse", true},
+		{"Combo_StarHash_PatternMoreSpecific_HashMatchesZero", "stock.*.#", "stock.usd", true},
+		{"Combo_HashStar_HashMatchesMultiple", "#.usd.*", "stock.eur.usd.nyse", true},
+		{"Combo_HashStar_HashMatchesOne", "#.usd.*", "stock.usd.nyse", true},
+		{"Combo_HashStar_HashMatchesZero", "#.usd.*", "usd.nyse", true},
+		{"Combo_Complex_HashStarHash", "a.#.c.*.e.#.g", "a.b.c.d.e.f.g", true},
+		{"Combo_Complex_HashStarHash_Zeroes", "a.#.c.*.e.#.g", "a.c.d.e.g", true},
+		{"Combo_StarHashStar", "*.*.#", "a.b.c.d", true},
+		{"Combo_StarHashStar_HashMatchesZero", "*.*.#", "a.b", true},
+		{"Combo_NoMatch_StarHash_StarFails", "*.eur.#", "stock.usd.nyse", false},
+
+		// Edge Cases with Empty Parts due to Dots
+		{"Edge_EmptyPattern_EmptyKey", "", "", true},
+		{"Edge_EmptyPattern_NonEmptyKey", "", "a.b", false},
+		{"Edge_NonEmptyPattern_EmptyKey", "a.b", "", false},
+		{"Edge_PatternWithDot_KeyWithout", "a.b", "ab", false},
+
+		{"Edge_KeyEndsWithDot_PatternShorter", "a.b", "a.b.", false}, // Corrected
+		{"Edge_PatternEndsWithDot_KeyMatchesExactly", "a.b.", "a.b.", true},
+		{"Edge_PatternEndsWithDot_KeyShorter", "a.b.", "a.b", false},
+
+		{"Edge_PatternStartsWithDot_Star_NoMatch", ".*.b", "a.b", false},
+		{"Edge_PatternStartsWithDot_Star_Match", ".*.b", ".a.b", true},
+
+		{"Edge_PatternStartsWithDot_Hash_NoMatch", ".#.b", "a.b", false},
+		{"Edge_PatternStartsWithDot_Hash_Match", ".#.b", ".any.words.b", true},
+
+		{"Edge_PatternMultipleEmptyParts_Star_Match", "a.*.b", "a..b", true},
+		{"Edge_PatternMultipleEmptyParts_Star_Mismatch", "a.*.c", "a..b", false},
+
+		{"Edge_PatternMultipleDots_Star_ExplicitEmptyInPattern", "a..*.b", "a..c.b", true},
+		{"Edge_PatternMultipleDots_Hash_ExplicitEmptyInPattern", "a..#.b", "a..anything.here.b", true},
+
+		// Specific cases from your existing tests (re-verified)
+		{"Existing_logs.#_vs_logs", "logs.#", "logs", true},
+		{"Existing_*.#.error_vs_app.module.submodule.error", "*.#.error", "app.module.submodule.error", true},
+		{"Existing_*.#.error_vs_app.error", "*.#.error", "app.error", true},
+
+		// More complex cases
+		{"Complex_1", "data.asset.*.compute.#.result", "data.asset.id123.compute.analysis.final.result", true},
+		{"Complex_1_NoMatch", "data.asset.*.compute.#.result", "data.asset.id123.compute.analysis.final.wrong", false},
+		{"Complex_2_HashAtStart", "#.compute.asset.*.result", "raw.transformed.compute.asset.id456.result", true},
+		{"Complex_2_HashAtStart_NoMatch_MiddlePartFails", "#.compute.asset.*.result", "raw.transformed.asset.id456.result", false},
+		{"Complex_HashAndStarInterleaved", "v1.*.events.#.processed.*", "v1.user.events.login.success.processed.byAgentX", true},
+		{"Complex_HashAndStarInterleaved_NoMatch_MissingLastStarPart", "v1.*.events.#.processed.*", "v1.user.events.login.success.processed", false},
+
+		// --- NEW Deeper Edge Cases with Dots and Empty Segments ---
+		{"Edge_DotOnly_Pattern_DotOnly_Key", ".", ".", true},       // P["",""], K["",""]
+		{"Edge_DotOnly_Pattern_EmptyKey", ".", "", false},          // P["",""], K[]
+		{"Edge_EmptyPattern_DotOnly_Key", "", ".", false},          // P[] (or [""] if not handled by `pattern==""` check), K["",""]
+		{"Edge_DoubleDot_Pattern_DoubleDot_Key", "..", "..", true}, // P["","",""], K["","",""]
+		{"Edge_Pattern_a_dot_Key_a", "a.", "a", false},             // P["a",""], K["a"]
+		{"Edge_Pattern_dot_a_Key_a", ".a", "a", false},             // P["","a"], K["a"]
+		{"Edge_Pattern_a_Key_a_dot", "a", "a.", false},             // P["a"], K["a",""]
+		{"Edge_Pattern_a_Key_dot_a", "a", ".a", false},             // P["a"], K["","a"]
+
+		// --- Wildcards with Leading/Trailing/Multiple Dots ---
+		{"Edge_Star_With_LeadingDotPattern_MatchingKey", ".*", ".a", true},                           // P["","*"], K["","a"] -> * matches "a"
+		{"Edge_Star_With_LeadingDotPattern_NonMatchingKey", ".*", "a", false},                        // P["","*"], K["a"] -> "" != "a"
+		{"Edge_Star_With_TrailingDotPattern_MatchingKey", "*.", "a.", true},                          // P["*",""], K["a",""] -> * matches "a"
+		{"Edge_Star_With_TrailingDotPattern_NonMatchingKey", "*.", "a", false},                       // P["*",""], K["a"] -> pattern has trailing "" part, key does not.
+		{"Edge_Star_With_DoubleDotPattern_Key_a_empty_b", "*..*", "a..b", true},                      // P["*","","*"], K["a","","b"] -> 1st * matches a, 2nd * matches b
+		{"Edge_Star_With_DoubleDotPattern_Key_empty_empty_empty_IterativeMatch", "*..*", "..", true}, // P["*","","*"], K["","",""] -> * matches "", then "" literal, then * matches "".
+
+		{"Edge_Hash_With_LeadingDotPattern_MatchingKey", ".#", ".a.b", true},          // P["","#"], K["","a","b"] -> # matches "a.b"
+		{"Edge_Hash_With_LeadingDotPattern_MatchingEmptySuffix", ".#", ".", true},     // P["","#"], K["",""] -> # matches ""
+		{"Edge_Hash_With_LeadingDotPattern_NonMatchingKey", ".#", "a.b", false},       // P["","#"], K["a","b"] -> "" != "a"
+		{"Edge_Hash_With_TrailingDotPattern_MatchingKey", "#.", "a.b.", true},         // P["#",""], K["a","b",""] -> # matches "a.b"
+		{"Edge_Hash_With_TrailingDotPattern_MatchingEmptyPrefix", "#.", ".", true},    // P["#",""], K["",""] -> # matches ""
+		{"Edge_Hash_With_TrailingDotPattern_NonMatchingKey", "#.", "a.b", false},      // P["#",""], K["a","b"] -> pattern has trailing "" part, key does not.
+		{"Edge_Hash_With_DoubleDotPattern_Key_a_empty_b", "#..#", "a..b", true},       // P["#","","#"], K["a","","b"] -> 1st # matches a, 2nd # matches b
+		{"Edge_Hash_With_DoubleDotPattern_Key_empty_empty_empty", "#..#", "..", true}, // P["#","","#"], K["","",""] -> #s match empty parts
+
+		// --- Patterns consisting only of wildcards or mixed with dots ---
+		{"Edge_StarStar_Pattern_Key_ab", "*.*", "a.b", true},
+		{"Edge_StarStar_Pattern_Key_a_empty", "*.*", "a.", true}, // P["*","*"], K["a",""]
+		{"Edge_StarStar_Pattern_Key_empty_b", "*.*", ".b", true}, // P["*","*"], K["","b"]
+		{"Edge_StarStar_Pattern_Key_dot", "*.*", ".", true},      // P["*","*"], K["",""]
+		{"Edge_StarStar_Pattern_Key_a", "*.*", "a", false},       // Needs two words
+		{"Edge_StarStar_Pattern_Key_empty", "*.*", "", false},    // Needs two words
+
+		{"Edge_HashHash_Pattern_Key_ab", "#.#", "a.b", true},
+		{"Edge_HashHash_Pattern_Key_a_empty", "#.#", "a.", true}, // P["#","#"], K["a",""]
+		{"Edge_HashHash_Pattern_Key_empty_b", "#.#", ".b", true}, // P["#","#"], K["","b"]
+		{"Edge_HashHash_Pattern_Key_dot", "#.#", ".", true},      // P["#","#"], K["",""]
+		{"Edge_HashHash_Pattern_Key_a", "#.#", "a", true},        // First # matches "a", second # matches empty
+		{"Edge_HashHash_Pattern_Key_empty", "#.#", "", true},     // Both # match empty
+
+		{"Edge_StarHash_Pattern_Key_a", "*.#", "a", true},            // * matches "a", # matches empty
+		{"Edge_StarHash_Pattern_Key_ab", "*.#", "a.b", true},         // * matches "a", # matches "b"
+		{"Edge_StarHash_Pattern_Key_a_empty_c", "*.#", "a..c", true}, // * matches "a", # matches ".c" (empty string and c)
+		{"Edge_StarHash_Pattern_Key_empty", "*.#", "", false},        // * needs one word
+
+		{"Edge_HashStar_Pattern_Key_a", "#.*", "a", true},            // # matches empty, * matches "a"
+		{"Edge_HashStar_Pattern_Key_ab", "#.*", "a.b", true},         // # matches "a", * matches "b"
+		{"Edge_HashStar_Pattern_Key_a_empty_c", "#.*", "a..c", true}, // # matches "a.", * matches "c" (a then empty, then c)
+		{"Edge_HashStar_Pattern_Key_empty", "#.*", "", false},        // * needs one word
+
+		// --- More complex interactions ---
+		{"Edge_ComplexDotsAndStar_Pattern1", "a.*.b.*.c", "a..b..c", true}, // P[a,*,b,*,c], K[a,"",b,"",c] -> *s match ""
+		{"Edge_ComplexDotsAndHash_Pattern1", "a.#.b.#.c", "a..b..c", true}, // P[a,#,b,#,c], K[a,"",b,"",c] -> #s match ""
+		{"Edge_ComplexDotsAndHash_Pattern2", "a.#.b.#.c", "a.x.y.b.z.c", true},
+		{"Edge_ComplexDotsAndHash_Pattern3", "a.#.b.#.c", "a.b.c", true}, // Inner #s match zero words
+
+		{"Edge_Key_Is_SingleDot_Pattern_a", "a", ".", false},
+		{"Edge_Pattern_Is_SingleDot_Key_Is_Word", ".", "a", false},
+		{"Edge_Pattern_Is_Star_Key_Is_Single_EmptySegment_From_Split_Dot", "*", ".", false}, // // * (1 segment) != . (2 empty segments)
+		// Corrected expectation: false
+		{"Edge_Pattern_Is_Hash_Key_Is_SingleDot", "#", ".", true}, // P["#"], K["",""] -> # matches anything
+
+		// Recheck previously failing tests with corrected expectations
+		{"Recheck_ExactMismatch_Length_PatternShorter", "stock.usd", "stock.usd.nyse", false},
+		{"Recheck_Star_MismatchTooManyPartsForStar", "stock.*.nyse", "stock.usd.nyse.fast", false},
+		{"Recheck_Star_OnlyStar_MismatchTwoWords", "*", "word.another", false},
+		{"Recheck_Edge_KeyEndsWithDot_PatternShorter", "a.b", "a.b.", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var routingKeyParts []string
+			if tc.routingKey == "" {
+				routingKeyParts = []string{}
+			} else {
+				routingKeyParts = strings.Split(tc.routingKey, ".")
+			}
+
+			// The iterative topicMatch function handles splitting pattern internally
+			actualMatch := topicMatch(tc.pattern, tc.routingKey) // Use the entry topicMatch
+			assert.Equal(t, tc.shouldMatch, actualMatch, "Pattern: '%s', RoutingKey: '%s' (KeyParts for debug: %v)", tc.pattern, tc.routingKey, routingKeyParts)
+		})
+	}
+}
+
+// --- Basic.Return Tests ---
+
+// Helper function to setup a channel and a return notification channel
+func setupChannelWithReturn(t *testing.T, conn *amqp.Connection) (*amqp.Channel, <-chan amqp.Return) {
+	t.Helper()
+	ch, err := conn.Channel()
+	require.NoError(t, err, "Should open channel successfully")
+
+	returnNotify := make(chan amqp.Return, 1) // Buffered to prevent blocking publisher
+	ch.NotifyReturn(returnNotify)
+
+	return ch, returnNotify
+}
+
+// Helper to assert common amqp.Return fields for NO_ROUTE
+func assertReturnNoRoute(t *testing.T, ret amqp.Return, expectedExchange, expectedRoutingKey string) {
+	t.Helper()
+	assert.Equal(t, uint16(amqp.NoRoute), ret.ReplyCode, "Return ReplyCode should be 312 (NO_ROUTE)")
+	assert.Equal(t, "NO_ROUTE", ret.ReplyText, "Return ReplyText should be NO_ROUTE")
+	assert.Equal(t, expectedExchange, ret.Exchange, "Return Exchange name mismatch")
+	assert.Equal(t, expectedRoutingKey, ret.RoutingKey, "Return RoutingKey mismatch")
+}
+
+func TestBasicReturn_Mandatory_NoRoute_DefaultExchange(t *testing.T) {
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	conn, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, returnNotify := setupChannelWithReturn(t, conn)
+	defer ch.Close()
+
+	routingKey := "non_existent_queue_for_default_return"
+	body := "message for default exchange return"
+	messageId := "default-return-msg-id"
+
+	err = ch.Publish(
+		"",         // Default exchange
+		routingKey, // Routing key (non-existent queue)
+		true,       // Mandatory
+		false,      // Immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			MessageId:   messageId,
+			Body:        []byte(body),
+		},
+	)
+	require.NoError(t, err, "Publish call should succeed")
+
+	select {
+	case ret := <-returnNotify:
+		assertReturnNoRoute(t, ret, "", routingKey)
+		assert.Equal(t, "text/plain", ret.ContentType, "Returned ContentType mismatch")
+		assert.Equal(t, messageId, ret.MessageId, "Returned MessageId mismatch")
+		assert.Equal(t, []byte(body), ret.Body, "Returned Body mismatch")
+	case <-time.After(2 * time.Second):
+		assert.Fail(t, "Timeout waiting for basic.return for default exchange")
+	}
+}
+
+func TestBasicReturn_Mandatory_NoRoute_DirectExchange(t *testing.T) {
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	conn, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, returnNotify := setupChannelWithReturn(t, conn)
+	defer ch.Close()
+
+	exchangeName := "direct_exchange_for_return"
+	routingKey := "unbound_key_for_direct_return"
+	body := "message for direct exchange return"
+	correlationId := "direct-return-corr-id"
+
+	err = ch.ExchangeDeclare(exchangeName, amqp.ExchangeDirect, false, false, false, false, nil)
+	require.NoError(t, err, "Failed to declare direct exchange")
+
+	err = ch.Publish(
+		exchangeName,
+		routingKey,
+		true,  // Mandatory
+		false, // Immediate
+		amqp.Publishing{
+			ContentType:   "application/json",
+			CorrelationId: correlationId,
+			Body:          []byte(body),
+		},
+	)
+	require.NoError(t, err, "Publish call should succeed")
+
+	select {
+	case ret := <-returnNotify:
+		assertReturnNoRoute(t, ret, exchangeName, routingKey)
+		assert.Equal(t, "application/json", ret.ContentType, "Returned ContentType mismatch")
+		assert.Equal(t, correlationId, ret.CorrelationId, "Returned CorrelationId mismatch")
+		assert.Equal(t, []byte(body), ret.Body, "Returned Body mismatch")
+	case <-time.After(2 * time.Second):
+		assert.Fail(t, "Timeout waiting for basic.return for direct exchange")
+	}
+}
+
+func TestBasicReturn_Mandatory_NoRoute_TopicExchange(t *testing.T) {
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	conn, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, returnNotify := setupChannelWithReturn(t, conn)
+	defer ch.Close()
+
+	exchangeName := "topic_exchange_for_return"
+	routingKey := "topic.key.unmatched"
+	body := "message for topic exchange return"
+	appId := "topic-return-app-id"
+
+	err = ch.ExchangeDeclare(exchangeName, amqp.ExchangeTopic, false, false, false, false, nil)
+	require.NoError(t, err, "Failed to declare topic exchange")
+
+	// Declare a queue and bind it with a non-matching pattern to ensure the target key has no route
+	_, err = ch.QueueDeclare("some_other_topic_queue", false, false, false, false, nil)
+	require.NoError(t, err)
+	err = ch.QueueBind("some_other_topic_queue", "topic.key.other.*", exchangeName, false, nil)
+	require.NoError(t, err)
+
+	err = ch.Publish(
+		exchangeName,
+		routingKey,
+		true,  // Mandatory
+		false, // Immediate
+		amqp.Publishing{
+			AppId: appId,
+			Body:  []byte(body),
+		},
+	)
+	require.NoError(t, err, "Publish call should succeed")
+
+	select {
+	case ret := <-returnNotify:
+		assertReturnNoRoute(t, ret, exchangeName, routingKey)
+		assert.Equal(t, appId, ret.AppId, "Returned AppId mismatch")
+		assert.Equal(t, []byte(body), ret.Body, "Returned Body mismatch")
+	case <-time.After(2 * time.Second):
+		assert.Fail(t, "Timeout waiting for basic.return for topic exchange")
+	}
+}
+
+func TestBasicReturn_Mandatory_RouteExists_NoReturn(t *testing.T) {
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	conn, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, returnNotify := setupChannelWithReturn(t, conn)
+	defer ch.Close()
+
+	exchangeName := "direct_exchange_route_exists"
+	queueName := "queue_for_route_exists"
+	routingKey := "key_for_route_exists"
+	body := "message that should be routed, not returned"
+
+	err = ch.ExchangeDeclare(exchangeName, amqp.ExchangeDirect, false, false, false, false, nil)
+	require.NoError(t, err)
+	q, err := ch.QueueDeclare(queueName, false, false, false, false, nil)
+	require.NoError(t, err)
+	err = ch.QueueBind(q.Name, routingKey, exchangeName, false, nil)
+	require.NoError(t, err)
+
+	msgs, err := ch.Consume(q.Name, "", true, false, false, false, nil)
+	require.NoError(t, err)
+
+	err = ch.Publish(
+		exchangeName,
+		routingKey,
+		true,  // Mandatory
+		false, // Immediate
+		amqp.Publishing{Body: []byte(body)},
+	)
+	require.NoError(t, err, "Publish call should succeed")
+
+	// Check if message is consumed (meaning it was routed)
+	select {
+	case consumedMsg := <-msgs:
+		assert.Equal(t, []byte(body), consumedMsg.Body, "Consumed message body mismatch")
+	case <-time.After(2 * time.Second):
+		assert.Fail(t, "Timeout waiting for message to be consumed")
+	}
+
+	// Check that no message was returned
+	select {
+	case ret := <-returnNotify:
+		assert.Fail(t, "basic.return received unexpectedly", "Return data: %+v", ret)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: no return
+	}
+}
+
+func TestBasicReturn_NotMandatory_NoRoute_NoReturn(t *testing.T) {
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	conn, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, returnNotify := setupChannelWithReturn(t, conn)
+	defer ch.Close()
+
+	exchangeName := "direct_exchange_not_mandatory"
+	routingKey := "unbound_key_not_mandatory"
+	body := "message not mandatory, no route"
+
+	err = ch.ExchangeDeclare(exchangeName, amqp.ExchangeDirect, false, false, false, false, nil)
+	require.NoError(t, err, "Failed to declare direct exchange")
+
+	err = ch.Publish(
+		exchangeName,
+		routingKey,
+		false, // Mandatory = false
+		false, // Immediate
+		amqp.Publishing{Body: []byte(body)},
+	)
+	require.NoError(t, err, "Publish call should succeed")
+
+	// Check that no message was returned
+	select {
+	case ret := <-returnNotify:
+		assert.Fail(t, "basic.return received unexpectedly for non-mandatory message", "Return data: %+v", ret)
+	case <-time.After(500 * time.Millisecond): // Longer timeout to be reasonably sure
+		// Expected: no return, message is silently dropped
+	}
+}
+
+func TestBasicPublish_Immediate_Rejected(t *testing.T) {
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	conn, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	require.NoError(t, err)
+	// No defer ch.Close() here, as we expect the channel to be closed by the server.
+
+	exchangeName := "exchange_for_immediate_test"
+	routingKey := "key_for_immediate"
+
+	err = ch.ExchangeDeclare(exchangeName, amqp.ExchangeDirect, false, false, false, false, nil)
+	if err != nil { // If channel is already closed due to setup, this might fail.
+		require.Contains(t, err.Error(), "channel/connection is not open", "ExchangeDeclare failed unexpectedly before immediate publish")
+		return
+	}
+
+	// Attempt to publish with immediate = true
+	// The client library might not return an error directly from Publish if it's asynchronous.
+	// The error will manifest when the server closes the channel.
+	publishErr := ch.Publish(
+		exchangeName,
+		routingKey,
+		false, // Mandatory
+		true,  // Immediate = true
+		amqp.Publishing{Body: []byte("test immediate")},
+	)
+
+	// We expect the server to close the channel.
+	// Wait for a channel close notification or for a subsequent operation to fail.
+	closedCh := make(chan *amqp.Error, 1)
+	ch.NotifyClose(closedCh)
+
+	select {
+	case amqpErr := <-closedCh:
+		require.NotNil(t, amqpErr, "Should receive a channel close error")
+		assert.Equal(t, amqp.NotImplemented, amqpErr.Code, "AMQP error code should be 540 (NOT_IMPLEMENTED) for immediate flag")
+		assert.Contains(t, amqpErr.Reason, "The 'immediate' flag is deprecated", "Error reason mismatch")
+	case <-time.After(2 * time.Second):
+		// If NotifyClose didn't fire, check if publishErr already indicated an issue
+		// or try another operation.
+		if publishErr != nil {
+			amqpErr, ok := publishErr.(*amqp.Error)
+			if ok {
+				assert.Equal(t, amqp.NotImplemented, amqpErr.Code, "AMQP error code from Publish should be 540")
+				return
+			}
+		}
+		// Try another operation to confirm channel state
+		errAfter := ch.ExchangeDeclare("another-ex", "direct", false, false, false, false, nil)
+		require.Error(t, errAfter, "Channel should be closed after publishing with immediate=true")
+		if amqpErr, ok := errAfter.(*amqp.Error); ok {
+			assert.Equal(t, amqp.ChannelError, amqpErr.Code, "Subsequent operation should fail with ChannelError or similar")
+		} else {
+			assert.Contains(t, errAfter.Error(), "channel/connection is not open", "Error should indicate channel is closed")
+		}
+		assert.Fail(t, "Timeout waiting for channel close notification after publishing with immediate=true")
+	}
+
+	// Ensure publishErr itself isn't a success code if the channel was closed.
+	// This depends on client library behavior; sometimes Publish is fire-and-forget.
+	if publishErr == nil {
+		t.Log("Publish call itself did not return an error, channel closure was detected asynchronously.")
 	}
 }

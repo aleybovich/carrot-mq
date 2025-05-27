@@ -58,6 +58,7 @@ const (
 	MethodBasicConsume      = 20
 	MethodBasicConsumeOk    = 21
 	MethodBasicPublish      = 40
+	MethodBasicReturn       = 50
 	MethodBasicDeliver      = 60
 )
 

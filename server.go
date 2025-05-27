@@ -681,14 +681,28 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 		}
 		_ = clientProperties // Use clientProperties if needed, e.g., logging or capabilities check
 
-		mechanism := readShortString(reader) // Auth mechanism
-		response := readLongString(reader)   // Auth credentials
-		_ = readShortString(reader)          // locale
+		mechanism, err := readShortString(reader) // Auth mechanism
+		if err != nil {
+			c.server.Err("Error reading mechanism in connection.start-ok: %v", err)
+			return c.sendConnectionClose(502, "SYNTAX_ERROR - malformed mechanism string", uint16(ClassConnection), MethodConnectionStartOk)
+		}
+
+		response, err := readLongString(reader) // Auth credentials
+		if err != nil {
+			c.server.Err("Error reading response in connection.start-ok: %v", err)
+			return c.sendConnectionClose(502, "SYNTAX_ERROR - malformed response string", uint16(ClassConnection), MethodConnectionStartOk)
+		}
+
+		_, err = readShortString(reader) // locale
+		if err != nil {
+			c.server.Err("Error reading locale in connection.start-ok: %v", err)
+			return c.sendConnectionClose(502, "SYNTAX_ERROR - malformed locale string", uint16(ClassConnection), MethodConnectionStartOk)
+		}
 
 		// Check for remaining bytes, indicates malformed arguments
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data at end of connection.start-ok payload.")
-			return c.sendConnectionClose(502, "extra data in connection.start-ok", uint16(ClassConnection), MethodConnectionStartOk)
+			return c.sendConnectionClose(502, "SYNTAX_ERROR - extra data in connection.start-ok", uint16(ClassConnection), MethodConnectionStartOk)
 		}
 
 		// Handle authentication based on server auth mode
@@ -756,8 +770,14 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 		return nil
 
 	case MethodConnectionOpen:
-		vhost := readShortString(reader)
-		_ = readShortString(reader)         // capabilities
+		vhost, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading vhost in connection.open: %v", err)
+			return c.sendConnectionClose(502, "SYNTAX_ERROR - malformed vhost string", uint16(ClassConnection), MethodConnectionStartOk)
+		}
+
+		_, _ = readShortString(reader) // capabilities
+
 		_, errReadByte := reader.ReadByte() // insist bit
 		if errReadByte != nil {
 			return c.sendConnectionClose(502, "malformed connection.open (insist bit)", uint16(ClassConnection), MethodConnectionOpen)
@@ -776,7 +796,7 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 		// AMQP 0-9-1 Connection.OpenOk has one field: known-hosts (shortstr), which "MUST be zero length".
 		writeShortString(payload, "") // known-hosts
 
-		err := c.writeFrame(&Frame{
+		err = c.writeFrame(&Frame{
 			Type:    FrameMethod,
 			Channel: 0,
 			Payload: payload.Bytes(),
@@ -791,7 +811,13 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 		c.server.Info("Processing connection.%s (client initiated close)", methodName)
 		var replyCode uint16
 		binary.Read(reader, binary.BigEndian, &replyCode)
-		replyText := readShortString(reader)
+		replyText, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading replyText in connection.close: %v", err)
+			// Server is closing anyway, but good to note if client sent malformed close
+			// For simplicity, we won't send another error, just proceed with CloseOk
+		}
+
 		var classIdField, methodIdField uint16
 		binary.Read(reader, binary.BigEndian, &classIdField)
 		binary.Read(reader, binary.BigEndian, &methodIdField)
@@ -870,8 +896,11 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 		c.server.Info("Processing channel.%s for channel %d", methodName, channelId)
 		// AMQP 0-9-1: reserved-1 (shortstr), "out-of-band, MUST be zero length string"
 		// Read and discard "out-of-band" argument.
-		_ = readShortString(reader) // Assuming readShortString correctly consumes the length byte even for empty string.
-		// If not, this needs to be more careful.
+		_, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading out-of-band string for channel.open on channel %d: %v", channelId, err)
+			return c.sendConnectionClose(502, "SYNTAX_ERROR - malformed out-of-band string in channel.open", uint16(ClassChannel), MethodChannelOpen)
+		}
 
 		// Check for extra data after the single reserved argument.
 		if reader.Len() > 0 {
@@ -957,7 +986,13 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 		if err := binary.Read(reader, binary.BigEndian, &replyCode); err != nil {
 			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed channel.close (reply-code)", uint16(ClassChannel), MethodChannelClose)
 		}
-		replyText := readShortString(reader) // Assuming robust
+		replyText, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading replyText for channel.close on channel %d: %v", channelId, err)
+			// Proceed with close, but log the malformed input from client
+			// return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed replyText in channel.close", uint16(ClassChannel), MethodChannelClose)
+		}
+
 		var classIdField, methodIdField uint16
 		if err := binary.Read(reader, binary.BigEndian, &classIdField); err != nil {
 			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed channel.close (class-id)", uint16(ClassChannel), MethodChannelClose)
@@ -1074,8 +1109,18 @@ func (c *Connection) handleExchangeMethod(methodId uint16, reader *bytes.Reader,
 		if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 			return fmt.Errorf("reading ticket for exchange.declare: %w", err)
 		}
-		exchangeName := readShortString(reader)
-		exchangeType := readShortString(reader)
+		exchangeName, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading exchangeName for exchange.declare: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed exchange.declare (exchangeName)", uint16(ClassExchange), MethodExchangeDeclare)
+		}
+
+		exchangeType, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading exchangeType for exchange.declare: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed exchange.declare (exchangeType)", uint16(ClassExchange), MethodExchangeDeclare)
+		}
+
 		bits, errReadByte := reader.ReadByte()
 		if errReadByte != nil {
 			return c.sendChannelClose(channelId, 502, "malformed exchange.declare (bits)", uint16(ClassExchange), MethodExchangeDeclare)
@@ -1240,8 +1285,11 @@ func (c *Connection) handleQueueMethod(methodId uint16, reader *bytes.Reader, ch
 			// Malformed frame if basic fields cannot be read.
 			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (ticket)", uint16(ClassQueue), MethodQueueDeclare)
 		}
-		queueNameIn := readShortString(reader) // Assuming readShortString is robust for now.
-		// If it could fail mid-read, it would need to return an error.
+		queueNameIn, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading queueNameIn for queue.declare: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (queueNameIn)", uint16(ClassQueue), MethodQueueDeclare)
+		}
 
 		bits, errReadByte := reader.ReadByte()
 		if errReadByte != nil {
@@ -1415,9 +1463,23 @@ func (c *Connection) handleQueueMethod(methodId uint16, reader *bytes.Reader, ch
 		if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (ticket)", uint16(ClassQueue), MethodQueueBind)
 		}
-		queueName := readShortString(reader)
-		exchangeName := readShortString(reader)
-		routingKey := readShortString(reader)
+		queueName, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading queueName for queue.bind: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (queueName)", uint16(ClassQueue), MethodQueueBind)
+		}
+
+		exchangeName, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading exchangeName for queue.bind: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (exchangeName)", uint16(ClassQueue), MethodQueueBind)
+		}
+
+		routingKey, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading routingKey for queue.bind: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (routingKey)", uint16(ClassQueue), MethodQueueBind)
+		}
 
 		bits, errReadByte := reader.ReadByte()
 		if errReadByte != nil {
@@ -1536,8 +1598,17 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.publish (ticket)", uint16(ClassBasic), MethodBasicPublish)
 		}
-		exchangeName := readShortString(reader)
-		routingKey := readShortString(reader)
+		exchangeName, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading exchangeName for basic.publish: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.publish (exchangeName)", uint16(ClassBasic), MethodBasicPublish)
+		}
+
+		routingKey, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading routingKey for basic.publish: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.publish (routingKey)", uint16(ClassBasic), MethodBasicPublish)
+		}
 
 		bits, errReadByte := reader.ReadByte()
 		if errReadByte != nil {
@@ -1551,8 +1622,14 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		}
 
 		mandatory := (bits & 0x01) != 0
-		immediate := (bits & 0x02) != 0 // Immediate is deprecated in AMQP 0-9-1, server should ignore or reject.
-		// For now, we'll accept it but not implement Basic.Return for immediate.
+		immediate := (bits & 0x02) != 0 // Immediate is deprecated in AMQP 0-9-1, server should reject
+
+		if immediate {
+			// AMQP 0-9-1 spec: "servers SHOULD reject messages published with the 'immediate' flag set."
+			replyText := "The 'immediate' flag is deprecated and not supported by this server."
+			c.server.Warn("Client on channel %d published with 'immediate' flag. Rejecting. Exchange: %s, RK: %s", channelId, exchangeName, routingKey)
+			return c.sendChannelClose(channelId, 540, replyText, uint16(ClassBasic), MethodBasicPublish) // 540 NOT_IMPLEMENTED
+		}
 
 		c.server.Info("Processing basic.%s: exchange='%s', routingKey='%s', mandatory=%v, immediate=%v on channel %d",
 			methodName, exchangeName, routingKey, mandatory, immediate, channelId)
@@ -1592,8 +1669,16 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.consume (ticket)", uint16(ClassBasic), MethodBasicConsume)
 		}
-		queueName := readShortString(reader)
-		consumerTagIn := readShortString(reader) // Client can specify, or server generates if empty
+		queueName, err := readShortString(reader)
+		if err != nil {
+			c.server.Err("Error reading queueName for basic.consume: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.consume (queueName)", uint16(ClassBasic), MethodBasicConsume)
+		}
+		consumerTagIn, err := readShortString(reader) // Client can specify, or server generates if empty
+		if err != nil {
+			c.server.Err("Error reading consumerTagIn for basic.consume: %v", err)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.consume (consumerTagIn)", uint16(ClassBasic), MethodBasicConsume)
+		}
 
 		bits, errReadByte := reader.ReadByte()
 		if errReadByte != nil {
@@ -1784,12 +1869,19 @@ func (c *Connection) handleHeader(frame *Frame) error {
 	}
 
 	// Parse properties based on flags
-	var errProp error      // To catch errors from reading properties
+	var errProp error // To catch errors from reading properties
+	var err error
 	if flags&0x8000 != 0 { // content-type
-		pendingMessage.Properties.ContentType = readShortString(reader)
+		pendingMessage.Properties.ContentType, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed content-type", classId, 0)
+		}
 	}
 	if flags&0x4000 != 0 { // content-encoding
-		pendingMessage.Properties.ContentEncoding = readShortString(reader)
+		pendingMessage.Properties.ContentEncoding, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed content-encoding", classId, 0)
+		}
 	}
 	if flags&0x2000 != 0 { // headers
 		var headersMap map[string]interface{}
@@ -1812,16 +1904,28 @@ func (c *Connection) handleHeader(frame *Frame) error {
 		}
 	}
 	if flags&0x0400 != 0 { // correlation-id
-		pendingMessage.Properties.CorrelationId = readShortString(reader)
+		pendingMessage.Properties.CorrelationId, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed correlation-id", classId, 0)
+		}
 	}
 	if flags&0x0200 != 0 { // reply-to
-		pendingMessage.Properties.ReplyTo = readShortString(reader)
+		pendingMessage.Properties.ReplyTo, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed reply-to", classId, 0)
+		}
 	}
 	if flags&0x0100 != 0 { // expiration
-		pendingMessage.Properties.Expiration = readShortString(reader)
+		pendingMessage.Properties.Expiration, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed expiration", classId, 0)
+		}
 	}
 	if flags&0x0080 != 0 { // message-id
-		pendingMessage.Properties.MessageId = readShortString(reader)
+		pendingMessage.Properties.MessageId, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed message-id", classId, 0)
+		}
 	}
 	if flags&0x0040 != 0 { // timestamp
 		if errProp = binary.Read(reader, binary.BigEndian, &pendingMessage.Properties.Timestamp); errProp != nil {
@@ -1829,16 +1933,28 @@ func (c *Connection) handleHeader(frame *Frame) error {
 		}
 	}
 	if flags&0x0020 != 0 { // type
-		pendingMessage.Properties.Type = readShortString(reader)
+		pendingMessage.Properties.Type, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed type", classId, 0)
+		}
 	}
 	if flags&0x0010 != 0 { // user-id
-		pendingMessage.Properties.UserId = readShortString(reader)
+		pendingMessage.Properties.UserId, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed user-id", classId, 0)
+		}
 	}
 	if flags&0x0008 != 0 { // app-id
-		pendingMessage.Properties.AppId = readShortString(reader)
+		pendingMessage.Properties.AppId, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed app-id", classId, 0)
+		}
 	}
 	if flags&0x0004 != 0 { // cluster-id (Reserved, usually not used by clients)
-		pendingMessage.Properties.ClusterId = readShortString(reader)
+		pendingMessage.Properties.ClusterId, err = readShortString(reader)
+		if err != nil {
+			return c.sendChannelClose(frame.Channel, 502, "SYNTAX_ERROR - malformed cluster-id", classId, 0)
+		}
 	}
 
 	// Check if readShortString (if it could indicate error) or binary.Read caused an issue
@@ -1916,7 +2032,7 @@ func (c *Connection) handleBody(frame *Frame) {
 			ch.mu.Unlock()
 
 			// Deliver the message
-			c.deliverMessage(messageToDeliver)
+			c.deliverMessage(messageToDeliver, frame.Channel)
 		} else {
 			ch.mu.Unlock()
 			c.server.Warn("Received body frame with no pending message on channel %d", frame.Channel)
@@ -1987,10 +2103,8 @@ func (c *Connection) routeTopic(exchange *Exchange, routingKey string) []string 
 	queues := make([]string, 0)
 	queueSet := make(map[string]bool)
 
-	routingParts := strings.Split(routingKey, ".")
-
 	for pattern, boundQueues := range exchange.Bindings {
-		if topicMatch(pattern, routingParts) {
+		if topicMatch(pattern, routingKey) {
 			for _, queueName := range boundQueues {
 				if !queueSet[queueName] {
 					queueSet[queueName] = true
@@ -2003,64 +2117,36 @@ func (c *Connection) routeTopic(exchange *Exchange, routingKey string) []string 
 	return queues
 }
 
-// topicMatch checks if a topic pattern matches routing key parts
-func topicMatch(pattern string, routingParts []string) bool {
-	patternParts := strings.Split(pattern, ".")
-
-	i, j := 0, 0
-	for i < len(patternParts) && j < len(routingParts) {
-		if patternParts[i] == "#" {
-			// # matches zero or more words
-			if i == len(patternParts)-1 {
-				// # at the end matches everything remaining
-				return true
-			}
-			// # in the middle - need to try matching rest of pattern
-			// from various positions in the routing key
-			for k := j; k <= len(routingParts); k++ {
-				if topicMatchHelper(patternParts[i+1:], routingParts[k:]) {
-					return true
-				}
-			}
-			return false
-		} else if patternParts[i] == "*" {
-			// * matches exactly one word
-			i++
-			j++
-		} else if patternParts[i] == routingParts[j] {
-			// Exact match
-			i++
-			j++
-		} else {
-			// No match
-			return false
-		}
-	}
-
-	// Check if we've consumed both patterns completely
-	// OR if remaining pattern is just "#" (which matches zero words)
-	return (i == len(patternParts) && j == len(routingParts)) ||
-		(i == len(patternParts)-1 && patternParts[i] == "#" && j == len(routingParts))
-}
-
-// Refactored deliverMessage to use routing functions
-func (c *Connection) deliverMessage(msg Message) {
-	c.server.Info("Message: exchange=%s, routingKey=%s", msg.Exchange, msg.RoutingKey)
+func (c *Connection) deliverMessage(msg Message, channelId uint16) {
+	c.server.Info("Message: exchange=%s, routingKey=%s, mandatory=%v", msg.Exchange, msg.RoutingKey, msg.Mandatory)
 
 	// Route the message
 	queueNames, err := c.routeMessage(msg)
 	if err != nil {
 		c.server.Err("Error routing message: %v", err)
-		if msg.Mandatory {
-			// TODO: Send basic.return
-			c.server.Warn("Failed to route mandatory message: %v", err)
+		if msg.Mandatory && channelId != 0 {
+			// Send basic.return for unroutable mandatory message due to error
+			if returnErr := c.sendBasicReturn(channelId, 312, "NO_ROUTE", msg.Exchange, msg.RoutingKey); returnErr != nil {
+				c.server.Err("Failed to send basic.return: %v", returnErr)
+			}
+			// Also send the header and body frames after basic.return
+			c.sendReturnedMessage(channelId, msg)
 		}
 		return
 	}
 
-	if len(queueNames) == 0 && msg.Mandatory {
-		// TODO: Send basic.return
+	if len(queueNames) == 0 && msg.Mandatory && channelId != 0 {
+		// No queues found for mandatory message
 		c.server.Warn("No queues for mandatory message on exchange '%s' with routing key '%s'", msg.Exchange, msg.RoutingKey)
+
+		// Send basic.return
+		if returnErr := c.sendBasicReturn(channelId, 312, "NO_ROUTE", msg.Exchange, msg.RoutingKey); returnErr != nil {
+			c.server.Err("Failed to send basic.return: %v", returnErr)
+			return
+		}
+
+		// Send the returned message content
+		c.sendReturnedMessage(channelId, msg)
 		return
 	}
 
@@ -2068,7 +2154,125 @@ func (c *Connection) deliverMessage(msg Message) {
 	for _, queueName := range queueNames {
 		c.deliverToQueue(queueName, msg)
 	}
+}
 
+// Helper method to send the returned message's header and body
+func (c *Connection) sendReturnedMessage(channelId uint16, msg Message) {
+	// Send header frame
+	headerPayload := &bytes.Buffer{}
+	binary.Write(headerPayload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(headerPayload, binary.BigEndian, uint16(0)) // weight
+	binary.Write(headerPayload, binary.BigEndian, uint64(len(msg.Body)))
+
+	// Calculate and write property flags
+	flags := uint16(0)
+	if msg.Properties.ContentType != "" {
+		flags |= 0x8000
+	}
+	if msg.Properties.ContentEncoding != "" {
+		flags |= 0x4000
+	}
+	if len(msg.Properties.Headers) > 0 {
+		flags |= 0x2000
+	}
+	if msg.Properties.DeliveryMode != 0 {
+		flags |= 0x1000
+	}
+	if msg.Properties.Priority != 0 {
+		flags |= 0x0800
+	}
+	if msg.Properties.CorrelationId != "" {
+		flags |= 0x0400
+	}
+	if msg.Properties.ReplyTo != "" {
+		flags |= 0x0200
+	}
+	if msg.Properties.Expiration != "" {
+		flags |= 0x0100
+	}
+	if msg.Properties.MessageId != "" {
+		flags |= 0x0080
+	}
+	if msg.Properties.Timestamp != 0 {
+		flags |= 0x0040
+	}
+	if msg.Properties.Type != "" {
+		flags |= 0x0020
+	}
+	if msg.Properties.UserId != "" {
+		flags |= 0x0010
+	}
+	if msg.Properties.AppId != "" {
+		flags |= 0x0008
+	}
+	if msg.Properties.ClusterId != "" {
+		flags |= 0x0004
+	}
+
+	binary.Write(headerPayload, binary.BigEndian, flags)
+
+	// Write properties based on flags
+	if flags&0x8000 != 0 {
+		writeShortString(headerPayload, msg.Properties.ContentType)
+	}
+	if flags&0x4000 != 0 {
+		writeShortString(headerPayload, msg.Properties.ContentEncoding)
+	}
+	if flags&0x2000 != 0 {
+		writeTable(headerPayload, msg.Properties.Headers)
+	}
+	if flags&0x1000 != 0 {
+		binary.Write(headerPayload, binary.BigEndian, msg.Properties.DeliveryMode)
+	}
+	if flags&0x0800 != 0 {
+		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Priority)
+	}
+	if flags&0x0400 != 0 {
+		writeShortString(headerPayload, msg.Properties.CorrelationId)
+	}
+	if flags&0x0200 != 0 {
+		writeShortString(headerPayload, msg.Properties.ReplyTo)
+	}
+	if flags&0x0100 != 0 {
+		writeShortString(headerPayload, msg.Properties.Expiration)
+	}
+	if flags&0x0080 != 0 {
+		writeShortString(headerPayload, msg.Properties.MessageId)
+	}
+	if flags&0x0040 != 0 {
+		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Timestamp)
+	}
+	if flags&0x0020 != 0 {
+		writeShortString(headerPayload, msg.Properties.Type)
+	}
+	if flags&0x0010 != 0 {
+		writeShortString(headerPayload, msg.Properties.UserId)
+	}
+	if flags&0x0008 != 0 {
+		writeShortString(headerPayload, msg.Properties.AppId)
+	}
+	if flags&0x0004 != 0 {
+		writeShortString(headerPayload, msg.Properties.ClusterId)
+	}
+
+	// Send header frame
+	if err := c.writeFrame(&Frame{
+		Type:    FrameHeader,
+		Channel: channelId,
+		Payload: headerPayload.Bytes(),
+	}); err != nil {
+		c.server.Err("Failed to send header frame for returned message: %v", err)
+		return
+	}
+
+	// Send body frame
+	if err := c.writeFrame(&Frame{
+		Type:    FrameBody,
+		Channel: channelId,
+		Payload: msg.Body,
+	}); err != nil {
+		c.server.Err("Failed to send body frame for returned message: %v", err)
+	}
 }
 
 // deliverToQueue handles delivery to a single queue
@@ -2560,88 +2764,37 @@ func (c *Connection) sendConnectionClose(replyCode uint16, replyText string, off
 	return errConnectionCloseSentByServer
 }
 
-func readTable(reader *bytes.Reader) (map[string]interface{}, error) {
-	var tablePayloadLength uint32
-	if err := binary.Read(reader, binary.BigEndian, &tablePayloadLength); err != nil {
-		return nil, fmt.Errorf("reading table payload length: %w", err)
+func (c *Connection) sendBasicReturn(channelId uint16, replyCode uint16, replyText string, exchange string, routingKey string) error {
+	c.server.Info("Sending basic.return on channel %d: code=%d, text='%s', exchange='%s', routingKey='%s'",
+		channelId, replyCode, replyText, exchange, routingKey)
+
+	payload := &bytes.Buffer{}
+	if err := binary.Write(payload, binary.BigEndian, uint16(ClassBasic)); err != nil {
+		return fmt.Errorf("writing class id for basic.return: %w", err)
+	}
+	if err := binary.Write(payload, binary.BigEndian, uint16(MethodBasicReturn)); err != nil {
+		return fmt.Errorf("writing method id for basic.return: %w", err)
 	}
 
-	if tablePayloadLength == 0 {
-		return make(map[string]interface{}), nil
+	// Write reply-code
+	if err := binary.Write(payload, binary.BigEndian, replyCode); err != nil {
+		return fmt.Errorf("writing reply code for basic.return: %w", err)
 	}
 
-	tablePayloadBytes := make([]byte, tablePayloadLength)
-	n, err := io.ReadFull(reader, tablePayloadBytes)
-	if err != nil {
-		// err will be io.ErrUnexpectedEOF if fewer than tablePayloadLength bytes were read
-		return nil, fmt.Errorf("reading table payload bytes (expected %d, read %d): %w", tablePayloadLength, n, err)
-	}
-	// This check is redundant if io.ReadFull is used correctly, as it returns an error for short reads.
-	// if n != int(tablePayloadLength) {
-	// 	return nil, fmt.Errorf("short read for table payload: got %d, expected %d", n, tablePayloadLength)
-	// }
+	// Write reply-text
+	writeShortString(payload, replyText)
 
-	tableReader := bytes.NewReader(tablePayloadBytes)
-	table := make(map[string]interface{})
+	// Write exchange
+	writeShortString(payload, exchange)
 
-	for tableReader.Len() > 0 {
-		// Assuming readShortString does not return an error itself.
-		// If readShortString could fail (e.g. EOF mid-string), it should return an error.
-		key := readShortString(tableReader)
+	// Write routing-key
+	writeShortString(payload, routingKey)
 
-		// If after reading a key, there's no more data for its value type, it's malformed.
-		if tableReader.Len() == 0 {
-			if key != "" { // We read a key but no value followed.
-				return table, fmt.Errorf("malformed table: key '%s' read but no value type followed", key)
-			}
-			// If key is "" and tableReader.Len() is 0, it might be a valid empty key at the end,
-			// or readShortString failed silently. This depends on readShortString's contract.
-			// For now, if key is "" and no more data, we assume loop termination is fine.
-			break
-		}
-
-		valueType, err := tableReader.ReadByte()
-		if err != nil {
-			return table, fmt.Errorf("reading value type for key '%s' (or after last key): %w", key, err)
-		}
-
-		value, err := readFieldValue(tableReader, valueType)
-		if err != nil {
-			return table, fmt.Errorf("reading value for key '%s' (type %c): %w", key, valueType, err)
-		}
-		table[key] = value
-	}
-
-	if tableReader.Len() > 0 {
-		// This means not all bytes of the declared table payload were consumed.
-		return table, fmt.Errorf("%d unread bytes remaining in table payload after parsing; table may be malformed or contain extra data", tableReader.Len())
-	}
-
-	return table, nil
-}
-
-func writeTable(writer *bytes.Buffer, table map[string]interface{}) error {
-	tablePayloadBuffer := &bytes.Buffer{}
-
-	for key, value := range table {
-		// Assuming writeShortString does not return an error.
-		// If it could fail, its error would need to be handled here.
-		writeShortString(tablePayloadBuffer, key)
-
-		if err := writeFieldValue(tablePayloadBuffer, value); err != nil {
-			return fmt.Errorf("serializing value for key '%s' (type %T): %w", key, value, err)
-		}
-	}
-
-	// Write the total length of the table payload first
-	if err := binary.Write(writer, binary.BigEndian, uint32(tablePayloadBuffer.Len())); err != nil {
-		return fmt.Errorf("writing table payload length: %w", err)
-	}
-	// Then write the actual table payload
-	if _, err := writer.Write(tablePayloadBuffer.Bytes()); err != nil {
-		return fmt.Errorf("writing table payload bytes: %w", err)
-	}
-	return nil
+	return c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payload.Bytes(),
+	})
 }
 
 func main() {
