@@ -37,6 +37,8 @@ func getFrameTypeName(frameType byte) string {
 // getClassName returns a string representation of a class ID
 func getClassName(classId uint16) string {
 	switch classId {
+	case ClassConfirm:
+		return "confirm"
 	case ClassConnection:
 		return "connection"
 	case ClassChannel:
@@ -55,6 +57,13 @@ func getClassName(classId uint16) string {
 // getMethodName returns a string representation of a method ID within a class
 func getMethodName(classId uint16, methodId uint16) string {
 	switch classId {
+	case ClassConfirm:
+		switch methodId {
+		case MethodConfirmSelect:
+			return "select"
+		case MethodConfirmSelectOk:
+			return "select-ok"
+		}
 	case ClassConnection:
 		switch methodId {
 		case MethodConnectionStart:
@@ -109,12 +118,32 @@ func getMethodName(classId uint16, methodId uint16) string {
 			return "consume"
 		case MethodBasicConsumeOk:
 			return "consume-ok"
+		case MethodBasicCancel:
+			return "cancel"
+		case MethodBasicCancelOk:
+			return "cancel-ok"
 		case MethodBasicPublish:
 			return "publish"
 		case MethodBasicDeliver:
 			return "deliver"
 		case MethodBasicReturn:
 			return "return"
+		case MethodBasicAck:
+			return "ack"
+		case MethodBasicReject:
+			return "reject"
+		case MethodBasicNack:
+			return "nack"
+		case MethodBasicGet:
+			return "get"
+		case MethodBasicGetOk:
+			return "get-ok"
+		case MethodBasicGetEmpty:
+			return "get-empty"
+		case MethodBasicRecover:
+			return "recover"
+		case MethodBasicRecoverOk:
+			return "recover-ok"
 		}
 	}
 	return fmt.Sprintf("unknown(%d)", methodId)

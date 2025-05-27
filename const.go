@@ -34,9 +34,12 @@ const (
 	ClassExchange   = 40
 	ClassQueue      = 50
 	ClassBasic      = 60
+	ClassConfirm    = 85
 )
 
 const (
+	MethodConfirmSelect     = 10
+	MethodConfirmSelectOk   = 11
 	MethodConnectionStart   = 10
 	MethodConnectionStartOk = 11
 	MethodConnectionTune    = 30
@@ -57,9 +60,19 @@ const (
 	MethodQueueBindOk       = 21
 	MethodBasicConsume      = 20
 	MethodBasicConsumeOk    = 21
+	MethodBasicCancel       = 30
+	MethodBasicCancelOk     = 31
 	MethodBasicPublish      = 40
 	MethodBasicReturn       = 50
 	MethodBasicDeliver      = 60
+	MethodBasicGet          = 70
+	MethodBasicGetOk        = 71
+	MethodBasicGetEmpty     = 72
+	MethodBasicAck          = 80
+	MethodBasicReject       = 90
+	MethodBasicRecover      = 110
+	MethodBasicRecoverOk    = 111
+	MethodBasicNack         = 120
 )
 
 var (

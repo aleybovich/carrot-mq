@@ -4,6 +4,12 @@
 
 ### Added 
 - Basic.Return for unroutable messages
+- Basic.Cancel
+- Basic.Ack/Nack/Reject
+- Basic.Get/GetOk
+- Basic.Recover
+- Max Frame Size validation
+- Publisher confirms
 - Improved error handling for frame reading - now returns 502 SYNTAX_ERROR when fails to read
 
 ## [0.0.1] 2025-05-27
@@ -35,14 +41,10 @@
 - Custom logger interface for external logging integration
 
 ### Not Implemented
-- Publisher confirms
 - Transaction support
 - Exchange-to-exchange bindings
 - Queue deletion
 - Queue purge
-- Basic.Get
-- Basic.Ack/Nack/Reject
-- Basic.Recover
 - Channel flow control
 - Heartbeat monitoring
 - SSL/TLS support

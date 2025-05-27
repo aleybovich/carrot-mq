@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"runtime"
@@ -21,6 +22,11 @@ const VERSION = "0.0.1"
 // How log to wait until cleanup if channel Close Ok not received from client
 // TODO: make server config value
 const channelCloseOkTimeout = 100 * time.Millisecond
+
+const (
+	suggestedHeartbeatInterval = 60 // Suggested heartbeat interval for AMQP 0-9-1
+	suggestedFrameMaxSize      = 131072
+)
 
 // Flag to determine if we're logging to a terminal (with colors) or a file
 var isTerminal bool
@@ -62,12 +68,13 @@ type Properties struct {
 }
 
 type Message struct {
-	Exchange   string
-	RoutingKey string
-	Mandatory  bool
-	Immediate  bool
-	Properties Properties
-	Body       []byte
+	Exchange    string
+	RoutingKey  string
+	Mandatory   bool
+	Immediate   bool
+	Properties  Properties
+	Body        []byte
+	Redelivered bool
 }
 
 type Queue struct {
@@ -102,6 +109,21 @@ type Channel struct {
 	closeOkTimer                  *time.Timer // Timer for waiting for Channel.CloseOk
 	serverInitiatedCloseReplyCode uint16      // Store the reply code for logging if CloseOk times out
 	serverInitiatedCloseReplyText string      // Store the reply text for logging if CloseOk times out
+
+	unackedMessages map[uint64]*UnackedMessage // deliveryTag -> UnackedMessage
+
+	// Publisher confirms fields
+	confirmMode      bool            // Whether confirm mode is enabled
+	nextPublishSeqNo uint64          // Next sequence number for published messages
+	pendingConfirms  map[uint64]bool // Map of unconfirmed delivery tags
+}
+
+type UnackedMessage struct {
+	Message     Message
+	ConsumerTag string
+	QueueName   string
+	DeliveryTag uint64
+	Delivered   time.Time
 }
 
 type Connection struct {
@@ -112,6 +134,11 @@ type Connection struct {
 	server   *Server
 	mu       sync.RWMutex
 	writeMu  sync.Mutex
+
+	// negotiated values
+	channelMax        uint16
+	frameMax          uint32
+	heartbeatInterval uint16
 
 	username string // Store authenticated username
 }
@@ -475,6 +502,12 @@ func (c *Connection) readFrame() (*Frame, error) {
 	}
 
 	size := binary.BigEndian.Uint32(header[3:7])
+	if c.frameMax > 0 && size > uint32(c.frameMax) {
+		// Send connection.close with frame-error
+		c.sendConnectionClose(505, "frame too large", 0, 0)
+		return nil, fmt.Errorf("frame size %d exceeds negotiated max %d", size, c.frameMax)
+	}
+
 	frame.Payload = make([]byte, size)
 	_, err = io.ReadFull(c.reader, frame.Payload)
 	if err != nil {
@@ -488,7 +521,8 @@ func (c *Connection) readFrame() (*Frame, error) {
 	}
 
 	if frameEnd[0] != FrameEnd {
-		return nil, fmt.Errorf("invalid frame end byte: %v", frameEnd[0])
+		c.sendConnectionClose(501, "frame-end octet missing", 0, 0)
+		return nil, fmt.Errorf("invalid frame-end octet: %x", frameEnd[0])
 	}
 
 	frameTypeName := getFrameTypeName(frame.Type)
@@ -637,6 +671,8 @@ func (c *Connection) handleMethod(frame *Frame) error { // Return type error
 
 	var err error
 	switch classId {
+	case ClassConfirm:
+		err = c.handleConfirmMethod(methodId, reader, frame.Channel)
 	case ClassConnection:
 		err = c.handleConnectionMethod(methodId, reader) // Assumes handleConnectionMethod also returns error
 	case ClassChannel:
@@ -663,6 +699,83 @@ func (c *Connection) handleMethod(frame *Frame) error { // Return type error
 	}
 
 	return nil // Success
+}
+
+func (c *Connection) handleConfirmMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+	methodName := getMethodName(ClassConfirm, methodId)
+
+	ch, channelExists, isClosing := c.getChannel(channelId)
+
+	if !channelExists && channelId != 0 {
+		replyText := fmt.Sprintf("COMMAND_INVALID - unknown channel id %d for confirm operation", channelId)
+		c.server.Err("Confirm method %s on non-existent channel %d. Sending Connection.Close.", methodName, channelId)
+		return c.sendConnectionClose(503, replyText, uint16(ClassConfirm), methodId)
+	}
+
+	if ch == nil && channelId != 0 {
+		c.server.Err("Internal error: channel %d object not found for confirm method %s", channelId, methodName)
+		return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR - channel state inconsistency", uint16(ClassConfirm), methodId)
+	}
+
+	if channelId == 0 {
+		replyText := "COMMAND_INVALID - confirm methods cannot be used on channel 0"
+		c.server.Err("Confirm method %s on channel 0. Sending Connection.Close.", methodName)
+		return c.sendConnectionClose(503, replyText, uint16(ClassConfirm), methodId)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring confirm method %s on channel %d that is being closed", methodName, channelId)
+		return nil
+	}
+
+	switch methodId {
+	case MethodConfirmSelect:
+		c.server.Info("Processing confirm.%s for channel %d", methodName, channelId)
+
+		// Read nowait bit
+		bits, err := reader.ReadByte()
+		if err != nil {
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed confirm.select (bits)", uint16(ClassConfirm), MethodConfirmSelect)
+		}
+
+		if reader.Len() > 0 {
+			c.server.Warn("Extra data at end of confirm.select payload for channel %d.", channelId)
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in confirm.select payload", uint16(ClassConfirm), MethodConfirmSelect)
+		}
+
+		noWait := (bits & 0x01) != 0
+
+		// Enable confirm mode for this channel
+		ch.mu.Lock()
+		ch.confirmMode = true
+		ch.mu.Unlock()
+
+		c.server.Info("Enabled publisher confirms on channel %d, noWait=%v", channelId, noWait)
+
+		if !noWait {
+			// Send Confirm.SelectOk
+			payloadOk := &bytes.Buffer{}
+			binary.Write(payloadOk, binary.BigEndian, uint16(ClassConfirm))
+			binary.Write(payloadOk, binary.BigEndian, uint16(MethodConfirmSelectOk))
+
+			if err := c.writeFrame(&Frame{
+				Type:    FrameMethod,
+				Channel: channelId,
+				Payload: payloadOk.Bytes(),
+			}); err != nil {
+				c.server.Err("Error sending confirm.select-ok: %v", err)
+				return err
+			}
+			c.server.Info("Sent confirm.select-ok for channel %d", channelId)
+		}
+
+		return nil
+
+	default:
+		replyText := fmt.Sprintf("unknown or not implemented confirm method id %d", methodId)
+		c.server.Err("Unhandled confirm method on channel %d: %s. Sending Channel.Close.", channelId, replyText)
+		return c.sendChannelClose(channelId, 540, replyText, uint16(ClassConfirm), methodId)
+	}
 }
 
 func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reader) error { // MODIFIED: Return type error
@@ -749,24 +862,21 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 
 	case MethodConnectionTuneOk:
 		c.server.Info("Processing connection.%s", methodName)
-		var channelMax uint16
-		var frameMax uint32
-		var heartbeatInterval uint16 // Renamed from heartbeat to avoid confusion
-		if err := binary.Read(reader, binary.BigEndian, &channelMax); err != nil {
+		if err := binary.Read(reader, binary.BigEndian, &c.channelMax); err != nil {
 			return c.sendConnectionClose(502, "malformed connection.tune-ok (channel-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 		}
-		if err := binary.Read(reader, binary.BigEndian, &frameMax); err != nil {
+		if err := binary.Read(reader, binary.BigEndian, &c.frameMax); err != nil {
 			return c.sendConnectionClose(502, "malformed connection.tune-ok (frame-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 		}
-		if err := binary.Read(reader, binary.BigEndian, &heartbeatInterval); err != nil {
+		if err := binary.Read(reader, binary.BigEndian, &c.heartbeatInterval); err != nil {
 			return c.sendConnectionClose(502, "malformed connection.tune-ok (heartbeat)", uint16(ClassConnection), MethodConnectionTuneOk)
 		}
 		if reader.Len() > 0 {
 			return c.sendConnectionClose(502, "extra data in connection.tune-ok", uint16(ClassConnection), MethodConnectionTuneOk)
 		}
+
 		c.server.Info("Connection parameters negotiated: channelMax=%d, frameMax=%d, heartbeat=%d",
-			channelMax, frameMax, heartbeatInterval)
-		// Store these if your server needs to enforce them (e.g., c.channelMax = channelMax)
+			c.channelMax, c.frameMax, c.heartbeatInterval)
 		return nil
 
 	case MethodConnectionOpen:
@@ -872,10 +982,10 @@ func (c *Connection) sendConnectionTune() error {
 	binary.Write(payload, binary.BigEndian, uint16(0))
 
 	// frameMax: suggested max frame size (including header and end byte)
-	binary.Write(payload, binary.BigEndian, uint32(131072))
+	binary.Write(payload, binary.BigEndian, uint32(suggestedFrameMaxSize))
 
 	// heartbeat: suggested heartbeat interval in seconds
-	binary.Write(payload, binary.BigEndian, uint16(60))
+	binary.Write(payload, binary.BigEndian, uint16(suggestedHeartbeatInterval))
 
 	if err := c.writeFrame(&Frame{
 		Type:    FrameMethod,
@@ -890,7 +1000,7 @@ func (c *Connection) sendConnectionTune() error {
 }
 
 func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
-	methodName := getMethodName(ClassChannel, methodId) // Ensure getMethodName is available
+	methodName := getMethodName(ClassChannel, methodId)
 
 	if methodId == MethodChannelOpen {
 		c.server.Info("Processing channel.%s for channel %d", methodName, channelId)
@@ -902,14 +1012,14 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 			return c.sendConnectionClose(502, "SYNTAX_ERROR - malformed out-of-band string in channel.open", uint16(ClassChannel), MethodChannelOpen)
 		}
 
-		// Check for extra data after the single reserved argument.
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data at end of channel.open payload for channel %d.", channelId)
 			// Channel.Open is fundamental; syntax error here often implies connection-level issue or badly formed client.
 			return c.sendConnectionClose(502, "SYNTAX_ERROR - extra data in channel.open payload", uint16(ClassChannel), MethodChannelOpen)
 		}
 
-		c.mu.Lock() // Lock connection to modify c.channels
+		// SPECIAL CASE: Need write lock for channel creation
+		c.mu.Lock()
 		if _, alreadyOpen := c.channels[channelId]; alreadyOpen {
 			c.mu.Unlock()
 			errMsg := fmt.Sprintf("channel %d already open", channelId)
@@ -918,13 +1028,16 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 			// Server should send Channel.Close, not Connection.Close here.
 			return c.sendChannelClose(channelId, 504, "CHANNEL_ERROR - channel ID already in use", uint16(ClassChannel), MethodChannelOpen)
 		}
-		// Create and add the new channel
+
 		newCh := &Channel{
-			id:              channelId,
-			conn:            c,
-			consumers:       make(map[string]string),
-			pendingMessages: make([]Message, 0),
-			// closingByServer, closeOkTimer will be zero/nil initially
+			id:               channelId,
+			conn:             c,
+			consumers:        make(map[string]string),
+			pendingMessages:  make([]Message, 0),
+			unackedMessages:  make(map[uint64]*UnackedMessage),
+			confirmMode:      false,
+			nextPublishSeqNo: 1,
+			pendingConfirms:  make(map[uint64]bool),
 		}
 		c.channels[channelId] = newCh
 		c.mu.Unlock()
@@ -944,7 +1057,7 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 		}
 		// AMQP 0-9-1 Channel.OpenOk has one field: channel-id (longstr), which is reserved and "MUST be empty".
 		// An empty longstr is represented by its length (uint32) being 0.
-		if err := binary.Write(payloadOpenOk, binary.BigEndian, uint32(0)); err != nil { // For the empty long string
+		if err := binary.Write(payloadOpenOk, binary.BigEndian, uint32(0)); err != nil {
 			c.server.Err("Internal error serializing empty longstr for Channel.OpenOk: %v", err)
 			c.forceRemoveChannel(channelId, "internal error sending channel.open-ok")
 			return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR", 0, 0)
@@ -952,45 +1065,39 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 
 		if err := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadOpenOk.Bytes()}); err != nil {
 			c.server.Err("Error sending channel.open-ok for channel %d: %v", channelId, err)
-			c.forceRemoveChannel(channelId, "failed to send channel.open-ok") // Clean up if OpenOk fails
-			return err                                                        // Propagate I/O error
+			c.forceRemoveChannel(channelId, "failed to send channel.open-ok")
+			return err
 		}
 		c.server.Info("Sent channel.open-ok for channel %d", channelId)
 		return nil
 	}
 
-	// For all other methods, the channel MUST exist.
-	c.mu.RLock() // RLock to check existence
-	ch, existsInMap := c.channels[channelId]
-	c.mu.RUnlock()
-
-	if !existsInMap || ch == nil {
-		errMsg := ""
-		if !existsInMap {
-			errMsg = fmt.Sprintf("received method %s for non-existent channel %d in map", methodName, channelId)
-		} else { // ch == nil but existsInMap was true (internal inconsistency)
-			errMsg = fmt.Sprintf("internal server error: channel %d object is nil in map for method %s", channelId, methodName)
-		}
+	// For all other methods, use getChannel
+	ch, exists, isClosing := c.getChannel(channelId)
+	if !exists {
+		errMsg := fmt.Sprintf("received method %s for non-existent channel %d", methodName, channelId)
 		c.server.Err(errMsg)
 		// If client sends a command on a channel server doesn't know (or is broken), it's a connection error.
 		// AMQP 504 CHANNEL_ERROR is appropriate.
 		return c.sendConnectionClose(504, "CHANNEL_ERROR - "+errMsg, uint16(ClassChannel), methodId)
 	}
 
-	// Channel exists, proceed with method handling
+	// Check if channel is closing
+	if isClosing && methodId != MethodChannelCloseOk {
+		c.server.Warn("Received method %s on channel %d that is already being closed by server. Ignoring.", methodName, channelId)
+		return nil
+	}
+
 	switch methodId {
-	case MethodChannelClose: // Client initiates Channel.Close
+	case MethodChannelClose:
 		c.server.Info("Processing channel.%s for channel %d (client initiated)", methodName, channelId)
 		var replyCode uint16
-
 		if err := binary.Read(reader, binary.BigEndian, &replyCode); err != nil {
 			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed channel.close (reply-code)", uint16(ClassChannel), MethodChannelClose)
 		}
 		replyText, err := readShortString(reader)
 		if err != nil {
 			c.server.Err("Error reading replyText for channel.close on channel %d: %v", channelId, err)
-			// Proceed with close, but log the malformed input from client
-			// return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed replyText in channel.close", uint16(ClassChannel), MethodChannelClose)
 		}
 
 		var classIdField, methodIdField uint16
@@ -1003,22 +1110,19 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data in client's channel.close payload for channel %d.", channelId)
-			// Server should still process the close but can send its own Channel.Close for syntax error if strict.
-			// For simplicity here, we proceed with their close request.
 		}
 
 		c.server.Info("Client requests channel close for channel %d: replyCode=%d, replyText='%s', classId=%d, methodId=%d",
 			channelId, replyCode, replyText, classIdField, methodIdField)
 
-		// Server cleans up and sends Channel.CloseOk
+		// Clean up and send CloseOk
 		c.forceRemoveChannel(channelId, "client initiated Channel.Close")
 
 		payloadCloseOk := &bytes.Buffer{}
 		if err := binary.Write(payloadCloseOk, binary.BigEndian, uint16(ClassChannel)); err != nil {
 			c.server.Err("Internal error serializing ClassChannel for Channel.CloseOk: %v", err)
-			return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR", 0, 0) // Connection error if we can't form response
+			return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR", 0, 0)
 		}
-
 		if err := binary.Write(payloadCloseOk, binary.BigEndian, uint16(MethodChannelCloseOk)); err != nil {
 			c.server.Err("Internal error serializing MethodChannelCloseOk: %v", err)
 			return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR", 0, 0)
@@ -1026,11 +1130,10 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 
 		if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadCloseOk.Bytes()}); errWrite != nil {
 			c.server.Err("Error sending channel.close-ok for client-initiated close on channel %d: %v", channelId, errWrite)
-			// Channel already removed by forceRemoveChannel, propagate I/O error
 			return errWrite
 		}
 		c.server.Info("Sent channel.close-ok for channel %d (client initiated)", channelId)
-		return nil // Channel closed gracefully by client
+		return nil
 
 	case MethodChannelCloseOk:
 		c.server.Info("Received channel.close-ok for channel %d.", channelId)
@@ -1040,57 +1143,41 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 			// For a simple CloseOk with extra data, just logging might be acceptable.
 		}
 
-		// Logic to handle stopping the timer and checking channel state ---
-		ch.mu.Lock() // Lock the specific channel
+		// Need to access timer, so lock the channel
+		ch.mu.Lock()
 		timerStopped := false
 		if ch.closeOkTimer != nil {
-			timerStopped = ch.closeOkTimer.Stop() // Stop the timeout timer
-			ch.closeOkTimer = nil                 // Clear the timer field
+			timerStopped = ch.closeOkTimer.Stop()
+			ch.closeOkTimer = nil
 		}
 		wasServerInitiated := ch.closingByServer
-		ch.mu.Unlock() // Unlock the channel before calling forceRemoveChannel (which also locks connection)
-		// --- END CHANGE ---
+		ch.mu.Unlock()
 
 		if wasServerInitiated {
 			if timerStopped {
 				c.server.Info("Client acknowledged server-initiated close for channel %d within timeout. Finalizing.", channelId)
 			} else {
-				// This case implies the timer might have already fired OR CloseOk arrived for a channel not server-closed.
-				c.server.Info("Client acknowledged server-initiated close for channel %d (timer might have already fired or was not set). Finalizing.", channelId)
+				c.server.Info("Client acknowledged server-initiated close for channel %d (timer might have already fired). Finalizing.", channelId)
 			}
 		} else {
-			c.server.Warn("Received unsolicited or late channel.close-ok for channel %d (was not marked as server-initiated). Finalizing.", channelId)
+			c.server.Warn("Received unsolicited or late channel.close-ok for channel %d. Finalizing.", channelId)
 		}
-		// Final removal from map
+
 		c.forceRemoveChannel(channelId, "received Channel.CloseOk")
 		return nil
 
 	default:
-		// For other methods, check if channel is already being closed by server.
-		ch.mu.Lock()
-		isClosing := ch.closingByServer
-		ch.mu.Unlock()
-
-		if isClosing {
-			c.server.Warn("Received method %s on channel %d that is already being closed by server. Ignoring.", methodName, channelId)
-			// Client should not send further commands (except CloseOk) on a channel it received Channel.Close for.
-			// If it does, server can ignore or send another Channel.Close. Ignoring is simpler.
-			return nil // nil means the command is just dropped, aligned to AMQP 0-9-1 spec
-		}
-
-		// CHANGE: Fallback to a generic "not implemented" for other channel methods ---
 		replyText := fmt.Sprintf("channel method %s (id %d) not implemented or invalid in this state", methodName, methodId)
 		c.server.Err("Unhandled channel method on channel %d: %s. Sending Channel.Close.", channelId, replyText)
-		return c.sendChannelClose(channelId, 540, replyText, uint16(ClassChannel), methodId) // 540 NOT_IMPLEMENTED
+		return c.sendChannelClose(channelId, 540, replyText, uint16(ClassChannel), methodId)
 	}
 }
 
 func (c *Connection) handleExchangeMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassExchange, methodId)
 
-	c.mu.RLock() // Check if channel exists
-	_, channelExists := c.channels[channelId]
-	c.mu.RUnlock()
+	_, channelExists, isClosing := c.getChannel(channelId)
+
 	if !channelExists && channelId != 0 { // Channel 0 is special and doesn't need this check here
 		// This is a critical error: operation on a non-existent channel.
 		// AMQP spec is somewhat open, could be Channel.Close or Connection.Close.
@@ -1099,6 +1186,11 @@ func (c *Connection) handleExchangeMethod(methodId uint16, reader *bytes.Reader,
 		c.server.Err("Exchange method %s on non-existent channel %d. Sending Connection.Close.", methodName, channelId)
 		// AMQP code 503 (COMMAND_INVALID) or 504 (CHANNEL_ERROR)
 		return c.sendConnectionClose(503, replyText, uint16(ClassExchange), methodId)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring exchange method %s on channel %d that is being closed", methodName, channelId)
+		return nil
 	}
 
 	switch methodId {
@@ -1267,15 +1359,18 @@ func (c *Connection) handleExchangeMethod(methodId uint16, reader *bytes.Reader,
 func (c *Connection) handleQueueMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassQueue, methodId)
 
-	c.mu.RLock() // Check if channel exists
-	_, channelExists := c.channels[channelId]
-	c.mu.RUnlock()
+	_, channelExists, isClosing := c.getChannel(channelId)
 	if !channelExists && channelId != 0 {
 		// This is a connection-level error as the channel context is invalid for the operation.
 		replyText := fmt.Sprintf("COMMAND_INVALID - unknown channel id %d for queue operation", channelId)
 		c.server.Err("Queue method %s on non-existent channel %d. Sending Connection.Close.", methodName, channelId)
 		// AMQP code 503 (COMMAND_INVALID) or 504 (CHANNEL_ERROR) - 503 is general for bad command sequence.
 		return c.sendConnectionClose(503, replyText, uint16(ClassQueue), methodId)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring queue method %s on channel %d that is being closed", methodName, channelId)
+		return nil
 	}
 
 	switch methodId {
@@ -1569,9 +1664,7 @@ func (c *Connection) handleQueueMethod(methodId uint16, reader *bytes.Reader, ch
 func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassBasic, methodId)
 
-	c.mu.RLock() // Lock connection to access its channels map
-	ch, channelExists := c.channels[channelId]
-	c.mu.RUnlock()
+	ch, channelExists, isClosing := c.getChannel(channelId)
 
 	if !channelExists && channelId != 0 { // Channel 0 is special and should not receive Basic methods
 		replyText := fmt.Sprintf("COMMAND_INVALID - unknown channel id %d for basic operation", channelId)
@@ -1592,7 +1685,17 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		return c.sendConnectionClose(503, replyText, uint16(ClassBasic), methodId)
 	}
 
+	if isClosing {
+		c.server.Debug("Ignoring basic method %s on channel %d that is being closed", methodName, channelId)
+		return nil
+	}
+
 	switch methodId {
+	case MethodBasicGet:
+		return c.handleBasicGet(reader, channelId)
+
+	case MethodBasicRecover:
+		return c.handleBasicRecover(reader, channelId)
 	case MethodBasicPublish:
 		var ticket uint16
 		if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
@@ -1793,14 +1896,23 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		}
 
 		// Start the message delivery goroutine for this consumer
-		go c.deliverMessages(channelId, actualConsumerTag, msgChan) // Pass noAck if deliverMessages needs it
+		go c.deliverMessages(channelId, actualConsumerTag, msgChan, noAck) // Pass noAck to delivery function
 		c.server.Info("Started message delivery goroutine for consumer '%s' on queue '%s' (noAck=%v)", actualConsumerTag, queueName, noAck)
+
+		go c.server.tryDispatchFromSingleQueue(queueName)
 		return nil
 
-	// Add cases for MethodBasicAck, MethodBasicNack, MethodBasicReject, MethodBasicCancel, etc.
-	// Example:
-	// case MethodBasicAck:
-	//  return c.sendChannelClose(channelId, 540, "Basic.Ack not implemented", uint16(ClassBasic), MethodBasicAck)
+	case MethodBasicAck:
+		return c.handleBasicAck(reader, channelId)
+
+	case MethodBasicNack:
+		return c.handleBasicNack(reader, channelId)
+
+	case MethodBasicReject:
+		return c.handleBasicReject(reader, channelId)
+
+	case MethodBasicCancel:
+		return c.handleBasicCancel(reader, channelId)
 
 	default:
 		replyText := fmt.Sprintf("unknown or not implemented basic method id %d", methodId)
@@ -1810,17 +1922,704 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 	}
 }
 
-func (c *Connection) handleHeader(frame *Frame) error {
+func (c *Connection) handleBasicGet(reader *bytes.Reader, channelId uint16) error {
+	var ticket uint16
+	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.get (ticket)", uint16(ClassBasic), MethodBasicGet)
+	}
+
+	queueName, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading queueName for basic.get: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.get (queueName)", uint16(ClassBasic), MethodBasicGet)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.get (noAck bit)", uint16(ClassBasic), MethodBasicGet)
+	}
+	noAck := (bits & 0x01) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of basic.get payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.get payload", uint16(ClassBasic), MethodBasicGet)
+	}
+
+	c.server.Info("Processing basic.get: queue='%s', noAck=%v on channel %d", queueName, noAck, channelId)
+
+	// Get the queue
+	c.server.mu.RLock()
+	queue, qExists := c.server.queues[queueName]
+	c.server.mu.RUnlock()
+
+	if !qExists {
+		replyText := fmt.Sprintf("no queue '%s' in vhost '/'", queueName)
+		c.server.Warn("Basic.Get: %s. Sending Channel.Close.", replyText)
+		return c.sendChannelClose(channelId, 404, replyText, uint16(ClassBasic), MethodBasicGet)
+	}
+
+	// Try to get a message from the queue
+	queue.mu.Lock()
+
+	if len(queue.Messages) == 0 {
+		queue.mu.Unlock()
+		// Send Basic.GetEmpty
+		c.server.Info("No messages available in queue '%s' for basic.get", queueName)
+		return c.sendBasicGetEmpty(channelId)
+	}
+
+	// Get the first message
+	msg := queue.Messages[0]
+	queue.Messages = queue.Messages[1:]
+	messageCount := uint32(len(queue.Messages))
+	queue.mu.Unlock()
+
+	// Get channel for delivery tag management
+	ch, exists, isClosing := c.getChannel(channelId)
+	if !exists {
+		// Put message back since we can't deliver it
+		queue.mu.Lock()
+		queue.Messages = append([]Message{msg}, queue.Messages...)
+		queue.mu.Unlock()
+		return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR - channel object nil", uint16(ClassBasic), MethodBasicGet)
+	}
+
+	if isClosing {
+		// Put message back since channel is closing
+		queue.mu.Lock()
+		queue.Messages = append([]Message{msg}, queue.Messages...)
+		queue.mu.Unlock()
+		c.server.Debug("Ignoring basic.get on channel %d that is being closed", channelId)
+		return nil
+	}
+
+	// Assign delivery tag and track if not noAck
+	ch.mu.Lock()
+	ch.deliveryTag++
+	deliveryTag := ch.deliveryTag
+
+	if !noAck {
+		unacked := &UnackedMessage{
+			Message:     msg,
+			ConsumerTag: "", // No consumer tag for basic.get
+			QueueName:   queueName,
+			DeliveryTag: deliveryTag,
+			Delivered:   time.Now(),
+		}
+		ch.unackedMessages[deliveryTag] = unacked
+	}
+	ch.mu.Unlock()
+
+	c.server.Info("Delivering message via basic.get: deliveryTag=%d, exchange=%s, routingKey=%s, bodySize=%d, noAck=%v, redelivered=%v",
+		deliveryTag, msg.Exchange, msg.RoutingKey, len(msg.Body), noAck, msg.Redelivered)
+
+	// Send Basic.GetOk method frame
+	methodPayload := &bytes.Buffer{}
+	binary.Write(methodPayload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(methodPayload, binary.BigEndian, uint16(MethodBasicGetOk))
+	binary.Write(methodPayload, binary.BigEndian, deliveryTag)
+
+	if msg.Redelivered {
+		methodPayload.WriteByte(1) // redelivered = true
+	} else {
+		methodPayload.WriteByte(0) // redelivered = false
+	}
+
+	writeShortString(methodPayload, msg.Exchange)
+	writeShortString(methodPayload, msg.RoutingKey)
+	binary.Write(methodPayload, binary.BigEndian, messageCount)
+
+	// Prepare header frame
+	headerPayload := &bytes.Buffer{}
+	binary.Write(headerPayload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(headerPayload, binary.BigEndian, uint16(0)) // weight
+	binary.Write(headerPayload, binary.BigEndian, uint64(len(msg.Body)))
+
+	// Calculate property flags
+	flags := uint16(0)
+	if msg.Properties.ContentType != "" {
+		flags |= 0x8000
+	}
+	if msg.Properties.ContentEncoding != "" {
+		flags |= 0x4000
+	}
+	if len(msg.Properties.Headers) > 0 {
+		flags |= 0x2000
+	}
+	if msg.Properties.DeliveryMode != 0 {
+		flags |= 0x1000
+	}
+	if msg.Properties.Priority != 0 {
+		flags |= 0x0800
+	}
+	if msg.Properties.CorrelationId != "" {
+		flags |= 0x0400
+	}
+	if msg.Properties.ReplyTo != "" {
+		flags |= 0x0200
+	}
+	if msg.Properties.Expiration != "" {
+		flags |= 0x0100
+	}
+	if msg.Properties.MessageId != "" {
+		flags |= 0x0080
+	}
+	if msg.Properties.Timestamp != 0 {
+		flags |= 0x0040
+	}
+	if msg.Properties.Type != "" {
+		flags |= 0x0020
+	}
+	if msg.Properties.UserId != "" {
+		flags |= 0x0010
+	}
+	if msg.Properties.AppId != "" {
+		flags |= 0x0008
+	}
+	if msg.Properties.ClusterId != "" {
+		flags |= 0x0004
+	}
+
+	binary.Write(headerPayload, binary.BigEndian, flags)
+
+	// Write properties based on flags
+	if flags&0x8000 != 0 {
+		writeShortString(headerPayload, msg.Properties.ContentType)
+	}
+	if flags&0x4000 != 0 {
+		writeShortString(headerPayload, msg.Properties.ContentEncoding)
+	}
+	if flags&0x2000 != 0 {
+		writeTable(headerPayload, msg.Properties.Headers)
+	}
+	if flags&0x1000 != 0 {
+		binary.Write(headerPayload, binary.BigEndian, msg.Properties.DeliveryMode)
+	}
+	if flags&0x0800 != 0 {
+		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Priority)
+	}
+	if flags&0x0400 != 0 {
+		writeShortString(headerPayload, msg.Properties.CorrelationId)
+	}
+	if flags&0x0200 != 0 {
+		writeShortString(headerPayload, msg.Properties.ReplyTo)
+	}
+	if flags&0x0100 != 0 {
+		writeShortString(headerPayload, msg.Properties.Expiration)
+	}
+	if flags&0x0080 != 0 {
+		writeShortString(headerPayload, msg.Properties.MessageId)
+	}
+	if flags&0x0040 != 0 {
+		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Timestamp)
+	}
+	if flags&0x0020 != 0 {
+		writeShortString(headerPayload, msg.Properties.Type)
+	}
+	if flags&0x0010 != 0 {
+		writeShortString(headerPayload, msg.Properties.UserId)
+	}
+	if flags&0x0008 != 0 {
+		writeShortString(headerPayload, msg.Properties.AppId)
+	}
+	if flags&0x0004 != 0 {
+		writeShortString(headerPayload, msg.Properties.ClusterId)
+	}
+
+	// Send all three frames atomically
+	c.writeMu.Lock()
+
+	// Buffer GetOk frame
+	if err := c.writeFrameInternal(FrameMethod, channelId, methodPayload.Bytes()); err != nil {
+		c.writeMu.Unlock()
+		c.server.Err("Error buffering basic.get-ok frame: %v", err)
+		// Put message back in queue if we failed to send
+		queue.mu.Lock()
+		queue.Messages = append([]Message{msg}, queue.Messages...)
+		queue.mu.Unlock()
+		// Remove from unacked if we tracked it
+		if !noAck {
+			ch.mu.Lock()
+			delete(ch.unackedMessages, deliveryTag)
+			ch.mu.Unlock()
+		}
+		return err
+	}
+
+	// Buffer header frame
+	if err := c.writeFrameInternal(FrameHeader, channelId, headerPayload.Bytes()); err != nil {
+		c.writeMu.Unlock()
+		c.server.Err("Error buffering header frame for basic.get: %v", err)
+		return err
+	}
+
+	// Buffer body frame
+	if err := c.writeFrameInternal(FrameBody, channelId, msg.Body); err != nil {
+		c.writeMu.Unlock()
+		c.server.Err("Error buffering body frame for basic.get: %v", err)
+		return err
+	}
+
+	// Flush all frames
+	if err := c.writer.Flush(); err != nil {
+		c.writeMu.Unlock()
+		c.server.Err("Error flushing frames for basic.get: %v", err)
+		return err
+	}
+
+	c.writeMu.Unlock()
+
+	c.server.Info("Successfully delivered message via basic.get (deliveryTag=%d)", deliveryTag)
+	return nil
+}
+
+func (c *Connection) sendBasicGetEmpty(channelId uint16) error {
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(payload, binary.BigEndian, uint16(MethodBasicGetEmpty))
+	writeShortString(payload, "") // cluster-id (reserved, must be empty)
+
+	return c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payload.Bytes(),
+	})
+}
+
+func (c *Connection) handleBasicCancel(reader *bytes.Reader, channelId uint16) error {
+	consumerTag, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading consumerTag for basic.cancel: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.cancel (consumerTag)", uint16(ClassBasic), MethodBasicCancel)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.cancel (noWait bit)", uint16(ClassBasic), MethodBasicCancel)
+	}
+	noWait := (bits & 0x01) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of basic.cancel payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.cancel payload", uint16(ClassBasic), MethodBasicCancel)
+	}
+
+	c.server.Info("Processing basic.cancel: consumerTag='%s', noWait=%v on channel %d", consumerTag, noWait, channelId)
+
 	c.mu.RLock()
-	ch := c.channels[frame.Channel]
+	ch := c.channels[channelId]
 	c.mu.RUnlock()
 
 	if ch == nil {
+		return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR - channel object nil", uint16(ClassBasic), MethodBasicCancel)
+	}
+
+	ch.mu.Lock()
+	queueName, exists := ch.consumers[consumerTag]
+	if !exists {
+		ch.mu.Unlock()
+		return c.sendChannelClose(channelId, 404, fmt.Sprintf("NOT_FOUND - no consumer '%s'", consumerTag), uint16(ClassBasic), MethodBasicCancel)
+	}
+	// Remove from channel's consumer map
+	delete(ch.consumers, consumerTag)
+	ch.mu.Unlock()
+
+	// Remove from queue's consumer map
+	c.server.mu.RLock()
+	queue, qExists := c.server.queues[queueName]
+	c.server.mu.RUnlock()
+
+	if qExists && queue != nil {
+		queue.mu.Lock()
+		if msgChan, consumerExists := queue.Consumers[consumerTag]; consumerExists {
+			close(msgChan) // This will cause deliverMessages goroutine to exit
+			delete(queue.Consumers, consumerTag)
+			c.server.Info("Cancelled consumer '%s' on queue '%s' for channel %d", consumerTag, queueName, channelId)
+		}
+		queue.mu.Unlock()
+	}
+
+	if !noWait {
+		// Send Basic.CancelOk
+		payload := &bytes.Buffer{}
+		binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
+		binary.Write(payload, binary.BigEndian, uint16(MethodBasicCancelOk))
+		writeShortString(payload, consumerTag)
+
+		if err := c.writeFrame(&Frame{
+			Type:    FrameMethod,
+			Channel: channelId,
+			Payload: payload.Bytes(),
+		}); err != nil {
+			c.server.Err("Error sending basic.cancel-ok for consumer '%s': %v", consumerTag, err)
+			return err
+		}
+		c.server.Info("Sent basic.cancel-ok for consumer '%s'", consumerTag)
+	}
+
+	return nil
+}
+
+func (c *Connection) handleBasicAck(reader *bytes.Reader, channelId uint16) error {
+	var deliveryTag uint64
+	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.ack (delivery-tag)", uint16(ClassBasic), MethodBasicAck)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.ack (bits)", uint16(ClassBasic), MethodBasicAck)
+	}
+
+	multiple := (bits & 0x01) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of basic.ack payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.ack payload", uint16(ClassBasic), MethodBasicAck)
+	}
+
+	c.server.Info("Processing basic.ack: deliveryTag=%d, multiple=%v on channel %d", deliveryTag, multiple, channelId)
+
+	ch, exists, isClosing := c.getChannel(channelId)
+
+	if !exists {
+		return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR - channel object nil", uint16(ClassBasic), MethodBasicAck)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring basic.ack on channel %d that is being closed", channelId)
+		return nil
+	}
+
+	ch.mu.Lock()
+
+	if deliveryTag == 0 {
+		// delivery-tag of 0 means "all messages delivered so far"
+		if !multiple {
+			ch.mu.Unlock()
+			// If multiple is false and delivery-tag is 0, it's a protocol error
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - delivery-tag 0 with multiple=false", uint16(ClassBasic), MethodBasicAck)
+		}
+		// Acknowledge all messages
+		for tag := range ch.unackedMessages {
+			delete(ch.unackedMessages, tag)
+		}
+		c.server.Info("Acknowledged all messages on channel %d", channelId)
+	} else {
+		if multiple {
+			// Acknowledge all messages up to and including deliveryTag
+			for tag := range ch.unackedMessages {
+				if tag <= deliveryTag {
+					delete(ch.unackedMessages, tag)
+					c.server.Debug("Acknowledged message with delivery tag %d on channel %d", tag, channelId)
+				}
+			}
+			c.server.Info("Acknowledged messages up to delivery tag %d on channel %d", deliveryTag, channelId)
+		} else {
+			// Acknowledge only the specific message
+			if _, exists := ch.unackedMessages[deliveryTag]; !exists {
+				ch.mu.Unlock()
+				// AMQP spec: unknown delivery tag is a channel error
+				return c.sendChannelClose(channelId, 406, fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d", deliveryTag), uint16(ClassBasic), MethodBasicAck)
+			}
+			delete(ch.unackedMessages, deliveryTag)
+			c.server.Info("Acknowledged message with delivery tag %d on channel %d", deliveryTag, channelId)
+		}
+	}
+
+	ch.mu.Unlock()
+	return nil
+}
+
+func (c *Connection) handleBasicNack(reader *bytes.Reader, channelId uint16) error {
+	var deliveryTag uint64
+	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.nack (delivery-tag)", uint16(ClassBasic), MethodBasicNack)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.nack (bits)", uint16(ClassBasic), MethodBasicNack)
+	}
+
+	multiple := (bits & 0x01) != 0
+	requeue := (bits & 0x02) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of basic.nack payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.nack payload", uint16(ClassBasic), MethodBasicNack)
+	}
+
+	c.server.Info("Processing basic.nack: deliveryTag=%d, multiple=%v, requeue=%v on channel %d",
+		deliveryTag, multiple, requeue, channelId)
+
+	ch, exists, isClosing := c.getChannel(channelId)
+
+	if !exists {
+		// This should ideally not happen if channel existence is checked before calling handlers for specific classes.
+		// However, if it does, it's a server-side issue with channel management.
+		c.server.Err("Internal error: channel object nil for basic.nack on channel %d", channelId)
+		return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR - channel object nil for nack", uint16(ClassBasic), MethodBasicNack)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring basic.nack on channel %d that is being closed", channelId)
+		return nil
+	}
+
+	ch.mu.Lock() // Lock channel to safely access unackedMessages
+
+	var messagesToProcess []*UnackedMessage
+	var affectedQueues = make(map[string]bool) // To track queues that need dispatch attempt
+
+	if deliveryTag == 0 {
+		if !multiple {
+			ch.mu.Unlock()
+			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - delivery-tag 0 with multiple=false for nack", uint16(ClassBasic), MethodBasicNack)
+		}
+		for _, unacked := range ch.unackedMessages {
+			messagesToProcess = append(messagesToProcess, unacked)
+		}
+		// Clear all unacked messages after collecting them
+		ch.unackedMessages = make(map[uint64]*UnackedMessage)
+	} else {
+		if multiple {
+			for tag, unacked := range ch.unackedMessages {
+				if tag <= deliveryTag {
+					messagesToProcess = append(messagesToProcess, unacked)
+					delete(ch.unackedMessages, tag)
+				}
+			}
+		} else {
+			unacked, exists := ch.unackedMessages[deliveryTag]
+			if !exists {
+				ch.mu.Unlock()
+				return c.sendChannelClose(channelId, 406, fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d for nack", deliveryTag), uint16(ClassBasic), MethodBasicNack)
+			}
+			messagesToProcess = append(messagesToProcess, unacked)
+			delete(ch.unackedMessages, deliveryTag)
+		}
+	}
+	ch.mu.Unlock() // Unlock channel as soon as unackedMessages modification is done
+
+	// Process the nacked messages
+	if requeue {
+		for _, unacked := range messagesToProcess {
+			c.server.mu.RLock() // Lock server to safely access s.queues
+			queue, qExists := c.server.queues[unacked.QueueName]
+			c.server.mu.RUnlock()
+
+			if qExists && queue != nil {
+				unacked.Message.Redelivered = true // Mark message as redelivered
+
+				queue.mu.Lock() // Lock the specific queue
+				// Prepend to queue (requeued messages go to front)
+				queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+				c.server.Info("Requeued message to queue '%s' (original delivery tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
+				affectedQueues[unacked.QueueName] = true
+				queue.mu.Unlock() // Unlock the queue
+			} else {
+				c.server.Warn("Queue '%s' not found for requeuing nacked message (tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
+			}
+		}
+	} else {
+		// Messages are discarded (potentially dead-lettered in a more advanced server)
+		c.server.Info("Discarded %d nacked messages (requeue=false) from channel %d", len(messagesToProcess), channelId)
+	}
+
+	// Attempt to dispatch from affected queues if messages were requeued
+	if requeue {
+		for queueName := range affectedQueues {
+			go c.server.tryDispatchFromSingleQueue(queueName) // Run in a goroutine to avoid blocking the handler
+		}
+	}
+
+	return nil
+}
+
+func (c *Connection) handleBasicReject(reader *bytes.Reader, channelId uint16) error {
+	var deliveryTag uint64
+	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.reject (delivery-tag)", uint16(ClassBasic), MethodBasicReject)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.reject (requeue bit)", uint16(ClassBasic), MethodBasicReject)
+	}
+	requeue := (bits & 0x01) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of basic.reject payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.reject payload", uint16(ClassBasic), MethodBasicReject)
+	}
+
+	c.server.Info("Processing basic.reject: deliveryTag=%d, requeue=%v on channel %d", deliveryTag, requeue, channelId)
+
+	ch, exists, isClosing := c.getChannel(channelId)
+	if !exists {
+		c.server.Err("Internal error: channel object nil for basic.reject on channel %d", channelId)
+		return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR - channel object nil for reject", uint16(ClassBasic), MethodBasicReject)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring basic.reject on channel %d that is being closed", channelId)
+		return nil
+	}
+
+	ch.mu.Lock() // Lock channel
+	if deliveryTag == 0 {
+		ch.mu.Unlock()
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - delivery-tag cannot be 0 for basic.reject", uint16(ClassBasic), MethodBasicReject)
+	}
+
+	unacked, exists := ch.unackedMessages[deliveryTag]
+	if !exists {
+		ch.mu.Unlock()
+		return c.sendChannelClose(channelId, 406, fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d for reject", deliveryTag), uint16(ClassBasic), MethodBasicReject)
+	}
+	delete(ch.unackedMessages, deliveryTag) // Remove from unacked
+	ch.mu.Unlock()                          // Unlock channel
+
+	var queueToDispatch string // To store the name of the queue if dispatch is needed
+
+	if requeue {
+		c.server.mu.RLock() // Lock server to safely access s.queues
+		queue, qExists := c.server.queues[unacked.QueueName]
+		c.server.mu.RUnlock()
+
+		if qExists && queue != nil {
+			unacked.Message.Redelivered = true // Mark message as redelivered
+
+			queue.mu.Lock() // Lock the specific queue
+			queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+			c.server.Info("Requeued rejected message to queue '%s' (delivery tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
+			queueToDispatch = unacked.QueueName
+			queue.mu.Unlock() // Unlock the queue
+		} else {
+			c.server.Warn("Queue '%s' not found for requeuing rejected message (tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
+		}
+	} else {
+		// Message is discarded
+		c.server.Info("Discarded rejected message (requeue=false) from channel %d (delivery tag %d)", channelId, deliveryTag)
+	}
+
+	// Attempt to dispatch from the affected queue if a message was requeued
+	if queueToDispatch != "" {
+		go c.server.tryDispatchFromSingleQueue(queueToDispatch)
+	}
+
+	return nil
+}
+
+func (c *Connection) handleBasicRecover(reader *bytes.Reader, channelId uint16) error {
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed basic.recover (requeue bit)", uint16(ClassBasic), MethodBasicRecover)
+	}
+	requeue := (bits & 0x01) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of basic.recover payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.recover payload", uint16(ClassBasic), MethodBasicRecover)
+	}
+
+	c.server.Info("Processing basic.recover: requeue=%v on channel %d", requeue, channelId)
+
+	ch, exists, isClosing := c.getChannel(channelId)
+	if !exists {
+		return c.sendConnectionClose(500, "INTERNAL_SERVER_ERROR - channel object nil", uint16(ClassBasic), MethodBasicRecover)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring basic.recover on channel %d that is being closed", channelId)
+		return nil
+	}
+
+	ch.mu.Lock()
+
+	// Collect all unacked messages
+	var messagesToProcess []*UnackedMessage
+	affectedQueues := make(map[string]bool)
+
+	for _, unacked := range ch.unackedMessages {
+		messagesToProcess = append(messagesToProcess, unacked)
+		affectedQueues[unacked.QueueName] = true
+	}
+
+	// Clear all unacked messages from this channel
+	ch.unackedMessages = make(map[uint64]*UnackedMessage)
+	ch.mu.Unlock()
+
+	c.server.Info("Basic.Recover: Processing %d unacked messages with requeue=%v", len(messagesToProcess), requeue)
+
+	if requeue {
+		// Requeue messages to their original queues
+		for _, unacked := range messagesToProcess {
+			c.server.mu.RLock()
+			queue, qExists := c.server.queues[unacked.QueueName]
+			c.server.mu.RUnlock()
+
+			if qExists && queue != nil {
+				unacked.Message.Redelivered = true
+
+				queue.mu.Lock()
+				// Prepend to queue (recovered messages go to front)
+				queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+				c.server.Info("Requeued recovered message to queue '%s' (original delivery tag %d on channel %d)",
+					unacked.QueueName, unacked.DeliveryTag, channelId)
+				queue.mu.Unlock()
+			} else {
+				c.server.Warn("Queue '%s' not found for requeuing recovered message (tag %d on channel %d)",
+					unacked.QueueName, unacked.DeliveryTag, channelId)
+			}
+		}
+
+		// Trigger dispatch for affected queues
+		for queueName := range affectedQueues {
+			go c.server.tryDispatchFromSingleQueue(queueName)
+		}
+	} else {
+		// If requeue is false, messages should be redelivered to the original consumer
+		// Since we don't track which consumer received each message, and the AMQP spec
+		// is vague about this case, we'll treat it as discarding the messages
+		// (similar to nack with requeue=false)
+		c.server.Info("Discarded %d recovered messages (requeue=false) from channel %d",
+			len(messagesToProcess), channelId)
+	}
+
+	// Send Basic.RecoverOk
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(payload, binary.BigEndian, uint16(MethodBasicRecoverOk))
+
+	if err := c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payload.Bytes(),
+	}); err != nil {
+		c.server.Err("Error sending basic.recover-ok: %v", err)
+		return err
+	}
+
+	c.server.Info("Sent basic.recover-ok for channel %d", channelId)
+	return nil
+}
+
+func (c *Connection) handleHeader(frame *Frame) error {
+	ch, exists, isClosing := c.getChannel(frame.Channel)
+
+	if !exists {
 		// Header frame for a non-existent channel (or channel 0 which shouldn't get headers like this)
 		c.server.Warn("Received header frame on non-existent or invalid channel %d", frame.Channel)
 		// AMQP code 504 (CHANNEL_ERROR)
 		// This is a connection error because the channel context is wrong.
 		return c.sendConnectionClose(504, fmt.Sprintf("header frame on invalid channel %d", frame.Channel), 0, 0)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring header frame on channel %d that is being closed by server", frame.Channel)
+		return nil
 	}
 
 	ch.mu.Lock()
@@ -1971,72 +2770,71 @@ func (c *Connection) handleHeader(frame *Frame) error {
 
 func (c *Connection) handleBody(frame *Frame) {
 	// Get the channel and its pendingMessage
-	c.mu.RLock()
-	ch := c.channels[frame.Channel]
-	c.mu.RUnlock()
+	ch, exists, isClosing := c.getChannel(frame.Channel)
 
-	if ch != nil {
-		ch.mu.Lock()
+	if !exists {
+		c.server.Warn("Received body frame on non-existent channel %d", frame.Channel)
+		return
+	}
 
-		// Check if channel is being closed by server
-		if ch.closingByServer {
-			ch.mu.Unlock()
-			c.server.Debug("Ignoring body frame on channel %d that is being closed by server", frame.Channel)
-			return // Just ignore it
+	if isClosing {
+		c.server.Debug("Ignoring body frame on channel %d that is being closed by server", frame.Channel)
+		return
+	}
+
+	ch.mu.Lock()
+
+	if len(ch.pendingMessages) > 0 {
+		// Take the FIRST pending message (FIFO)
+		pendingMessage := ch.pendingMessages[0]
+		ch.pendingMessages = ch.pendingMessages[1:] // Remove it
+
+		c.server.Info("Processing body frame: channel=%d, size=%d, exchange=%s, routingKey=%s",
+			frame.Channel, len(frame.Payload), pendingMessage.Exchange, pendingMessage.RoutingKey)
+
+		// Create a DEEP copy of Properties
+		propertiesCopy := Properties{
+			ContentType:     pendingMessage.Properties.ContentType,
+			ContentEncoding: pendingMessage.Properties.ContentEncoding,
+			DeliveryMode:    pendingMessage.Properties.DeliveryMode,
+			Priority:        pendingMessage.Properties.Priority,
+			CorrelationId:   pendingMessage.Properties.CorrelationId,
+			ReplyTo:         pendingMessage.Properties.ReplyTo,
+			Expiration:      pendingMessage.Properties.Expiration,
+			MessageId:       pendingMessage.Properties.MessageId,
+			Timestamp:       pendingMessage.Properties.Timestamp,
+			Type:            pendingMessage.Properties.Type,
+			UserId:          pendingMessage.Properties.UserId,
+			AppId:           pendingMessage.Properties.AppId,
+			ClusterId:       pendingMessage.Properties.ClusterId,
 		}
 
-		if len(ch.pendingMessages) > 0 {
-			// Take the FIRST pending message (FIFO)
-			pendingMessage := ch.pendingMessages[0]
-			ch.pendingMessages = ch.pendingMessages[1:] // Remove it
-
-			c.server.Info("Processing body frame: channel=%d, size=%d, exchange=%s, routingKey=%s",
-				frame.Channel, len(frame.Payload), pendingMessage.Exchange, pendingMessage.RoutingKey)
-
-			// Create a DEEP copy of Properties
-			propertiesCopy := Properties{
-				ContentType:     pendingMessage.Properties.ContentType,
-				ContentEncoding: pendingMessage.Properties.ContentEncoding,
-				DeliveryMode:    pendingMessage.Properties.DeliveryMode,
-				Priority:        pendingMessage.Properties.Priority,
-				CorrelationId:   pendingMessage.Properties.CorrelationId,
-				ReplyTo:         pendingMessage.Properties.ReplyTo,
-				Expiration:      pendingMessage.Properties.Expiration,
-				MessageId:       pendingMessage.Properties.MessageId,
-				Timestamp:       pendingMessage.Properties.Timestamp,
-				Type:            pendingMessage.Properties.Type,
-				UserId:          pendingMessage.Properties.UserId,
-				AppId:           pendingMessage.Properties.AppId,
-				ClusterId:       pendingMessage.Properties.ClusterId,
+		// Deep copy the Headers map if it exists
+		if pendingMessage.Properties.Headers != nil {
+			propertiesCopy.Headers = make(map[string]interface{})
+			for k, v := range pendingMessage.Properties.Headers {
+				propertiesCopy.Headers[k] = v
 			}
-
-			// Deep copy the Headers map if it exists
-			if pendingMessage.Properties.Headers != nil {
-				propertiesCopy.Headers = make(map[string]interface{})
-				for k, v := range pendingMessage.Properties.Headers {
-					propertiesCopy.Headers[k] = v
-				}
-			}
-
-			// Create the complete message with deep-copied properties
-			messageToDeliver := Message{
-				Exchange:   pendingMessage.Exchange,
-				RoutingKey: pendingMessage.RoutingKey,
-				Mandatory:  pendingMessage.Mandatory,
-				Immediate:  pendingMessage.Immediate,
-				Properties: propertiesCopy,
-				Body:       make([]byte, len(frame.Payload)),
-			}
-			copy(messageToDeliver.Body, frame.Payload)
-
-			ch.mu.Unlock()
-
-			// Deliver the message
-			c.deliverMessage(messageToDeliver, frame.Channel)
-		} else {
-			ch.mu.Unlock()
-			c.server.Warn("Received body frame with no pending message on channel %d", frame.Channel)
 		}
+
+		// Create the complete message with deep-copied properties
+		messageToDeliver := Message{
+			Exchange:   pendingMessage.Exchange,
+			RoutingKey: pendingMessage.RoutingKey,
+			Mandatory:  pendingMessage.Mandatory,
+			Immediate:  pendingMessage.Immediate,
+			Properties: propertiesCopy,
+			Body:       make([]byte, len(frame.Payload)),
+		}
+		copy(messageToDeliver.Body, frame.Payload)
+
+		ch.mu.Unlock()
+
+		// Deliver the message
+		c.deliverMessage(messageToDeliver, frame.Channel)
+	} else {
+		ch.mu.Unlock()
+		c.server.Warn("Received body frame with no pending message on channel %d", frame.Channel)
 	}
 }
 
@@ -2120,6 +2918,22 @@ func (c *Connection) routeTopic(exchange *Exchange, routingKey string) []string 
 func (c *Connection) deliverMessage(msg Message, channelId uint16) {
 	c.server.Info("Message: exchange=%s, routingKey=%s, mandatory=%v", msg.Exchange, msg.RoutingKey, msg.Mandatory)
 
+	// Get channel for confirm handling
+	ch, exists, _ := c.getChannel(channelId)
+	var deliveryTag uint64
+	var confirmMode bool
+
+	if exists && ch != nil && channelId != 0 {
+		ch.mu.Lock()
+		if ch.confirmMode {
+			confirmMode = true
+			deliveryTag = ch.nextPublishSeqNo
+			ch.nextPublishSeqNo++
+			ch.pendingConfirms[deliveryTag] = true
+		}
+		ch.mu.Unlock()
+	}
+
 	// Route the message
 	queueNames, err := c.routeMessage(msg)
 	if err != nil {
@@ -2132,6 +2946,10 @@ func (c *Connection) deliverMessage(msg Message, channelId uint16) {
 			// Also send the header and body frames after basic.return
 			c.sendReturnedMessage(channelId, msg)
 		}
+		// Send negative acknowledgment if in confirm mode
+		if confirmMode {
+			c.sendBasicNack(channelId, deliveryTag, false, false)
+		}
 		return
 	}
 
@@ -2142,11 +2960,19 @@ func (c *Connection) deliverMessage(msg Message, channelId uint16) {
 		// Send basic.return
 		if returnErr := c.sendBasicReturn(channelId, 312, "NO_ROUTE", msg.Exchange, msg.RoutingKey); returnErr != nil {
 			c.server.Err("Failed to send basic.return: %v", returnErr)
+			// Send negative acknowledgment if in confirm mode
+			if confirmMode {
+				c.sendBasicNack(channelId, deliveryTag, false, false)
+			}
 			return
 		}
 
 		// Send the returned message content
 		c.sendReturnedMessage(channelId, msg)
+		// Send negative acknowledgment if in confirm mode
+		if confirmMode {
+			c.sendBasicNack(channelId, deliveryTag, false, false)
+		}
 		return
 	}
 
@@ -2154,6 +2980,104 @@ func (c *Connection) deliverMessage(msg Message, channelId uint16) {
 	for _, queueName := range queueNames {
 		c.deliverToQueue(queueName, msg)
 	}
+
+	// Send positive acknowledgment if in confirm mode
+	if confirmMode {
+		c.sendBasicAck(channelId, deliveryTag, false)
+	}
+}
+
+func (c *Connection) sendBasicAck(channelId uint16, deliveryTag uint64, multiple bool) error {
+	ch, exists, _ := c.getChannel(channelId)
+	if !exists || ch == nil {
+		return fmt.Errorf("channel %d not found for sending basic.ack", channelId)
+	}
+
+	ch.mu.Lock()
+	if !ch.confirmMode {
+		ch.mu.Unlock()
+		return nil // Not in confirm mode, nothing to do
+	}
+
+	// Remove from pending confirms
+	if multiple {
+		for tag := range ch.pendingConfirms {
+			if tag <= deliveryTag {
+				delete(ch.pendingConfirms, tag)
+			}
+		}
+	} else {
+		delete(ch.pendingConfirms, deliveryTag)
+	}
+	ch.mu.Unlock()
+
+	c.server.Info("Sending basic.ack for publisher confirm on channel %d: deliveryTag=%d, multiple=%v",
+		channelId, deliveryTag, multiple)
+
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(payload, binary.BigEndian, uint16(MethodBasicAck))
+	binary.Write(payload, binary.BigEndian, deliveryTag)
+
+	if multiple {
+		payload.WriteByte(1)
+	} else {
+		payload.WriteByte(0)
+	}
+
+	return c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payload.Bytes(),
+	})
+}
+
+func (c *Connection) sendBasicNack(channelId uint16, deliveryTag uint64, multiple bool, requeue bool) error {
+	ch, exists, _ := c.getChannel(channelId)
+	if !exists || ch == nil {
+		return fmt.Errorf("channel %d not found for sending basic.nack", channelId)
+	}
+
+	ch.mu.Lock()
+	if !ch.confirmMode {
+		ch.mu.Unlock()
+		return nil // Not in confirm mode, nothing to do
+	}
+
+	// Remove from pending confirms
+	if multiple {
+		for tag := range ch.pendingConfirms {
+			if tag <= deliveryTag {
+				delete(ch.pendingConfirms, tag)
+			}
+		}
+	} else {
+		delete(ch.pendingConfirms, deliveryTag)
+	}
+	ch.mu.Unlock()
+
+	c.server.Info("Sending basic.nack for publisher confirm on channel %d: deliveryTag=%d, multiple=%v, requeue=%v",
+		channelId, deliveryTag, multiple, requeue)
+
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(payload, binary.BigEndian, uint16(MethodBasicNack))
+	binary.Write(payload, binary.BigEndian, deliveryTag)
+
+	bits := byte(0)
+	if multiple {
+		bits |= 0x01
+	}
+	if requeue {
+		bits |= 0x02
+	}
+	payload.WriteByte(bits)
+
+	return c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payload.Bytes(),
+	})
 }
 
 // Helper method to send the returned message's header and body
@@ -2287,14 +3211,15 @@ func (c *Connection) deliverToQueue(queueName string, msg Message) {
 	}
 
 	queue.mu.Lock()
-	defer queue.mu.Unlock()
+	defer queue.mu.Unlock() // Keep lock for entire operation
 
 	// Create a deep copy of the message
 	msgCopy := Message{
-		Exchange:   msg.Exchange,
-		RoutingKey: msg.RoutingKey,
-		Mandatory:  msg.Mandatory,
-		Immediate:  msg.Immediate,
+		Exchange:    msg.Exchange,
+		RoutingKey:  msg.RoutingKey,
+		Mandatory:   msg.Mandatory,
+		Immediate:   msg.Immediate,
+		Redelivered: msg.Redelivered,
 		Properties: Properties{
 			ContentType:     msg.Properties.ContentType,
 			ContentEncoding: msg.Properties.ContentEncoding,
@@ -2314,53 +3239,96 @@ func (c *Connection) deliverToQueue(queueName string, msg Message) {
 	}
 	copy(msgCopy.Body, msg.Body)
 
-	// Deep copy headers if they exist
 	if msg.Properties.Headers != nil {
 		msgCopy.Properties.Headers = make(map[string]interface{})
-		for k, v := range msg.Properties.Headers {
-			msgCopy.Properties.Headers[k] = v
+		maps.Copy(msgCopy.Properties.Headers, msg.Properties.Headers)
+	}
+
+	delivered := false
+	var consumerTags []string
+	for tag := range queue.Consumers {
+		consumerTags = append(consumerTags, tag)
+	}
+
+	for _, consumerTag := range consumerTags {
+		msgChan, stillExists := queue.Consumers[consumerTag]
+		if !stillExists {
+			continue
+		}
+
+		select {
+		case msgChan <- msgCopy:
+			c.server.Info("Message (ID: %s, RK: %s) delivered directly to consumer '%s' on queue '%s'",
+				msgCopy.Properties.MessageId, msgCopy.RoutingKey, consumerTag, queueName)
+			delivered = true
+			return // Exit after delivering to ONE consumer
+		default:
+			c.server.Debug("Consumer '%s' on queue '%s' is busy or its channel is full. Trying next.",
+				consumerTag, queueName)
+			continue
 		}
 	}
 
-	queue.Messages = append(queue.Messages, msgCopy)
-	c.server.Info("Queue %s now has %d messages", queueName, len(queue.Messages))
+	// If no consumer could accept the message immediately, add it to the queue
+	if !delivered {
+		queue.Messages = append(queue.Messages, msgCopy)
+		queueLength := len(queue.Messages) // Capture while locked
+		c.server.Info("No consumer immediately available for message (ID: %s, RK: %s) on queue '%s'. Message enqueued. Queue now has %d messages.",
+			queueName, msgCopy.Properties.MessageId, queueLength)
 
-	// Send to all consumers for this queue
-	for consumerTag, msgChan := range queue.Consumers {
-		c.server.Info("Sending message to consumer %s in queue %s", consumerTag, queueName)
-		select {
-		case msgChan <- msgCopy:
-			c.server.Info("Message queued for consumer %s", consumerTag)
-		default:
-			c.server.Warn("Consumer %s channel full, message dropped", consumerTag)
-		}
+		// Dispatch decision made while holding lock - trigger after unlock
+		go c.server.tryDispatchFromSingleQueue(queueName)
 	}
 }
 
-func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgChan chan Message) {
+func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgChan chan Message, noAck bool) {
 	for msg := range msgChan { // Loop as long as the message channel is open
-		c.mu.RLock()
-		ch := c.channels[channelId]
-		c.mu.RUnlock()
+		ch, exists, isClosing := c.getChannel(channelId)
 
-		if ch == nil {
+		if !exists {
 			c.server.Info("Channel %d no longer exists, stopping delivery for consumer %s", channelId, consumerTag)
 			return // Exit goroutine if channel is gone
 		}
 
-		// Atomically increment delivery tag for this channel
+		if isClosing {
+			c.server.Info("Channel %d is closing, stopping delivery for consumer %s", channelId, consumerTag)
+			return
+		}
+
+		// Get queue name for this consumer
 		ch.mu.Lock()
+		queueName, hasQueue := ch.consumers[consumerTag]
+
+		if !hasQueue {
+			ch.mu.Unlock()
+			c.server.Warn("Consumer %s not found in channel %d consumers map", consumerTag, channelId)
+			continue
+		}
+
+		// Atomically increment delivery tag for this channel
 		ch.deliveryTag++
 		deliveryTag := ch.deliveryTag
+
+		// If not noAck, track this message as unacknowledged
+		if !noAck {
+			unacked := &UnackedMessage{
+				Message:     msg,
+				ConsumerTag: consumerTag,
+				QueueName:   queueName,
+				DeliveryTag: deliveryTag,
+				Delivered:   time.Now(),
+			}
+			ch.unackedMessages[deliveryTag] = unacked
+		}
 		ch.mu.Unlock() // Unlock immediately after getting the tag
 
-		// Create a deep copy of the message to avoid data races if msg is modified elsewhere
-		// or if the same msg object is sent to multiple consumers (though deliverMessage already makes copies for queues)
+		// Create a deep copy of the message to avoid data races
 		msgCopy := Message{
-			Exchange:   msg.Exchange,
-			RoutingKey: msg.RoutingKey,
-			Mandatory:  msg.Mandatory,
-			Immediate:  msg.Immediate,
+			Exchange:    msg.Exchange,
+			RoutingKey:  msg.RoutingKey,
+			Mandatory:   msg.Mandatory,
+			Immediate:   msg.Immediate,
+			Redelivered: msg.Redelivered,
 			Properties: Properties{
 				ContentType:     msg.Properties.ContentType,
 				ContentEncoding: msg.Properties.ContentEncoding,
@@ -2381,13 +3349,11 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		copy(msgCopy.Body, msg.Body)
 		if msg.Properties.Headers != nil {
 			msgCopy.Properties.Headers = make(map[string]interface{})
-			for k, v := range msg.Properties.Headers {
-				msgCopy.Properties.Headers[k] = v // Assuming v is also safe or deep copied if necessary
-			}
+			maps.Copy(msgCopy.Properties.Headers, msg.Properties.Headers)
 		}
 
-		c.server.Info("Delivering message: channel=%d, consumerTag=%s, deliveryTag=%d, exchange=%s, routingKey=%s, bodySize=%d",
-			channelId, consumerTag, deliveryTag, msgCopy.Exchange, msgCopy.RoutingKey, len(msgCopy.Body))
+		c.server.Info("Delivering message: channel=%d, consumerTag=%s, deliveryTag=%d, exchange=%s, routingKey=%s, bodySize=%d, noAck=%v, redelivered=%v",
+			channelId, consumerTag, deliveryTag, msgCopy.Exchange, msgCopy.RoutingKey, len(msgCopy.Body), noAck, msgCopy.Redelivered)
 
 		// --- Construct Method Payload (Basic.Deliver) ---
 		methodPayload := &bytes.Buffer{}
@@ -2395,7 +3361,14 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		binary.Write(methodPayload, binary.BigEndian, uint16(MethodBasicDeliver)) // MethodID
 		writeShortString(methodPayload, consumerTag)
 		binary.Write(methodPayload, binary.BigEndian, deliveryTag)
-		methodPayload.WriteByte(0) // redelivered (false)
+
+		// Write redelivered flag
+		if msgCopy.Redelivered {
+			methodPayload.WriteByte(1) // redelivered = true
+		} else {
+			methodPayload.WriteByte(0) // redelivered = false
+		}
+
 		writeShortString(methodPayload, msgCopy.Exchange)
 		writeShortString(methodPayload, msgCopy.RoutingKey)
 
@@ -2448,7 +3421,6 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		if msgCopy.Properties.ClusterId != "" {
 			flags |= (1 << 2)
 		} // 0x0004
-		// Note: AMQP spec says remaining bits of property flags are reserved.
 
 		binary.Write(headerPayload, binary.BigEndian, flags)
 
@@ -2460,7 +3432,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		}
 		if (flags & (1 << 13)) != 0 {
 			writeTable(headerPayload, msgCopy.Properties.Headers)
-		} // Assuming writeTable is defined
+		}
 		if (flags & (1 << 12)) != 0 {
 			binary.Write(headerPayload, binary.BigEndian, msgCopy.Properties.DeliveryMode)
 		}
@@ -2504,13 +3476,10 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		if deliveryErr != nil {
 			c.server.Err("Error buffering basic.deliver frame for tag %d: %v", deliveryTag, deliveryErr)
 			c.writeMu.Unlock() // Release lock on error
-			// Decide if to continue to next message or return/break from loop
-			// If connection is broken, subsequent writes will likely fail anyway.
-			continue // or return, depending on desired error handling
+			continue
 		}
 
 		// Buffer Header Frame
-
 		deliveryErr = c.writeFrameInternal(FrameHeader, channelId, headerPayload.Bytes())
 		if deliveryErr != nil {
 			c.server.Err("Error buffering header frame for tag %d: %v", deliveryTag, deliveryErr)
@@ -2529,7 +3498,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 			flushErr := c.writer.Flush()
 			if flushErr != nil {
 				c.server.Err("Error flushing writer after message delivery for tag %d: %v", deliveryTag, flushErr)
-				deliveryErr = flushErr // Report flush error as the overall delivery error
+				deliveryErr = flushErr
 			}
 		}
 
@@ -2538,10 +3507,6 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		if deliveryErr == nil {
 			c.server.Info("Successfully delivered message (method, header, body) for deliveryTag=%d", deliveryTag)
 		} else {
-			// Handle the case where delivery failed.
-			// The client might not have received the message or received a partial one.
-			// Depending on noAck, redelivery logic might be needed (more complex).
-			// For now, just logging.
 			c.server.Err("Failed to fully deliver message for deliveryTag=%d", deliveryTag)
 		}
 	}
@@ -2551,32 +3516,77 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 func (c *Connection) cleanupConnectionResources() {
 	c.server.Info("Cleaning up resources for connection %s", c.conn.RemoteAddr())
 	c.mu.Lock() // Lock the connection to safely iterate over channels
-	defer c.mu.Unlock()
+
+	// NEW: Collect queue names that will need dispatch attempts
+	affectedQueuesForDispatch := make(map[string]bool)
 
 	for chanId, ch := range c.channels {
-		c.server.Info("Closing resources for channel %d on connection %s", chanId, c.conn.RemoteAddr())
-		ch.mu.Lock()
+		c.server.Info("Cleaning up resources for channel %d on connection %s", chanId, c.conn.RemoteAddr())
+		ch.mu.Lock() // Lock the specific channel
+
+		// Handle unacked messages: requeue them
+		if len(ch.unackedMessages) > 0 {
+			c.server.Info("Channel %d has %d unacked messages during connection cleanup, preparing for requeue", chanId, len(ch.unackedMessages))
+			for deliveryTag, unacked := range ch.unackedMessages {
+				c.server.mu.RLock() // RLock server to access s.queues
+				queue, qExists := c.server.queues[unacked.QueueName]
+				c.server.mu.RUnlock()
+
+				if qExists && queue != nil {
+					unacked.Message.Redelivered = true // Mark as redelivered
+
+					queue.mu.Lock() // Lock the specific queue
+					// Prepend to queue (requeued messages go to front)
+					queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+					c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'", deliveryTag, chanId, unacked.QueueName)
+					affectedQueuesForDispatch[unacked.QueueName] = true // Mark queue for dispatch
+					queue.mu.Unlock()                                   // Unlock queue
+				} else {
+					c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d) during connection cleanup", unacked.QueueName, deliveryTag, chanId)
+				}
+			}
+			// Clear unacked messages for the channel
+			ch.unackedMessages = make(map[uint64]*UnackedMessage)
+		}
+
+		// Clean up consumers associated with this channel
 		for consumerTag, queueName := range ch.consumers {
-			c.server.mu.RLock()
+			c.server.mu.RLock() // RLock server to access s.queues
 			if queue, ok := c.server.queues[queueName]; ok {
-				queue.mu.Lock()
+				queue.mu.Lock() // Lock the specific queue
 				if msgChan, consumerExists := queue.Consumers[consumerTag]; consumerExists {
-					c.server.Info("Closing consumer channel for tag %s on queue %s", consumerTag, queueName)
+					c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
 					close(msgChan) // This will make the deliverMessages goroutine exit
 					delete(queue.Consumers, consumerTag)
+					// If this queue had messages and now has one less consumer, it might affect dispatch.
+					// The generic dispatch attempt later will cover this.
 				}
-				queue.mu.Unlock()
+				queue.mu.Unlock() // Unlock queue
 			}
 			c.server.mu.RUnlock()
 		}
-		ch.consumers = make(map[string]string) // Clear consumers map
-		ch.pendingMessages = nil               // Clear pending messages
-		ch.mu.Unlock()
-		// We don't delete from c.channels here because we are iterating over it.
-		// The channel map will be discarded when the Connection object is GC'd.
+		ch.consumers = map[string]string{} // Clear consumers map for the channel
+		ch.pendingMessages = nil           // Clear any partial messages from publish
+		// Ensure timer is stopped if channel was being closed by server
+		if ch.closeOkTimer != nil {
+			ch.closeOkTimer.Stop()
+			ch.closeOkTimer = nil
+		}
+		ch.mu.Unlock() // Unlock the channel
 	}
-	c.channels = make(map[uint16]*Channel) // Clear the channels map
-	// The underlying c.conn will be closed by the caller of cleanupConnectionResources or already closed.
+	c.channels = map[uint16]*Channel{} // Clear the channels map on the connection
+	c.mu.Unlock()                      // Unlock the connection
+
+	// NEW: After all channel cleanups and lock releases, attempt dispatch for affected queues
+	if len(affectedQueuesForDispatch) > 0 {
+		c.server.Info("Attempting dispatch for %d queues affected by connection %s cleanup", len(affectedQueuesForDispatch), c.conn.RemoteAddr())
+		for queueName := range affectedQueuesForDispatch {
+			go c.server.tryDispatchFromSingleQueue(queueName) // Run in a goroutine
+		}
+	}
+
+	c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
+	// The underlying c.conn will be closed by the caller of cleanupConnectionResources or was already closed.
 }
 
 // sendChannelClose sends a Channel.Close method to the client and cleans up the channel.
@@ -2688,49 +3698,120 @@ func (c *Connection) sendChannelClose(channelId uint16, replyCode uint16, replyT
 // forceRemoveChannel is an internal helper to clean up a channel from the connection
 // typically called after a timeout, unrecoverable error, or when client initiates close.
 func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
-	c.mu.Lock() // Lock connection to modify c.channels
-	defer c.mu.Unlock()
+	c.server.Info("Forcibly removing channel %d from connection %s. Reason: %s", channelId, c.conn.RemoteAddr(), reason)
 
+	// Phase 1: Get channel reference and mark as closing
+	c.mu.Lock()
 	ch, exists := c.channels[channelId]
 	if !exists || ch == nil {
+		c.mu.Unlock()
 		c.server.Info("Attempted to forcibly remove channel %d, but it was already gone or nil. Reason: %s", channelId, reason)
 		return
 	}
 
+	// Don't remove from map yet - just mark as closing
 	ch.mu.Lock()
-	// Ensure timer is stopped if it hasn't fired and exists
+	if ch.closingByServer {
+		ch.mu.Unlock()
+		c.mu.Unlock()
+		c.server.Debug("Channel %d already being cleaned up, skipping", channelId)
+		return
+	}
+	ch.closingByServer = true
+	ch.mu.Unlock()
+	c.mu.Unlock()
+
+	// Phase 2: Clean up channel resources (channel still in map)
+	ch.mu.Lock()
+
+	// Stop timer first
 	if ch.closeOkTimer != nil {
 		if !ch.closeOkTimer.Stop() {
-			// Timer already fired or was stopped, allow its goroutine to potentially run if it just fired
-			// Or, it might be nil if never started (e.g. client initiated close)
-			c.server.Debug("CloseOkTimer for channel %d had already fired or was stopped when forceRemoveChannel called.", channelId)
+			c.server.Debug("CloseOkTimer for channel %d had already fired", channelId)
 		}
-		ch.closeOkTimer = nil // Clear the timer
+		ch.closeOkTimer = nil
 	}
 
-	// Defensive cleanup of consumers and pending messages if not already done
+	// Collect queue names that will need dispatch attempts
+	affectedQueuesForDispatch := make(map[string]bool)
+
+	// Cleanup unacked messages
+	if len(ch.unackedMessages) > 0 {
+		c.server.Info("Channel %d has %d unacked messages, requeuing", channelId, len(ch.unackedMessages))
+		for deliveryTag, unacked := range ch.unackedMessages {
+			c.server.mu.RLock()
+			queue, qExists := c.server.queues[unacked.QueueName]
+			c.server.mu.RUnlock()
+
+			if qExists && queue != nil {
+				unacked.Message.Redelivered = true
+				queue.mu.Lock()
+				queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+				c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'",
+					deliveryTag, channelId, unacked.QueueName)
+				affectedQueuesForDispatch[unacked.QueueName] = true
+				queue.mu.Unlock()
+			} else {
+				c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d)",
+					unacked.QueueName, deliveryTag, channelId)
+			}
+		}
+		ch.unackedMessages = make(map[uint64]*UnackedMessage)
+	}
+
+	// Handle pending confirms
+	if len(ch.pendingConfirms) > 0 {
+		c.server.Info("Channel %d has %d pending confirms, sending nacks", channelId, len(ch.pendingConfirms))
+		// Send nack for all pending confirms
+		var maxTag uint64
+		for tag := range ch.pendingConfirms {
+			if tag > maxTag {
+				maxTag = tag
+			}
+		}
+		if maxTag > 0 {
+			// Send a single nack with multiple=true to cover all pending
+			c.sendBasicNack(channelId, maxTag, true, false)
+		}
+		ch.pendingConfirms = make(map[uint64]bool)
+	}
+
+	// Clean up consumers
 	if len(ch.consumers) > 0 {
-		c.server.Warn("Channel %d (reason: %s) had remaining consumers during forceRemove: %v", channelId, reason, ch.consumers)
+		c.server.Info("Channel %d cleaning up %d consumers", channelId, len(ch.consumers))
 		for consumerTag, queueName := range ch.consumers {
 			c.server.mu.RLock()
 			if q, qExists := c.server.queues[queueName]; qExists {
 				q.mu.Lock()
-				if msgChan, consumerExistsOnQueue := q.Consumers[consumerTag]; consumerExistsOnQueue {
+				if msgChan, consumerExists := q.Consumers[consumerTag]; consumerExists {
 					close(msgChan)
 					delete(q.Consumers, consumerTag)
+					c.server.Info("Closed consumer %s on queue %s for channel %d",
+						consumerTag, queueName, channelId)
 				}
 				q.mu.Unlock()
 			}
 			c.server.mu.RUnlock()
 		}
-		ch.consumers = make(map[string]string)
+		ch.consumers = map[string]string{}
 	}
 	ch.pendingMessages = nil
+	ch.mu.Unlock()
 
-	ch.mu.Unlock() // Unlock the channel
-
+	// Phase 3: Remove from connection map after cleanup is complete
+	c.mu.Lock()
 	delete(c.channels, channelId)
-	c.server.Info("Forcibly removed channel %d from connection %s. Reason: %s", channelId, c.conn.RemoteAddr(), reason)
+	c.mu.Unlock()
+
+	// Trigger dispatch for affected queues
+	if len(affectedQueuesForDispatch) > 0 {
+		c.server.Info("Attempting dispatch for %d queues affected by channel %d removal",
+			len(affectedQueuesForDispatch), channelId)
+		for queueName := range affectedQueuesForDispatch {
+			go c.server.tryDispatchFromSingleQueue(queueName)
+		}
+	}
+	c.server.Info("Finished forcibly removing channel %d. Reason: %s", channelId, reason)
 }
 
 // sendConnectionClose sends a Connection.Close method to the client.
@@ -2795,6 +3876,106 @@ func (c *Connection) sendBasicReturn(channelId uint16, replyCode uint16, replyTe
 		Channel: channelId,
 		Payload: payload.Bytes(),
 	})
+}
+
+// tryDispatchFromSingleQueue attempts to dispatch messages from the head of the named queue
+// to available consumers. It continues as long as messages are available in the queue
+// and consumers can accept them.
+// This function handles its own locking for the specified queue.
+func (s *Server) tryDispatchFromSingleQueue(queueName string) {
+	// REVISED FUNCTION - Now attempts to dispatch multiple messages
+	s.mu.RLock() // Lock server to safely access s.queues
+	q, exists := s.queues[queueName]
+	s.mu.RUnlock()
+
+	if !exists {
+		s.Warn("tryDispatchFromSingleQueue: Attempted to dispatch from non-existent queue: %s", queueName)
+		return
+	}
+
+	// Loop to dispatch as many messages as possible from this queue in this run.
+	// This loop is outside the queue lock initially to re-check conditions.
+	for {
+		q.mu.Lock() // Lock the specific queue for each dispatch attempt cycle
+
+		if len(q.Messages) == 0 {
+			q.mu.Unlock()
+			// s.Debug("tryDispatchFromSingleQueue: No more messages in queue '%s' to dispatch.", q.Name)
+			return // No messages left
+		}
+		if len(q.Consumers) == 0 {
+			q.mu.Unlock()
+			s.Debug("tryDispatchFromSingleQueue: No consumers for queue '%s' to dispatch messages to.", q.Name)
+			return // No consumers
+		}
+
+		// Get the first message. This message is expected to be a deep copy suitable for sending.
+		msgToDispatch := q.Messages[0]
+		dispatchedThisIteration := false
+
+		// Iterate over consumers to find one that can accept the message.
+		// The order of iteration over a map is random, providing some basic fairness.
+		// We create a list of consumer tags to iterate over to avoid issues if a consumer is removed concurrently
+		// (though q.Consumers is protected by q.mu.Lock here).
+		var consumerTags []string
+		for tag := range q.Consumers {
+			consumerTags = append(consumerTags, tag)
+		}
+		// Shuffle consumerTags for better load distribution if desired, though map iteration order is already random.
+		// rand.Shuffle(len(consumerTags), func(i, j int) { consumerTags[i], consumerTags[j] = consumerTags[j], consumerTags[i] })
+
+		for _, consumerTag := range consumerTags {
+			consumerMsgChan, consumerExists := q.Consumers[consumerTag]
+			if !consumerExists { // Consumer might have been removed since we got the tags
+				continue
+			}
+
+			// The deliverMessages goroutine for this consumer will make another deep copy
+			// before framing and sending to the client.
+			select {
+			case consumerMsgChan <- msgToDispatch:
+				s.Info("Dispatched message (Id: %s, RK: %s) from queue '%s' to consumer '%s' via tryDispatchFromSingleQueue", msgToDispatch.Properties.MessageId, msgToDispatch.RoutingKey, q.Name, consumerTag)
+				q.Messages = q.Messages[1:] // Remove from queue
+				dispatchedThisIteration = true
+			default:
+				// Consumer's channel is full, try next consumer in this iteration
+				s.Debug("tryDispatchFromSingleQueue: Consumer '%s' on queue '%s' busy, trying next for message (Id: %s)", consumerTag, q.Name, msgToDispatch.Properties.MessageId)
+				continue
+			}
+			if dispatchedThisIteration {
+				break // Exit consumer loop to re-evaluate queue state for next message
+			}
+		}
+
+		q.mu.Unlock() // Unlock the queue after one dispatch attempt cycle
+
+		if !dispatchedThisIteration {
+			// If we went through all consumers and none could take the message,
+			// then no point in re-looping immediately.
+			s.Info("tryDispatchFromSingleQueue: No consumer immediately available for message (Id: %s) in queue '%s'. Message remains queued.", msgToDispatch.Properties.MessageId, q.Name)
+			return // Exit the dispatch attempt for this queue
+		}
+		// If a message was dispatched, loop again to see if more can be dispatched.
+	}
+}
+
+// getChannel safely retrieves a channel and checks if it's closing
+// Returns (channel, exists, isClosing)
+func (c *Connection) getChannel(channelId uint16) (*Channel, bool, bool) {
+	c.mu.RLock()
+	ch, exists := c.channels[channelId]
+	c.mu.RUnlock()
+
+	if !exists || ch == nil {
+		return nil, false, false
+	}
+
+	// Check if closing while we have the channel reference
+	ch.mu.Lock()
+	isClosing := ch.closingByServer
+	ch.mu.Unlock()
+
+	return ch, true, isClosing
 }
 
 func main() {

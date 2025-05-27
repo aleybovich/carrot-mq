@@ -2,11 +2,8 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"net"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,60 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// testServerPortCounter is a global counter to assign unique ports to test servers.
-var testServerPortCounter = 5800 // Starting port number, different from previous example
-var portCounterMutex sync.Mutex
-
-func getNextTestPort() string {
-	portCounterMutex.Lock()
-	defer portCounterMutex.Unlock()
-	port := testServerPortCounter
-	testServerPortCounter++
-	return fmt.Sprintf(":%d", port)
-}
-
-// Helper to start a server and return its address and a cleanup function
-func setupTestServer(t *testing.T, opts ...ServerOption) (addr string, cleanup func()) {
-	isTerminal = true // Force colorized output for server logs during tests
-	addr = getNextTestPort()
-	server := NewServer(opts...) // Uses default internal logger
-
-	// Channel to signal when server goroutine exits
-	serverDone := make(chan struct{})
-
-	go func() {
-		defer close(serverDone)
-		if err := server.Start(addr); err != nil {
-			// Only log if it's not the expected closed listener error
-			if !errors.Is(err, net.ErrClosed) {
-				t.Logf("Test server failed to start on %s: %v", addr, err)
-			}
-		}
-	}()
-
-	// Wait a bit for server to start
-	time.Sleep(200 * time.Millisecond)
-
-	cleanup = func() {
-		if server.listener != nil {
-			err := server.listener.Close()
-			if err != nil {
-				t.Logf("Error closing test server listener on %s: %v", addr, err)
-			}
-		}
-
-		// Wait for server goroutine to exit with timeout
-		select {
-		case <-serverDone:
-			// Server exited cleanly
-		case <-time.After(1 * time.Second):
-			t.Logf("Warning: Server goroutine did not exit within timeout for %s", addr)
-		}
-	}
-
-	return addr, cleanup
-}
 
 // Basic connection test
 func TestServerConnection(t *testing.T) {
