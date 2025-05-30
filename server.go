@@ -610,7 +610,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 			c.cleanupConnectionResources() // Clean up channels and consumers
 			conn.Close()                   // Ensure underlying connection is closed
-			return                         // Exit handleConnection goroutine
+			s.removeConnection(c)
+			return // Exit handleConnection goroutine
 		}
 
 		var handlerError error
@@ -652,6 +653,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				// Since conn.Close() was called in the handler, the next readFrame() will fail and trigger cleanup.
 				// For explicitness, we can ensure cleanup and return.
 				c.cleanupConnectionResources()
+				s.removeConnection(c)
 				// conn.Close() was already called by the method handler that returned errConnectionClosedGracefully
 				return // Exit the loop and goroutine
 			}
@@ -668,6 +670,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				s.Err("Critical error from handler for %s: %v. Closing connection.", conn.RemoteAddr(), handlerError)
 				c.cleanupConnectionResources()
 				conn.Close()
+				s.removeConnection(c)
 				return
 			}
 		}
@@ -3562,8 +3565,6 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		msgCopy := Message{
 			Exchange:    msg.Exchange,
 			RoutingKey:  msg.RoutingKey,
-			Mandatory:   msg.Mandatory,
-			Immediate:   msg.Immediate,
 			Redelivered: msg.Redelivered,
 			Properties: Properties{
 				ContentType:     msg.Properties.ContentType,
