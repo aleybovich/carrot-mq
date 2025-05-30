@@ -253,6 +253,7 @@ func TestPublisherConfirms_ChannelClose(t *testing.T) {
 	err = ch.Publish("non-existent-exchange", "key", false, false, amqp.Publishing{
 		Body: []byte("This should fail"),
 	})
+	assert.NoError(t, err, "Publishing to non-existent exchange should not error immediately")
 
 	// Channel should be closed by server
 	select {

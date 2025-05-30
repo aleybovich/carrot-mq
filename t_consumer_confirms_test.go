@@ -23,17 +23,17 @@ func TestBasicAck_Single_HappyPath(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-ack-single")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false) // autoAck = false
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false) // autoAck = false
 
 	msgBody := "Hello Ack Single"
-	publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
 
-	msg := expectMessage(t, deliveries, msgBody, nil, 1*time.Second)
+	msg := t_expectMessage(t, deliveries, msgBody, nil, 1*time.Second)
 
 	err = ch.Ack(msg.DeliveryTag, false) // multiple = false
 	require.NoError(t, err, "ch.Ack failed")
 
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 	// Further verification: if this message was the only one, the queue should be empty.
 	// Or, if consumer dies and message wasn't acked, it should be redelivered.
 	// For this happy path, ensuring no error is the primary goal.
@@ -52,23 +52,23 @@ func TestBasicAck_Multiple_True_HappyPath(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-ack-multi")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	bodies := []string{"Msg1", "Msg2", "Msg3"}
 	for _, body := range bodies {
-		publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
 	}
 
 	var lastDeliveryTag uint64
 	for i := 0; i < len(bodies); i++ {
-		msg := expectMessage(t, deliveries, bodies[i], nil, 1*time.Second)
+		msg := t_expectMessage(t, deliveries, bodies[i], nil, 1*time.Second)
 		lastDeliveryTag = msg.DeliveryTag
 	}
 
 	err = ch.Ack(lastDeliveryTag, true) // multiple = true
 	require.NoError(t, err, "ch.Ack with multiple=true failed")
 
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicAck_Multiple_True_DeliveryTagZero_HappyPath(t *testing.T) {
@@ -84,22 +84,22 @@ func TestBasicAck_Multiple_True_DeliveryTagZero_HappyPath(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-ack-multi-zero")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	bodies := []string{"ZeroAck1", "ZeroAck2"}
 	for _, body := range bodies {
-		publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
 	}
 
 	for i := 0; i < len(bodies); i++ {
-		expectMessage(t, deliveries, bodies[i], nil, 1*time.Second)
+		t_expectMessage(t, deliveries, bodies[i], nil, 1*time.Second)
 		// We don't need to store deliveryTag here, just consume them
 	}
 
 	err = ch.Ack(0, true) // deliveryTag = 0, multiple = true
 	require.NoError(t, err, "ch.Ack with deliveryTag=0, multiple=true failed")
 
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicAck_Error_UnknownDeliveryTag(t *testing.T) {
@@ -115,10 +115,10 @@ func TestBasicAck_Error_UnknownDeliveryTag(t *testing.T) {
 	// No defer ch.Close() as we expect it to be closed by server
 
 	qName := uniqueName("q-ack-unknown-tag")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
-	publishMessage(t, ch, "", qName, "test unknown tag", false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, "test unknown tag", nil, 1*time.Second)
+	t_publishMessage(t, ch, "", qName, "test unknown tag", false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, "test unknown tag", nil, 1*time.Second)
 
 	err = ch.Ack(msg.DeliveryTag+100, false) // Unknown tag
 	// The client library might not return an error immediately from Ack if channel is closed by server.
@@ -127,7 +127,7 @@ func TestBasicAck_Error_UnknownDeliveryTag(t *testing.T) {
 		t.Logf("Client ch.Ack returned error (might be due to already closed channel): %v", err)
 	}
 
-	expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
+	t_expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
 }
 
 func TestBasicAck_Error_DeliveryTagZero_MultipleFalse(t *testing.T) {
@@ -143,16 +143,16 @@ func TestBasicAck_Error_DeliveryTagZero_MultipleFalse(t *testing.T) {
 	// No defer ch.Close()
 
 	qName := uniqueName("q-ack-zero-multi-false")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
-	publishMessage(t, ch, "", qName, "test zero multi false", false, amqp.Publishing{})
-	expectMessage(t, deliveries, "test zero multi false", nil, 1*time.Second)
+	t_publishMessage(t, ch, "", qName, "test zero multi false", false, amqp.Publishing{})
+	t_expectMessage(t, deliveries, "test zero multi false", nil, 1*time.Second)
 
 	err = ch.Ack(0, false) // deliveryTag = 0, multiple = false
 	if err != nil {
 		t.Logf("Client ch.Ack returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.SyntaxError, "delivery-tag 0 with multiple=false")
+	t_expectChannelClose(t, ch, amqp.SyntaxError, "delivery-tag 0 with multiple=false")
 }
 
 func TestBasicAck_Error_MessageAlreadyAcked(t *testing.T) {
@@ -168,10 +168,10 @@ func TestBasicAck_Error_MessageAlreadyAcked(t *testing.T) {
 	// No defer ch.Close()
 
 	qName := uniqueName("q-ack-already-acked")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
-	publishMessage(t, ch, "", qName, "test already acked", false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, "test already acked", nil, 1*time.Second)
+	t_publishMessage(t, ch, "", qName, "test already acked", false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, "test already acked", nil, 1*time.Second)
 
 	err = ch.Ack(msg.DeliveryTag, false)
 	require.NoError(t, err, "First Ack failed")
@@ -183,7 +183,7 @@ func TestBasicAck_Error_MessageAlreadyAcked(t *testing.T) {
 	if err != nil {
 		t.Logf("Client second ch.Ack returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag") // Server sees it as unknown because it was removed
+	t_expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag") // Server sees it as unknown because it was removed
 }
 
 // --- II. Basic.Nack Tests ---
@@ -201,17 +201,17 @@ func TestBasicNack_Single_RequeueFalse_HappyPath(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-nack-single-noreq")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	msgBody := "Hello Nack Single NoRequeue"
-	publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, msgBody, nil, 1*time.Second)
+	t_publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, msgBody, nil, 1*time.Second)
 
 	err = ch.Nack(msg.DeliveryTag, false, false) // multiple=false, requeue=false
 	require.NoError(t, err, "ch.Nack failed")
 
-	expectNoMessage(t, deliveries, 200*time.Millisecond) // Message should be discarded
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 200*time.Millisecond) // Message should be discarded
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicNack_Single_RequeueTrue_HappyPath_Redelivery(t *testing.T) {
@@ -227,22 +227,22 @@ func TestBasicNack_Single_RequeueTrue_HappyPath_Redelivery(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-nack-single-req")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	msgBody := "Hello Nack Single Requeue"
-	publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
 
-	msg1 := expectMessage(t, deliveries, msgBody, ptr(false), 1*time.Second) // Expect redelivered=false initially
+	msg1 := t_expectMessage(t, deliveries, msgBody, ptr(false), 1*time.Second) // Expect redelivered=false initially
 
 	err = ch.Nack(msg1.DeliveryTag, false, true) // multiple=false, requeue=true
 	require.NoError(t, err, "ch.Nack failed")
 
-	msg2 := expectMessage(t, deliveries, msgBody, ptr(true), 1*time.Second) // Expect redelivered=true
+	msg2 := t_expectMessage(t, deliveries, msgBody, ptr(true), 1*time.Second) // Expect redelivered=true
 	require.Equal(t, msg1.Body, msg2.Body, "Message body should be the same")
 
 	err = ch.Ack(msg2.DeliveryTag, false) // Ack the redelivered message
 	require.NoError(t, err, "Ack of redelivered message failed")
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicNack_Multiple_True_RequeueFalse_HappyPath(t *testing.T) {
@@ -258,24 +258,24 @@ func TestBasicNack_Multiple_True_RequeueFalse_HappyPath(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-nack-multi-noreq")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	bodies := []string{"NackMultiNoReq1", "NackMultiNoReq2"}
 	for _, body := range bodies {
-		publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
 	}
 
 	var lastDeliveryTag uint64
 	for i := 0; i < len(bodies); i++ {
-		msg := expectMessage(t, deliveries, bodies[i], nil, 1*time.Second)
+		msg := t_expectMessage(t, deliveries, bodies[i], nil, 1*time.Second)
 		lastDeliveryTag = msg.DeliveryTag
 	}
 
 	err = ch.Nack(lastDeliveryTag, true, false) // multiple=true, requeue=false
 	require.NoError(t, err, "ch.Nack multi norequeue failed")
 
-	expectNoMessage(t, deliveries, 200*time.Millisecond)
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicNack_Multiple_True_RequeueTrue_HappyPath_Redelivery(t *testing.T) {
@@ -291,17 +291,17 @@ func TestBasicNack_Multiple_True_RequeueTrue_HappyPath_Redelivery(t *testing.T) 
 	defer ch.Close()
 
 	qName := uniqueName("q-nack-multi-req")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	bodies := []string{"NackMultiReq1", "NackMultiReq2", "NackMultiReq3"}
 	for _, body := range bodies {
-		publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
 	}
 
 	var lastDeliveryTag uint64
 	consumedOriginal := make(map[string]bool)
 	for i := 0; i < len(bodies); i++ {
-		msg := expectMessage(t, deliveries, bodies[i], ptr(false), 1*time.Second)
+		msg := t_expectMessage(t, deliveries, bodies[i], ptr(false), 1*time.Second)
 		lastDeliveryTag = msg.DeliveryTag
 		consumedOriginal[string(msg.Body)] = true
 	}
@@ -326,7 +326,7 @@ func TestBasicNack_Multiple_True_RequeueTrue_HappyPath_Redelivery(t *testing.T) 
 		}
 	}
 	require.Len(t, consumedRedelivered, len(bodies), "Did not consume all redelivered messages")
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicNack_Multiple_True_DeliveryTagZero_RequeueTrue_HappyPath(t *testing.T) {
@@ -342,11 +342,11 @@ func TestBasicNack_Multiple_True_DeliveryTagZero_RequeueTrue_HappyPath(t *testin
 	defer ch.Close()
 
 	qName := uniqueName("q-nack-zero-multi-req")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	bodies := []string{"NackZeroMultiReq1", "NackZeroMultiReq2"}
 	for _, body := range bodies {
-		publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", qName, body, false, amqp.Publishing{})
 	}
 
 	// Consume original messages
@@ -376,7 +376,7 @@ func TestBasicNack_Multiple_True_DeliveryTagZero_RequeueTrue_HappyPath(t *testin
 	// Verify we got all the original messages back
 	require.Equal(t, originalMessages, redeliveredMessages, "Should have received all original messages after requeue")
 
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicNack_Error_UnknownDeliveryTag(t *testing.T) {
@@ -389,15 +389,15 @@ func TestBasicNack_Error_UnknownDeliveryTag(t *testing.T) {
 	require.NoError(t, err)
 
 	qName := uniqueName("q-nack-unknown")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
-	publishMessage(t, ch, "", qName, "nack unknown", false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, "nack unknown", nil, 1*time.Second)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
+	t_publishMessage(t, ch, "", qName, "nack unknown", false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, "nack unknown", nil, 1*time.Second)
 
 	err = ch.Nack(msg.DeliveryTag+100, false, false)
 	if err != nil {
 		t.Logf("Client ch.Nack returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
+	t_expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
 }
 
 func TestBasicNack_Error_DeliveryTagZero_MultipleFalse(t *testing.T) {
@@ -410,15 +410,15 @@ func TestBasicNack_Error_DeliveryTagZero_MultipleFalse(t *testing.T) {
 	require.NoError(t, err)
 
 	qName := uniqueName("q-nack-zero-nofalse")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
-	publishMessage(t, ch, "", qName, "nack zero nofalse", false, amqp.Publishing{})
-	expectMessage(t, deliveries, "nack zero nofalse", nil, 1*time.Second)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
+	t_publishMessage(t, ch, "", qName, "nack zero nofalse", false, amqp.Publishing{})
+	t_expectMessage(t, deliveries, "nack zero nofalse", nil, 1*time.Second)
 
 	err = ch.Nack(0, false, false)
 	if err != nil {
 		t.Logf("Client ch.Nack returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.SyntaxError, "delivery-tag 0 with multiple=false for nack")
+	t_expectChannelClose(t, ch, amqp.SyntaxError, "delivery-tag 0 with multiple=false for nack")
 }
 
 // --- III. Basic.Reject Tests ---
@@ -434,16 +434,16 @@ func TestBasicReject_RequeueFalse_HappyPath(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-reject-noreq")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 	msgBody := "Reject NoRequeue"
-	publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, msgBody, nil, 1*time.Second)
+	t_publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, msgBody, nil, 1*time.Second)
 
 	err = ch.Reject(msg.DeliveryTag, false) // requeue=false
 	require.NoError(t, err, "ch.Reject failed")
 
-	expectNoMessage(t, deliveries, 200*time.Millisecond)
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicReject_RequeueTrue_HappyPath_Redelivery(t *testing.T) {
@@ -457,19 +457,19 @@ func TestBasicReject_RequeueTrue_HappyPath_Redelivery(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-reject-req")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 	msgBody := "Reject Requeue"
-	publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, msgBody, false, amqp.Publishing{})
 
-	msg1 := expectMessage(t, deliveries, msgBody, ptr(false), 1*time.Second)
+	msg1 := t_expectMessage(t, deliveries, msgBody, ptr(false), 1*time.Second)
 	err = ch.Reject(msg1.DeliveryTag, true) // requeue=true
 	require.NoError(t, err, "ch.Reject failed")
 
-	msg2 := expectMessage(t, deliveries, msgBody, ptr(true), 1*time.Second)
+	msg2 := t_expectMessage(t, deliveries, msgBody, ptr(true), 1*time.Second)
 	require.Equal(t, msg1.Body, msg2.Body)
 	err = ch.Ack(msg2.DeliveryTag, false)
 	require.NoError(t, err)
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestBasicReject_Error_UnknownDeliveryTag(t *testing.T) {
@@ -482,15 +482,15 @@ func TestBasicReject_Error_UnknownDeliveryTag(t *testing.T) {
 	require.NoError(t, err)
 
 	qName := uniqueName("q-reject-unknown")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
-	publishMessage(t, ch, "", qName, "reject unknown", false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, "reject unknown", nil, 1*time.Second)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
+	t_publishMessage(t, ch, "", qName, "reject unknown", false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, "reject unknown", nil, 1*time.Second)
 
 	err = ch.Reject(msg.DeliveryTag+100, false)
 	if err != nil {
 		t.Logf("Client ch.Reject returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
+	t_expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
 }
 
 func TestBasicReject_Error_DeliveryTagZero(t *testing.T) {
@@ -503,15 +503,15 @@ func TestBasicReject_Error_DeliveryTagZero(t *testing.T) {
 	require.NoError(t, err)
 
 	qName := uniqueName("q-reject-zero")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
-	publishMessage(t, ch, "", qName, "reject zero", false, amqp.Publishing{})
-	expectMessage(t, deliveries, "reject zero", nil, 1*time.Second)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
+	t_publishMessage(t, ch, "", qName, "reject zero", false, amqp.Publishing{})
+	t_expectMessage(t, deliveries, "reject zero", nil, 1*time.Second)
 
 	err = ch.Reject(0, false) // deliveryTag=0
 	if err != nil {
 		t.Logf("Client ch.Reject returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.SyntaxError, "delivery-tag cannot be 0 for basic.reject")
+	t_expectChannelClose(t, ch, amqp.SyntaxError, "delivery-tag cannot be 0 for basic.reject")
 }
 
 // --- IV. General Interaction & Edge Case Tests ---
@@ -526,11 +526,11 @@ func TestAck_MessageFromAutoAckConsumer_Error(t *testing.T) {
 	require.NoError(t, err)
 
 	qName := uniqueName("q-ack-autoack")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, true) // autoAck = true
-	publishMessage(t, ch, "", qName, "ack autoack", false, amqp.Publishing{})
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, true) // autoAck = true
+	t_publishMessage(t, ch, "", qName, "ack autoack", false, amqp.Publishing{})
 
 	// Message is consumed and auto-acked
-	msg := expectMessage(t, deliveries, "ack autoack", nil, 1*time.Second)
+	msg := t_expectMessage(t, deliveries, "ack autoack", nil, 1*time.Second)
 
 	// Wait for server to process auto-ack (client lib might ack implicitly before delivery)
 	time.Sleep(100 * time.Millisecond)
@@ -540,7 +540,7 @@ func TestAck_MessageFromAutoAckConsumer_Error(t *testing.T) {
 		t.Logf("Client ch.Ack for auto-acked msg returned error: %v", err)
 	}
 	// Server should see this deliveryTag as unknown/inactive
-	expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
+	t_expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
 }
 
 func TestNack_MessageFromAutoAckConsumer_Error(t *testing.T) {
@@ -553,16 +553,16 @@ func TestNack_MessageFromAutoAckConsumer_Error(t *testing.T) {
 	require.NoError(t, err)
 
 	qName := uniqueName("q-nack-autoack")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, true) // autoAck = true
-	publishMessage(t, ch, "", qName, "nack autoack", false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, "nack autoack", nil, 1*time.Second)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, true) // autoAck = true
+	t_publishMessage(t, ch, "", qName, "nack autoack", false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, "nack autoack", nil, 1*time.Second)
 	time.Sleep(100 * time.Millisecond)
 
 	err = ch.Nack(msg.DeliveryTag, false, false)
 	if err != nil {
 		t.Logf("Client ch.Nack for auto-acked msg returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
+	t_expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
 }
 
 func TestReject_MessageFromAutoAckConsumer_Error(t *testing.T) {
@@ -575,16 +575,16 @@ func TestReject_MessageFromAutoAckConsumer_Error(t *testing.T) {
 	require.NoError(t, err)
 
 	qName := uniqueName("q-reject-autoack")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, true) // autoAck = true
-	publishMessage(t, ch, "", qName, "reject autoack", false, amqp.Publishing{})
-	msg := expectMessage(t, deliveries, "reject autoack", nil, 1*time.Second)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, true) // autoAck = true
+	t_publishMessage(t, ch, "", qName, "reject autoack", false, amqp.Publishing{})
+	msg := t_expectMessage(t, deliveries, "reject autoack", nil, 1*time.Second)
 	time.Sleep(100 * time.Millisecond)
 
 	err = ch.Reject(msg.DeliveryTag, false)
 	if err != nil {
 		t.Logf("Client ch.Reject for auto-acked msg returned error: %v", err)
 	}
-	expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
+	t_expectChannelClose(t, ch, amqp.PreconditionFailed, "unknown delivery-tag")
 }
 
 func TestRequeueOrder_NackTrue_PrependsToQueue(t *testing.T) {
@@ -614,8 +614,8 @@ func TestRequeueOrder_NackTrue_PrependsToQueue(t *testing.T) {
 	// Publish messages
 	msgBody1 := "MsgOrder1"
 	msgBody2 := "MsgOrder2"
-	publishMessage(t, ch, "", qName, msgBody1, false, amqp.Publishing{})
-	publishMessage(t, ch, "", qName, msgBody2, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, msgBody1, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, msgBody2, false, amqp.Publishing{})
 
 	// Create consumer
 	ctag := uniqueName("consumer")
@@ -673,7 +673,7 @@ func TestRequeueOrder_NackTrue_PrependsToQueue(t *testing.T) {
 	require.True(t, redeliveredMessages[msgBody1], "Message 1 should be redelivered")
 	require.True(t, redeliveredMessages[msgBody2], "Message 2 should be redelivered")
 
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 func TestRequeue_ConsumerDiesBeforeAck_MessageRequeuedAndAvailable(t *testing.T) {
@@ -688,10 +688,10 @@ func TestRequeue_ConsumerDiesBeforeAck_MessageRequeuedAndAvailable(t *testing.T)
 	require.NoError(t, err)
 	ch1, err := conn1.Channel()
 	require.NoError(t, err)
-	_, deliveriesC1, _ := setupQueueAndConsumer(t, ch1, qName, false) // autoAck=false
+	_, deliveriesC1, _ := t_setupQueueAndConsumer(t, ch1, qName, false) // autoAck=false
 
-	publishMessage(t, ch1, "", qName, msgBody, false, amqp.Publishing{})
-	msgC1 := expectMessage(t, deliveriesC1, msgBody, ptr(false), 1*time.Second)
+	t_publishMessage(t, ch1, "", qName, msgBody, false, amqp.Publishing{})
+	msgC1 := t_expectMessage(t, deliveriesC1, msgBody, ptr(false), 1*time.Second)
 
 	// Simulate consumer C1 dying by closing its connection
 	// N.B.: Closing the channel ch1 first, then conn1, is cleaner for the client library.
@@ -710,10 +710,10 @@ func TestRequeue_ConsumerDiesBeforeAck_MessageRequeuedAndAvailable(t *testing.T)
 	ch2, err := conn2.Channel()
 	require.NoError(t, err)
 	defer ch2.Close()
-	_, deliveriesC2, _ := setupQueueAndConsumer(t, ch2, qName, false)
+	_, deliveriesC2, _ := t_setupQueueAndConsumer(t, ch2, qName, false)
 
 	// C2 should receive the requeued message
-	msgC2 := expectMessage(t, deliveriesC2, msgBody, ptr(true), 2*time.Second)
+	msgC2 := t_expectMessage(t, deliveriesC2, msgBody, ptr(true), 2*time.Second)
 	require.Equal(t, msgC1.Body, msgC2.Body)
 	err = ch2.Ack(msgC2.DeliveryTag, false)
 	require.NoError(t, err)
@@ -730,16 +730,16 @@ func TestAck_InterleavedWithNackRequeue(t *testing.T) {
 	defer ch.Close()
 
 	qName := uniqueName("q-ack-nack-interleaved")
-	_, deliveries, _ := setupQueueAndConsumer(t, ch, qName, false)
+	_, deliveries, _ := t_setupQueueAndConsumer(t, ch, qName, false)
 
 	m1Body, m2Body, m3Body := "InterleavedM1", "InterleavedM2", "InterleavedM3"
-	publishMessage(t, ch, "", qName, m1Body, false, amqp.Publishing{})
-	publishMessage(t, ch, "", qName, m2Body, false, amqp.Publishing{})
-	publishMessage(t, ch, "", qName, m3Body, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, m1Body, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, m2Body, false, amqp.Publishing{})
+	t_publishMessage(t, ch, "", qName, m3Body, false, amqp.Publishing{})
 
-	msg1 := expectMessage(t, deliveries, m1Body, ptr(false), 1*time.Second)
-	msg2 := expectMessage(t, deliveries, m2Body, ptr(false), 1*time.Second)
-	msg3 := expectMessage(t, deliveries, m3Body, ptr(false), 1*time.Second)
+	msg1 := t_expectMessage(t, deliveries, m1Body, ptr(false), 1*time.Second)
+	msg2 := t_expectMessage(t, deliveries, m2Body, ptr(false), 1*time.Second)
+	msg3 := t_expectMessage(t, deliveries, m3Body, ptr(false), 1*time.Second)
 
 	// Nack M2 with requeue=true
 	err = ch.Nack(msg2.DeliveryTag, false, true)
@@ -754,12 +754,12 @@ func TestAck_InterleavedWithNackRequeue(t *testing.T) {
 	require.NoError(t, err, "Ack for M1 failed")
 
 	// M2 should be redelivered
-	redeliveredM2 := expectMessage(t, deliveries, m2Body, ptr(true), 1*time.Second)
+	redeliveredM2 := t_expectMessage(t, deliveries, m2Body, ptr(true), 1*time.Second)
 	err = ch.Ack(redeliveredM2.DeliveryTag, false)
 	require.NoError(t, err, "Ack for redelivered M2 failed")
 
-	expectNoMessage(t, deliveries, 200*time.Millisecond)
-	expectNoChannelClose(t, ch, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 200*time.Millisecond)
+	t_expectNoChannelClose(t, ch, 200*time.Millisecond)
 }
 
 // Helper to create a boolean pointer for optional redelivered check

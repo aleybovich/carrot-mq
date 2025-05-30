@@ -1,6 +1,6 @@
 # Changelog
 
-## [unreleased]
+## [0.0.2]
 
 ### Added 
 - Basic.Return for unroutable messages
@@ -10,6 +10,7 @@
 - Basic.Recover
 - Max Frame Size validation
 - Publisher confirms
+- Virtual hosts support
 - Improved error handling for frame reading - now returns 502 SYNTAX_ERROR when fails to read
 
 ## [0.0.1] 2025-05-27
@@ -42,6 +43,7 @@
 
 ### Not Implemented
 - Transaction support
+- ExchangeDelete, ExchangeBind, ExchangeUnbind
 - Exchange-to-exchange bindings
 - Queue deletion
 - Queue purge
@@ -49,7 +51,6 @@
 - Heartbeat monitoring
 - SSL/TLS support
 - Full headers exchange functionality
-- Virtual hosts support
 - Full implementation of immediate flag
 - Auto-delete functionality for exchanges and queues
 - Connection.Blocked/Unblocked

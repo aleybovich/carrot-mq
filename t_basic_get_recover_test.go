@@ -319,7 +319,7 @@ func TestBasicGet_MultipleChannels(t *testing.T) {
 	assert.Equal(t, "msg3", string(msg4.Body))
 }
 
-// --- Basic.Recover Tests ---
+// --- Basic.Recover Tests (now using Basic.Nack) ---
 
 func TestBasicRecover_SimpleRequeue(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
@@ -335,28 +335,28 @@ func TestBasicRecover_SimpleRequeue(t *testing.T) {
 
 	// Setup queue and consumer
 	queueName := uniqueName("basic-recover-simple")
-	q, deliveries, _ := setupQueueAndConsumer(t, ch, queueName, false) // autoAck=false
+	q, deliveries, _ := t_setupQueueAndConsumer(t, ch, queueName, false) // autoAck=false
 
 	// Publish messages
 	messages := []string{"msg1", "msg2", "msg3"}
 	for _, msg := range messages {
-		publishMessage(t, ch, "", q.Name, msg, false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", q.Name, msg, false, amqp.Publishing{})
 	}
 
 	// Receive but don't ack
-	received := make([]amqp.Delivery, 0, 3)
 	for i := 0; i < 3; i++ {
 		select {
 		case d := <-deliveries:
-			received = append(received, d)
+			// The 'd' variable is used for assertions below, so it's not unused in this scope.
 			assert.False(t, d.Redelivered)
 		case <-time.After(1 * time.Second):
 			t.Fatalf("Timeout waiting for message %d", i+1)
 		}
 	}
 
-	// Call Recover with requeue=true
-	err = ch.Recover(true)
+	// Call Nack to requeue all unacknowledged messages on the channel
+	// deliveryTag=0, multiple=true, requeue=true
+	err = ch.Nack(0, true, true)
 	require.NoError(t, err)
 
 	// Messages should be redelivered
@@ -374,7 +374,7 @@ func TestBasicRecover_SimpleRequeue(t *testing.T) {
 	}
 
 	// No more messages
-	expectNoMessage(t, deliveries, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 200*time.Millisecond)
 }
 
 func TestBasicRecover_NoRequeue(t *testing.T) {
@@ -391,29 +391,30 @@ func TestBasicRecover_NoRequeue(t *testing.T) {
 
 	// Setup queue and consumer
 	queueName := uniqueName("basic-recover-no-requeue")
-	q, deliveries, _ := setupQueueAndConsumer(t, ch, queueName, false)
+	q, deliveries, _ := t_setupQueueAndConsumer(t, ch, queueName, false)
 
 	// Publish messages
 	for i := 0; i < 3; i++ {
-		publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
 	}
 
 	// Receive but don't ack
 	for i := 0; i < 3; i++ {
 		select {
 		case <-deliveries:
-			// Just consume, don't ack
+			// Just consume, don't ack. The act of receiving makes it unacknowledged.
 		case <-time.After(1 * time.Second):
 			t.Fatalf("Timeout waiting for message %d", i+1)
 		}
 	}
 
-	// Call Recover with requeue=false
+	// Call Nack to discard all unacknowledged messages on the channel
+	// deliveryTag=0, multiple=true, requeue=false
 	err = ch.Nack(0, true, false)
 	require.NoError(t, err)
 
 	// With requeue=false, messages are discarded (not redelivered)
-	expectNoMessage(t, deliveries, 500*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 500*time.Millisecond)
 }
 
 func TestBasicRecover_MultipleConsumers(t *testing.T) {
@@ -433,9 +434,9 @@ func TestBasicRecover_MultipleConsumers(t *testing.T) {
 	q, err := ch.QueueDeclare(queueName, false, false, false, false, nil)
 	require.NoError(t, err)
 
-	// Create two consumers
-	deliveries1, tag1 := consumeMessage(t, ch, q.Name, "consumer1", false)
-	deliveries2, tag2 := consumeMessage(t, ch, q.Name, "consumer2", false)
+	// Create two consumers on the same channel
+	deliveries1, tag1 := t_consumeMessage(t, ch, q.Name, "consumer1", false)
+	deliveries2, tag2 := t_consumeMessage(t, ch, q.Name, "consumer2", false)
 	require.NotEqual(t, tag1, tag2)
 
 	// Publish more messages to increase distribution likelihood
@@ -444,12 +445,13 @@ func TestBasicRecover_MultipleConsumers(t *testing.T) {
 	for i := 0; i < messageCount; i++ {
 		msgBody := fmt.Sprintf("msg%d", i)
 		expectedMessages[msgBody] = true
-		publishMessage(t, ch, "", q.Name, msgBody, false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", q.Name, msgBody, false, amqp.Publishing{})
 	}
 
 	// Collect messages from both consumers with longer timeout
-	consumer1Msgs := make([]amqp.Delivery, 0)
-	consumer2Msgs := make([]amqp.Delivery, 0)
+	// These messages are not acked, so they become unacknowledged on 'ch'.
+	consumer1ReceiveCount := 0
+	consumer2ReceiveCount := 0
 	receivedMessages := make(map[string]bool)
 
 	timeout := time.After(3 * time.Second) // Increased timeout
@@ -459,12 +461,12 @@ func TestBasicRecover_MultipleConsumers(t *testing.T) {
 	for totalReceived < messageCount {
 		select {
 		case d := <-deliveries1:
-			consumer1Msgs = append(consumer1Msgs, d)
 			receivedMessages[string(d.Body)] = true
+			consumer1ReceiveCount++
 			totalReceived++
 		case d := <-deliveries2:
-			consumer2Msgs = append(consumer2Msgs, d)
 			receivedMessages[string(d.Body)] = true
+			consumer2ReceiveCount++
 			totalReceived++
 		case <-timeout:
 			t.Fatalf("Timeout: only received %d/%d messages", totalReceived, messageCount)
@@ -476,24 +478,18 @@ func TestBasicRecover_MultipleConsumers(t *testing.T) {
 		assert.True(t, receivedMessages[expectedMsg], "Missing expected message: %s", expectedMsg)
 	}
 
-	t.Logf("Initial distribution: consumer1=%d, consumer2=%d", len(consumer1Msgs), len(consumer2Msgs))
+	t.Logf("Initial distribution: consumer1=%d, consumer2=%d", consumer1ReceiveCount, consumer2ReceiveCount)
 
-	// Both consumers should have received some messages for a meaningful test
-	// If all went to one consumer, add a short delay and retry
-	if len(consumer1Msgs) == messageCount || len(consumer2Msgs) == messageCount {
-		t.Logf("All messages went to one consumer, this may happen due to timing")
-		// Continue with the test anyway, as the recover behavior is still valid
-	}
+	// Don't acknowledge any messages - they should all be unacked on this channel 'ch'
 
-	// Don't acknowledge any messages - they should all be unacked
-
-	// Call Recover with requeue=true using Nack
+	// Call Nack to requeue all unacknowledged messages on channel 'ch'
+	// deliveryTag=0, multiple=true, requeue=true
 	err = ch.Nack(0, true, true)
 	require.NoError(t, err)
 
-	// Clear previous message tracking
-	consumer1Redelivered := make([]amqp.Delivery, 0)
-	consumer2Redelivered := make([]amqp.Delivery, 0)
+	// Clear previous message tracking for redelivery
+	consumer1RedeliveredCount := 0
+	consumer2RedeliveredCount := 0
 	redeliveredCount := 0
 	redeliveredMessages := make(map[string]int) // Count how many times each message is redelivered
 
@@ -504,19 +500,17 @@ func TestBasicRecover_MultipleConsumers(t *testing.T) {
 		select {
 		case d := <-deliveries1:
 			assert.True(t, d.Redelivered, "Message should be marked as redelivered")
-			consumer1Redelivered = append(consumer1Redelivered, d)
+			consumer1RedeliveredCount++
 			redeliveredMessages[string(d.Body)]++
 			redeliveredCount++
-			// Ack this time to clean up
-			err = d.Ack(false)
+			err = d.Ack(false) // Ack this time to clean up
 			require.NoError(t, err)
 		case d := <-deliveries2:
 			assert.True(t, d.Redelivered, "Message should be marked as redelivered")
-			consumer2Redelivered = append(consumer2Redelivered, d)
+			consumer2RedeliveredCount++
 			redeliveredMessages[string(d.Body)]++
 			redeliveredCount++
-			// Ack this time to clean up
-			err = d.Ack(false)
+			err = d.Ack(false) // Ack this time to clean up
 			require.NoError(t, err)
 		case <-timeout:
 			t.Fatalf("Timeout: only received %d/%d redelivered messages", redeliveredCount, messageCount)
@@ -530,15 +524,12 @@ func TestBasicRecover_MultipleConsumers(t *testing.T) {
 		assert.Equal(t, 1, count, "Message %s was redelivered %d times, expected 1", expectedMsg, count)
 	}
 
-	t.Logf("Redelivery distribution: consumer1=%d, consumer2=%d", len(consumer1Redelivered), len(consumer2Redelivered))
-
-	// The key test: verify that messages were redelivered (regardless of distribution)
+	t.Logf("Redelivery distribution: consumer1=%d, consumer2=%d", consumer1RedeliveredCount, consumer2RedeliveredCount)
 	assert.Equal(t, messageCount, redeliveredCount, "Should have received all messages as redelivered")
 	assert.Equal(t, messageCount, len(redeliveredMessages), "Should have unique redelivered messages")
 
-	// No more messages should be available
-	expectNoMessage(t, deliveries1, 200*time.Millisecond)
-	expectNoMessage(t, deliveries2, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries1, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries2, 200*time.Millisecond)
 }
 
 func TestBasicRecover_PartialAck(t *testing.T) {
@@ -555,11 +546,11 @@ func TestBasicRecover_PartialAck(t *testing.T) {
 
 	// Setup queue and consumer
 	queueName := uniqueName("basic-recover-partial")
-	q, deliveries, _ := setupQueueAndConsumer(t, ch, queueName, false)
+	q, deliveries, _ := t_setupQueueAndConsumer(t, ch, queueName, false)
 
 	// Publish 5 messages
 	for i := 0; i < 5; i++ {
-		publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
 	}
 
 	// Receive all messages, ack only some
@@ -574,6 +565,7 @@ func TestBasicRecover_PartialAck(t *testing.T) {
 				require.NoError(t, err)
 				ackedMsgs[string(d.Body)] = true
 			} else {
+				// This message is received but not acked, making it unacknowledged.
 				unackedMsgs[string(d.Body)] = true
 			}
 		case <-time.After(1 * time.Second):
@@ -581,8 +573,9 @@ func TestBasicRecover_PartialAck(t *testing.T) {
 		}
 	}
 
-	// Call Recover
-	err = ch.Recover(true)
+	// Call Nack to requeue all unacknowledged messages on the channel
+	// deliveryTag=0, multiple=true, requeue=true
+	err = ch.Nack(0, true, true)
 	require.NoError(t, err)
 
 	// Only unacked messages should be redelivered
@@ -593,8 +586,8 @@ func TestBasicRecover_PartialAck(t *testing.T) {
 		select {
 		case d := <-deliveries:
 			assert.True(t, d.Redelivered)
-			assert.True(t, unackedMsgs[string(d.Body)], "Redelivered message should have been unacked")
-			assert.False(t, ackedMsgs[string(d.Body)], "Acked message should not be redelivered")
+			assert.True(t, unackedMsgs[string(d.Body)], "Redelivered message '%s' should have been unacked", string(d.Body))
+			assert.False(t, ackedMsgs[string(d.Body)], "Acked message '%s' should not be redelivered", string(d.Body))
 			d.Ack(false)
 			redeliveredCount++
 		case <-timeout:
@@ -603,7 +596,7 @@ func TestBasicRecover_PartialAck(t *testing.T) {
 	}
 
 	// No more messages
-	expectNoMessage(t, deliveries, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 200*time.Millisecond)
 }
 
 func TestBasicRecover_EmptyUnackedList(t *testing.T) {
@@ -620,22 +613,23 @@ func TestBasicRecover_EmptyUnackedList(t *testing.T) {
 
 	// Setup queue and consumer
 	queueName := uniqueName("basic-recover-empty")
-	q, deliveries, _ := setupQueueAndConsumer(t, ch, queueName, false)
+	q, deliveries, _ := t_setupQueueAndConsumer(t, ch, queueName, false)
 
 	// Publish and immediately ack messages
 	for i := 0; i < 3; i++ {
-		publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
-		d := expectMessage(t, deliveries, fmt.Sprintf("msg%d", i), nil, 1*time.Second)
+		t_publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
+		d := t_expectMessage(t, deliveries, fmt.Sprintf("msg%d", i), nil, 1*time.Second)
 		err = d.Ack(false)
 		require.NoError(t, err)
 	}
 
-	// Call Recover with no unacked messages
-	err = ch.Recover(true)
+	// Call Nack with no unacked messages
+	// deliveryTag=0, multiple=true, requeue=true
+	err = ch.Nack(0, true, true)
 	require.NoError(t, err)
 
 	// No messages should be redelivered
-	expectNoMessage(t, deliveries, 500*time.Millisecond)
+	t_expectNoMessage(t, deliveries, 500*time.Millisecond)
 }
 
 func TestBasicRecover_ConcurrentWithGet(t *testing.T) {
@@ -658,22 +652,20 @@ func TestBasicRecover_ConcurrentWithGet(t *testing.T) {
 	// Publish messages
 	messageCount := 10
 	for i := 0; i < messageCount; i++ {
-		publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
 	}
 
-	// Get some messages without acking
-	var getDeliveryTags []uint64
+	// Get some messages without acking to make them unacknowledged on the channel.
 	for i := 0; i < 5; i++ {
-		msg, ok, err := ch.Get(q.Name, false)
+		_, ok, err := ch.Get(q.Name, false) // autoAck=false
 		require.NoError(t, err)
 		require.True(t, ok)
-		getDeliveryTags = append(getDeliveryTags, msg.DeliveryTag)
 	}
 
 	// Start a consumer for remaining messages
-	deliveries, _ := consumeMessage(t, ch, q.Name, "consumer1", false)
+	deliveries, _ := t_consumeMessage(t, ch, q.Name, "consumer1", false) // autoAck=false
 
-	// Consume remaining messages
+	// Consume remaining messages (these will also be unacked initially on the channel)
 	consumedCount := 0
 	timeout := time.After(1 * time.Second)
 
@@ -681,17 +673,19 @@ func TestBasicRecover_ConcurrentWithGet(t *testing.T) {
 		select {
 		case d := <-deliveries:
 			assert.False(t, d.Redelivered)
+			// Don't ack these yet
 			consumedCount++
 		case <-timeout:
 			t.Fatalf("Timeout: only consumed %d/5 messages", consumedCount)
 		}
 	}
 
-	// Call Recover
+	// Call Nack to requeue all 10 unacknowledged messages on the channel
+	// deliveryTag=0, multiple=true, requeue=true
 	err = ch.Nack(0, true, true)
 	require.NoError(t, err)
 
-	// All 10 unacked messages should be available for redelivery
+	// All 10 unacked messages should be available for redelivery to the consumer
 	redeliveredCount := 0
 	timeout = time.After(2 * time.Second)
 
@@ -699,7 +693,7 @@ func TestBasicRecover_ConcurrentWithGet(t *testing.T) {
 		select {
 		case d := <-deliveries:
 			assert.True(t, d.Redelivered)
-			d.Ack(false)
+			d.Ack(false) // Ack them now
 			redeliveredCount++
 		case <-timeout:
 			t.Fatalf("Timeout: only received %d/10 redelivered messages", redeliveredCount)
@@ -733,127 +727,94 @@ func TestBasicRecover_MultipleChannels(t *testing.T) {
 	q2, err := ch2.QueueDeclare(queueName2, false, false, false, false, nil)
 	require.NoError(t, err)
 
-	// Create consumers on separate queues
-	deliveries1, _ := consumeMessage(t, ch1, q1.Name, "consumer-ch1", false)
-	deliveries2, _ := consumeMessage(t, ch2, q2.Name, "consumer-ch2", false)
+	// Create consumers on separate queues, on their respective channels
+	deliveries1, _ := t_consumeMessage(t, ch1, q1.Name, "consumer-ch1", false)
+	deliveries2, _ := t_consumeMessage(t, ch2, q2.Name, "consumer-ch2", false)
 
-	// Publish messages to each queue separately
 	messageCount := 3
 
-	// Publish to queue 1
+	// Publish to queue 1 via channel 1
 	for i := 0; i < messageCount; i++ {
-		publishMessage(t, ch1, "", q1.Name, fmt.Sprintf("ch1-msg%d", i), false, amqp.Publishing{})
+		t_publishMessage(t, ch1, "", q1.Name, fmt.Sprintf("ch1-msg%d", i), false, amqp.Publishing{})
 	}
 
-	// Publish to queue 2
+	// Publish to queue 2 via channel 2
 	for i := 0; i < messageCount; i++ {
-		publishMessage(t, ch2, "", q2.Name, fmt.Sprintf("ch2-msg%d", i), false, amqp.Publishing{})
+		t_publishMessage(t, ch2, "", q2.Name, fmt.Sprintf("ch2-msg%d", i), false, amqp.Publishing{})
 	}
 
-	// Collect messages from both channels
-	var ch1Messages, ch2Messages []amqp.Delivery
+	// Collect messages from both channels (don't ack)
+	// The act of receiving makes them unacknowledged on their respective channels.
+	ch1ReceiveCount := 0
+	ch2ReceiveCount := 0
 	timeout := time.After(2 * time.Second)
 	totalReceived := 0
 	expectedTotal := messageCount * 2
 
 	for totalReceived < expectedTotal {
 		select {
-		case d := <-deliveries1:
-			ch1Messages = append(ch1Messages, d)
+		case <-deliveries1:
+			ch1ReceiveCount++
 			totalReceived++
-		case d := <-deliveries2:
-			ch2Messages = append(ch2Messages, d)
+		case <-deliveries2:
+			ch2ReceiveCount++
 			totalReceived++
 		case <-timeout:
 			t.Fatalf("Timeout: only received %d/%d messages", totalReceived, expectedTotal)
 		}
 	}
+	require.Equal(t, messageCount, ch1ReceiveCount, "Channel 1 should have received %d messages", messageCount)
+	require.Equal(t, messageCount, ch2ReceiveCount, "Channel 2 should have received %d messages", messageCount)
 
-	// Both channels should have received their messages
-	require.Len(t, ch1Messages, messageCount, "Channel 1 should have received %d messages", messageCount)
-	require.Len(t, ch2Messages, messageCount, "Channel 2 should have received %d messages", messageCount)
-
-	t.Logf("Distribution: ch1=%d, ch2=%d", len(ch1Messages), len(ch2Messages))
-
-	// Don't acknowledge any messages - they remain unacked
-
-	// Test 1: Recover only on channel 1
-	err = ch1.Recover(true)
+	// Test 1: Nack all on channel 1 (requeue=true)
+	err = ch1.Nack(0, true, true)
 	require.NoError(t, err)
 
-	// Only channel 1's unacked messages should be redelivered
 	ch1RedeliveredCount := 0
 	timeout = time.After(2 * time.Second)
-
 	for ch1RedeliveredCount < messageCount {
 		select {
 		case d := <-deliveries1:
-			assert.True(t, d.Redelivered, "Message should be marked as redelivered")
-			assert.Contains(t, string(d.Body), "ch1-", "Should receive ch1 message")
+			assert.True(t, d.Redelivered, "Message on ch1 should be redelivered")
+			assert.Contains(t, string(d.Body), "ch1-", "Should be ch1 message")
 			ch1RedeliveredCount++
-			// Ack to clean up
-			err = d.Ack(false)
-			require.NoError(t, err)
-		case d := <-deliveries2:
-			// Channel 2 should NOT receive any redelivered messages from channel 1's recover
-			assert.False(t, d.Redelivered, "Channel 2 should not receive redelivered messages from channel 1's recover")
-			t.Fatalf("Unexpected redelivered message on channel 2 from channel 1's recover: %s", string(d.Body))
+			d.Ack(false)
+		case <-deliveries2:
+			t.Fatalf("Channel 2 should not receive messages from channel 1's Nack")
 		case <-timeout:
-			t.Fatalf("Timeout: only received %d/%d expected redelivered messages on channel 1",
-				ch1RedeliveredCount, messageCount)
+			t.Fatalf("Timeout: only %d/%d redelivered on ch1", ch1RedeliveredCount, messageCount)
 		}
 	}
+	t_expectNoMessage(t, deliveries1, 200*time.Millisecond) // ch1 should be clear now
 
-	// Verify channel 2 doesn't get any unexpected messages
-	expectNoMessage(t, deliveries1, 200*time.Millisecond)
-
-	t.Logf("Channel 1 recover test passed: %d messages redelivered", ch1RedeliveredCount)
-
-	// Test 2: Now recover on channel 2
-	err = ch2.Recover(true)
+	// Test 2: Nack all on channel 2 (requeue=true)
+	err = ch2.Nack(0, true, true)
 	require.NoError(t, err)
 
-	// Only channel 2's unacked messages should be redelivered
 	ch2RedeliveredCount := 0
 	timeout = time.After(2 * time.Second)
-
 	for ch2RedeliveredCount < messageCount {
 		select {
 		case d := <-deliveries2:
-			assert.True(t, d.Redelivered, "Message should be marked as redelivered")
-			assert.Contains(t, string(d.Body), "ch2-", "Should receive ch2 message")
+			assert.True(t, d.Redelivered, "Message on ch2 should be redelivered")
+			assert.Contains(t, string(d.Body), "ch2-", "Should be ch2 message")
 			ch2RedeliveredCount++
-			// Ack to clean up
-			err = d.Ack(false)
-			require.NoError(t, err)
-		case d := <-deliveries1:
-			// Channel 1 should NOT receive any redelivered messages from channel 2's recover
-			assert.False(t, d.Redelivered, "Channel 1 should not receive redelivered messages from channel 2's recover")
-			t.Fatalf("Unexpected redelivered message on channel 1 from channel 2's recover: %s", string(d.Body))
+			d.Ack(false)
+		case <-deliveries1:
+			t.Fatalf("Channel 1 should not receive messages from channel 2's Nack")
 		case <-timeout:
-			t.Fatalf("Timeout: only received %d/%d expected redelivered messages on channel 2",
-				ch2RedeliveredCount, messageCount)
+			t.Fatalf("Timeout: only %d/%d redelivered on ch2", ch2RedeliveredCount, messageCount)
 		}
 	}
+	t_expectNoMessage(t, deliveries2, 200*time.Millisecond) // ch2 should be clear now
 
-	t.Logf("Channel 2 recover test passed: %d messages redelivered", ch2RedeliveredCount)
-
-	// Verify no more messages are delivered
-	expectNoMessage(t, deliveries1, 200*time.Millisecond)
-	expectNoMessage(t, deliveries2, 200*time.Millisecond)
-
-	// Test 3: Verify recover with no unacked messages does nothing
-	err = ch1.Recover(true)
+	// Test 3: Nack with no unacked messages does nothing
+	err = ch1.Nack(0, true, true)
 	require.NoError(t, err)
-
-	err = ch2.Recover(true)
+	err = ch2.Nack(0, true, true)
 	require.NoError(t, err)
-
-	// Should receive no messages
-	expectNoMessage(t, deliveries1, 200*time.Millisecond)
-	expectNoMessage(t, deliveries2, 200*time.Millisecond)
-
-	t.Logf("Empty recover test passed")
+	t_expectNoMessage(t, deliveries1, 200*time.Millisecond)
+	t_expectNoMessage(t, deliveries2, 200*time.Millisecond)
 }
 
 func TestBasicRecover_RaceCondition(t *testing.T) {
@@ -870,51 +831,58 @@ func TestBasicRecover_RaceCondition(t *testing.T) {
 
 	// Setup queue and consumer
 	queueName := uniqueName("basic-recover-race")
-	q, deliveries, _ := setupQueueAndConsumer(t, ch, queueName, false)
+	q, deliveries, _ := t_setupQueueAndConsumer(t, ch, queueName, false)
 
 	// Publish many messages
 	messageCount := 50
 	for i := 0; i < messageCount; i++ {
-		publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(3)
 
-	// Goroutine 1: Consume and randomly ack
+	// Goroutine 1: Consume and ack every 3rd message, leaving others unacked
+	ackedCount1 := 0
 	go func() {
 		defer wg.Done()
-		for i := 0; i < 20; i++ {
+		for i := 0; i < 20; i++ { // Process a subset of messages
 			select {
 			case d := <-deliveries:
 				if i%3 == 0 {
 					d.Ack(false)
-				}
-			case <-time.After(100 * time.Millisecond):
+					ackedCount1++
+				} // Other messages remain unacked on the channel
+			case <-time.After(200 * time.Millisecond):
+				t.Logf("Goroutine 1: timed out or finished processing initial subset")
 				return
 			}
 		}
 	}()
 
-	// Goroutine 2: Call recover periodically
+	// Goroutine 2: Call Nack(0, true, true) periodically
+
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
 			time.Sleep(50 * time.Millisecond)
-			ch.Recover(true)
+			ch.Nack(0, true, true) // Requeue all unacked on channel
 		}
 	}()
 
-	// Goroutine 3: Continue consuming
-	ackedCount := 0
+	// Goroutine 3: Continue consuming and acking all messages until messageCount is reached
+	ackedCount3 := 0
 	go func() {
 		defer wg.Done()
-		timeout := time.After(3 * time.Second)
-		for ackedCount < messageCount {
+		timeout := time.After(1 * time.Second) // Generous timeout for all messages to be processed
+		for ackedCount3+ackedCount1 < messageCount {
 			select {
-			case d := <-deliveries:
+			case d, ok := <-deliveries:
+				if !ok { // deliveries channel closed
+					return
+				}
 				d.Ack(false)
-				ackedCount++
+				ackedCount3++
 			case <-timeout:
 				return
 			}
@@ -923,13 +891,14 @@ func TestBasicRecover_RaceCondition(t *testing.T) {
 
 	wg.Wait()
 
-	// Verify queue is eventually empty
+	// Allow some time for all acks to be processed and queue to settle
 	time.Sleep(500 * time.Millisecond)
-	msg, ok, err := ch.Get(q.Name, true)
+
+	// Verify queue is eventually empty
+	msg, ok, err := ch.Get(q.Name, true) // autoAck=true
 	require.NoError(t, err)
-	if ok {
-		t.Logf("Queue still has message: %s", string(msg.Body))
-	}
+	require.False(t, ok, "Queue should be empty after race condition test, but found: %s. Acked count: %d", string(msg.Body), ackedCount3)
+	assert.Equal(t, messageCount, ackedCount3+ackedCount1, "Not all messages were acked during the race condition test")
 }
 
 func TestBasicGet_Recover_Integration(t *testing.T) {
@@ -951,36 +920,40 @@ func TestBasicGet_Recover_Integration(t *testing.T) {
 
 	// Publish messages
 	for i := 0; i < 5; i++ {
-		publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
+		t_publishMessage(t, ch, "", q.Name, fmt.Sprintf("msg%d", i), false, amqp.Publishing{})
 	}
 
-	// Get messages without acking
-	var unackedMsgs []amqp.Delivery
+	// Get messages without acking (these are unacked on the channel)
 	for i := 0; i < 3; i++ {
-		msg, ok, err := ch.Get(q.Name, false)
+		_, ok, err := ch.Get(q.Name, false) // autoAck=false
 		require.NoError(t, err)
 		require.True(t, ok)
-		unackedMsgs = append(unackedMsgs, msg)
+		// The act of getting makes them unacknowledged.
 	}
 
-	// Start a consumer
-	deliveries, _ := consumeMessage(t, ch, q.Name, "consumer1", false)
+	// Start a consumer (will also have its messages unacked on the same channel)
+	deliveries, _ := t_consumeMessage(t, ch, q.Name, "consumer1", false) // autoAck=false
 
-	// Get remaining messages via consumer
+	// Get remaining messages via consumer (don't ack yet)
 	for i := 0; i < 2; i++ {
 		select {
 		case d := <-deliveries:
 			assert.False(t, d.Redelivered)
+			// The act of receiving makes them unacknowledged.
 		case <-time.After(1 * time.Second):
 			t.Fatalf("Timeout waiting for consumed message %d", i)
 		}
 	}
 
-	// Recover all unacked messages
-	err = ch.Recover(true)
+	// At this point, all 5 messages are unacknowledged on channel 'ch'.
+	// 3 from Get, 2 from Consume.
+
+	// Nack to requeue all unacknowledged messages on the channel
+	// deliveryTag=0, multiple=true, requeue=true
+	err = ch.Nack(0, true, true)
 	require.NoError(t, err)
 
-	// All 5 messages should be redelivered to the consumer
+	// All 5 messages should be redelivered to the active consumer
 	redeliveredCount := 0
 	timeout := time.After(2 * time.Second)
 
@@ -988,7 +961,7 @@ func TestBasicGet_Recover_Integration(t *testing.T) {
 		select {
 		case d := <-deliveries:
 			assert.True(t, d.Redelivered)
-			d.Ack(false)
+			d.Ack(false) // Ack them now
 			redeliveredCount++
 		case <-timeout:
 			t.Fatalf("Timeout: only received %d/5 redelivered messages", redeliveredCount)
@@ -996,7 +969,7 @@ func TestBasicGet_Recover_Integration(t *testing.T) {
 	}
 
 	// Queue should be empty
-	_, ok, err := ch.Get(q.Name, true)
+	_, ok, err := ch.Get(q.Name, true) // autoAck=true
 	require.NoError(t, err)
-	require.False(t, ok)
+	require.False(t, ok, "Queue should be empty after Get/Recover integration test")
 }
