@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log"
 	"maps"
@@ -15,6 +14,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -137,6 +137,8 @@ type Queue struct {
 	Exclusive  bool
 	AutoDelete bool
 	mu         sync.RWMutex
+
+	deleting atomic.Bool
 }
 
 type QueueConfig struct {
@@ -1570,284 +1572,13 @@ func (c *Connection) handleQueueMethod(methodId uint16, reader *bytes.Reader, ch
 
 	switch methodId {
 	case MethodQueueDeclare:
-		var ticket uint16
-		if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
-			// Malformed frame if basic fields cannot be read.
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (ticket)", uint16(ClassQueue), MethodQueueDeclare)
-		}
-		queueNameIn, err := readShortString(reader)
-		if err != nil {
-			c.server.Err("Error reading queueNameIn for queue.declare: %v", err)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (queueNameIn)", uint16(ClassQueue), MethodQueueDeclare)
-		}
-
-		bits, errReadByte := reader.ReadByte()
-		if errReadByte != nil {
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (bits)", uint16(ClassQueue), MethodQueueDeclare)
-		}
-
-		args, errReadTable := readTable(reader) // readTable now returns (map, error)
-		if errReadTable != nil {
-			c.server.Err("Error reading arguments table for queue.declare (queue: '%s'): %v", queueNameIn, errReadTable)
-			// AMQP code 502 (SYNTAX_ERROR) for malformed table.
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed arguments table for queue.declare", uint16(ClassQueue), MethodQueueDeclare)
-		}
-
-		// Check for extra data after all arguments are read.
-		if reader.Len() > 0 {
-			c.server.Warn("Extra data at end of queue.declare payload for queue '%s'.", queueNameIn)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.declare payload", uint16(ClassQueue), MethodQueueDeclare)
-		}
-
-		passive := (bits & 0x01) != 0
-		durable := (bits & 0x02) != 0
-		exclusive := (bits & 0x04) != 0
-		autoDelete := (bits & 0x08) != 0 // Server doesn't fully implement auto-delete logic yet
-		noWait := (bits & 0x10) != 0
-
-		c.server.Info("Processing queue.%s: name='%s', passive=%v, durable=%v, exclusive=%v, autoDelete=%v, noWait=%v, args=%v on channel %d",
-			methodName, queueNameIn, passive, durable, exclusive, autoDelete, noWait, args, channelId)
-
-		var actualQueueName = queueNameIn
-		var messageCount uint32 = 0
-		var consumerCount uint32 = 0
-
-		vhost := c.vhost
-		vhost.mu.Lock()
-
-		if queueNameIn == "" { // Client requests server-generated name
-			if passive {
-				vhost.mu.Unlock()
-				errMsg := "passive declare of server-named queue not allowed"
-				c.server.Err("Queue.Declare passive error: %s", errMsg)
-				// AMQP code 403 (ACCESS_REFUSED)
-				return c.sendChannelClose(channelId, 403, errMsg, uint16(ClassQueue), MethodQueueDeclare)
-			}
-			// Generate a unique name
-			actualQueueName = fmt.Sprintf("amq.gen-%s-%d-%d-q", c.conn.LocalAddr().String(), channelId, c.server.listener.Addr().(*net.TCPAddr).Port)
-			tempCounter := 0
-			baseName := actualQueueName
-			// Ensure unique name (simple approach)
-			for _, existsGen := vhost.queues[actualQueueName]; existsGen; _, existsGen = vhost.queues[actualQueueName] {
-				tempCounter++
-				actualQueueName = fmt.Sprintf("%s-%d", baseName, tempCounter)
-			}
-			c.server.Info("Server generated queue name: %s", actualQueueName)
-		}
-
-		q, exists := vhost.queues[actualQueueName]
-
-		if passive {
-			if !exists {
-				vhost.mu.Unlock()
-				replyText := fmt.Sprintf("no queue '%s' in vhost '/'", actualQueueName)
-				c.server.Info("Passive Queue.Declare: Queue '%s' not found. Sending Channel.Close.", actualQueueName)
-				// AMQP code 404 (NOT_FOUND)
-				return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueueDeclare)
-			}
-			// Passive and exists: check compatibility.
-			q.mu.RLock()
-			// Per your original logic: if it's exclusive, it's a 405.
-			// This implies an attempt to use/check an exclusive queue owned by another connection.
-			// If your server tracked ownerChannel, a more nuanced check could be done here.
-			if q.Exclusive {
-				q.mu.RUnlock()
-				vhost.mu.Unlock()
-				replyText := fmt.Sprintf("queue '%s' is exclusive", actualQueueName)
-				c.server.Warn("Passive Queue.Declare: %s. Sending Channel.Close.", replyText)
-				// AMQP code 405 (RESOURCE_LOCKED)
-				return c.sendChannelClose(channelId, 405, replyText, uint16(ClassQueue), MethodQueueDeclare)
-			}
-			messageCount = uint32(len(q.Messages))
-			consumerCount = uint32(len(q.Consumers))
-			q.mu.RUnlock()
-			c.server.Info("Queue '%s' already exists (passive declare). Messages: %d, Consumers: %d. Durable: %v, Exclusive: %v",
-				actualQueueName, messageCount, consumerCount, q.Durable, q.Exclusive)
-			// For passive declare, if it exists and isn't an immediate RESOURCE_LOCKED,
-			// the server should check if other properties like durable, auto-delete, arguments match.
-			// If they don't, it's a 406 PRECONDITION_FAILED.
-			// Your original code didn't have this extra check for passive, so I'll stick to that for now,
-			// but a fully compliant server would add it. The main thing for passive is type match for exchanges.
-			// For queues, it's existence and non-exclusive access.
-
-		} else { // Not passive: declare or re-declare.
-			if exists {
-				q.mu.RLock()
-				// Per your original logic:
-				// 1. Check if it's an exclusive queue (implies owned by another if we don't track owner) -> 405
-				if q.Exclusive { // This implies an attempt to re-declare an existing exclusive queue.
-					// If this connection *is* the owner, this check might be too strict without ownerChannel tracking.
-					// However, if it *is* the owner, and tries to change 'exclusive' from true to false, that's a 406.
-					q.mu.RUnlock()
-					vhost.mu.Unlock()
-					replyText := fmt.Sprintf("queue '%s' is exclusive and cannot be redeclared by this connection or with changed exclusive status", actualQueueName)
-					c.server.Warn("Queue.Declare: %s. Sending Channel.Close.", replyText)
-					// AMQP code 405 (RESOURCE_LOCKED) if trying to access another's exclusive queue.
-					// AMQP code 406 (PRECONDITION_FAILED) if owner tries to change 'exclusive' flag.
-					// Given no owner tracking, 405 is a safe bet if q.Exclusive is true.
-					return c.sendChannelClose(channelId, 405, replyText, uint16(ClassQueue), MethodQueueDeclare)
-				}
-
-				// 2. If not q.Exclusive, check for other property mismatches -> 406
-				// Your original check: q.Durable != durable || q.Exclusive != exclusive
-				// This covers changing durable, or changing exclusive from false to true, or true to false (if it passed the first q.Exclusive check).
-				// Also consider autoDelete and arguments for full compliance.
-				propertiesMatch := (q.Durable == durable &&
-					q.Exclusive == exclusive &&
-					q.AutoDelete == autoDelete) // && areTablesEqual(q.Arguments, args)
-
-				if !propertiesMatch {
-					q.mu.RUnlock()
-					vhost.mu.Unlock()
-					replyText := fmt.Sprintf("properties mismatch for existing queue '%s' on redeclare", actualQueueName)
-					c.server.Warn("Queue.Declare: %s. Sending Channel.Close. Existing(dur:%v, excl:%v, ad:%v), Req(dur:%v, excl:%v, ad:%v)",
-						replyText, q.Durable, q.Exclusive, q.AutoDelete, durable, exclusive, autoDelete)
-					// AMQP code 406 (PRECONDITION_FAILED)
-					return c.sendChannelClose(channelId, 406, replyText, uint16(ClassQueue), MethodQueueDeclare)
-				}
-				// If properties match, it's a valid re-declaration.
-				c.server.Info("Queue '%s' re-declared with matching properties.", actualQueueName)
-				messageCount = uint32(len(q.Messages))
-				consumerCount = uint32(len(q.Consumers))
-				q.mu.RUnlock()
-			} else { // Not passive and not exists: create it.
-				vhost.queues[actualQueueName] = &Queue{
-					Name:       actualQueueName,
-					Messages:   []Message{},
-					Bindings:   make(map[string]bool),
-					Consumers:  make(map[string]chan Message),
-					Durable:    durable,
-					Exclusive:  exclusive, // If exclusive, ideally track ownerChannelId = channelId
-					AutoDelete: autoDelete,
-					// Arguments: args, // If you store and use queue arguments
-				}
-				c.server.Info("Created new queue: '%s', durable=%v, exclusive=%v, autoDelete=%v",
-					actualQueueName, durable, exclusive, autoDelete)
-				messageCount = 0
-				consumerCount = 0
-			}
-		}
-		vhost.mu.Unlock()
-
-		if !noWait {
-			// If noWait is false, server MUST reply with Queue.DeclareOk.
-			payloadOk := &bytes.Buffer{}
-			binary.Write(payloadOk, binary.BigEndian, uint16(ClassQueue))
-			binary.Write(payloadOk, binary.BigEndian, uint16(MethodQueueDeclareOk))
-			writeShortString(payloadOk, actualQueueName)
-			binary.Write(payloadOk, binary.BigEndian, messageCount)
-			binary.Write(payloadOk, binary.BigEndian, consumerCount)
-
-			if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
-				c.server.Err("Error sending queue.declare-ok for queue '%s': %v", actualQueueName, errWrite)
-				// This is an I/O error. The queue might have been created/state changed.
-				return errWrite // Propagate I/O error
-			}
-			c.server.Info("Sent queue.declare-ok for queue '%s'", actualQueueName)
-		} else {
-			c.server.Info("Queue.Declare with noWait=true processed for '%s'. No DeclareOk sent.", actualQueueName)
-		}
-		return nil // Successfully processed Queue.Declare
+		return c.handleQueueDeclare(reader, channelId)
 
 	case MethodQueueBind:
-		var ticket uint16
-		if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (ticket)", uint16(ClassQueue), MethodQueueBind)
-		}
-		queueName, err := readShortString(reader)
-		if err != nil {
-			c.server.Err("Error reading queueName for queue.bind: %v", err)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (queueName)", uint16(ClassQueue), MethodQueueBind)
-		}
+		return c.handleQueueBind(reader, channelId)
 
-		exchangeName, err := readShortString(reader)
-		if err != nil {
-			c.server.Err("Error reading exchangeName for queue.bind: %v", err)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (exchangeName)", uint16(ClassQueue), MethodQueueBind)
-		}
-
-		routingKey, err := readShortString(reader)
-		if err != nil {
-			c.server.Err("Error reading routingKey for queue.bind: %v", err)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (routingKey)", uint16(ClassQueue), MethodQueueBind)
-		}
-
-		bits, errReadByte := reader.ReadByte()
-		if errReadByte != nil {
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (bits)", uint16(ClassQueue), MethodQueueBind)
-		}
-
-		argsBind, errReadTableBind := readTable(reader) // readTable now returns (map, error)
-		if errReadTableBind != nil {
-			c.server.Err("Error reading arguments table for queue.bind (queue: '%s', exchange: '%s'): %v", queueName, exchangeName, errReadTableBind)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed arguments table for queue.bind", uint16(ClassQueue), MethodQueueBind)
-		}
-
-		if reader.Len() > 0 {
-			c.server.Warn("Extra data at end of queue.bind payload for queue '%s'.", queueName)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.bind payload", uint16(ClassQueue), MethodQueueBind)
-		}
-
-		noWait := (bits & 0x01) != 0
-
-		c.server.Info("Processing queue.%s: queue='%s', exchange='%s', routingKey='%s', noWait=%v, args=%v on channel %d",
-			methodName, queueName, exchangeName, routingKey, noWait, argsBind, channelId)
-
-		vhost := c.vhost
-		vhost.mu.RLock() // Use RLock for reading exchanges and queues initially
-		ex, exExists := vhost.exchanges[exchangeName]
-		q, qExists := vhost.queues[queueName]
-		vhost.mu.RUnlock()
-
-		if !exExists {
-			replyText := fmt.Sprintf("no exchange '%s' in vhost '/'", exchangeName)
-			c.server.Warn("Queue.Bind failed: %s. Sending Channel.Close.", replyText)
-			// AMQP code 404 (NOT_FOUND)
-			return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueueBind)
-		}
-		if !qExists {
-			replyText := fmt.Sprintf("no queue '%s' in vhost '/'", queueName)
-			c.server.Warn("Queue.Bind failed: %s. Sending Channel.Close.", replyText)
-			// AMQP code 404 (NOT_FOUND)
-			return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueueBind)
-		}
-
-		// Add binding (locking specific exchange and queue)
-		ex.mu.Lock()
-		alreadyBound := false
-		for _, existingQueueName := range ex.Bindings[routingKey] {
-			if existingQueueName == queueName {
-				alreadyBound = true
-				break
-			}
-		}
-		if !alreadyBound {
-			ex.Bindings[routingKey] = append(ex.Bindings[routingKey], queueName)
-		}
-		ex.mu.Unlock()
-
-		q.mu.Lock()
-		q.Bindings[exchangeName+":"+routingKey] = true // Store more specific binding info
-		q.mu.Unlock()
-		c.server.Info("Bound exchange '%s' (type: %s) to queue '%s' with routing key '%s'", exchangeName, ex.Type, queueName, routingKey)
-
-		if !noWait {
-			payloadBindOk := &bytes.Buffer{}
-			binary.Write(payloadBindOk, binary.BigEndian, uint16(ClassQueue))
-			binary.Write(payloadBindOk, binary.BigEndian, uint16(MethodQueueBindOk))
-
-			if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadBindOk.Bytes()}); errWrite != nil {
-				c.server.Err("Error sending queue.bind-ok for queue '%s': %v", queueName, errWrite)
-				return errWrite // Propagate I/O error
-			}
-			c.server.Info("Sent queue.bind-ok for queue '%s'", queueName)
-		}
-		return nil // Successfully processed Queue.Bind
-
-	// Add cases for MethodQueueUnbind, MethodQueuePurge, MethodQueueDelete if you implement them.
-	// Example for a missing one:
-	// case MethodQueueDelete:
-	//  return c.sendChannelClose(channelId, 540, "Queue.Delete not implemented", uint16(ClassQueue), MethodQueueDelete)
+	case MethodQueueDelete:
+		return c.handleQueueDelete(reader, channelId)
 
 	default:
 		replyText := fmt.Sprintf("unknown or not implemented queue method id %d", methodId)
@@ -3407,6 +3138,511 @@ func (c *Connection) sendReturnedMessage(channelId uint16, msg Message) {
 	}
 }
 
+// sendBasicCancelFromServer sends a Basic.Cancel method frame to the client.
+// This informs the client that a consumer has been cancelled by the server.
+func (c *Connection) sendBasicCancelFromServer(channelId uint16, consumerTag string) error {
+	c.server.Debug("Sending Basic.Cancel to client for consumer '%s' on channel %d", consumerTag, channelId)
+
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(payload, binary.BigEndian, uint16(MethodBasicCancel))
+	writeShortString(payload, consumerTag)
+	binary.Write(payload, binary.BigEndian, byte(0x00)) // no-wait bit (always false for server-sent)
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.writeFrameInternal(FrameMethod, channelId, payload.Bytes()); err != nil {
+		return fmt.Errorf("error writing basic.cancel frame: %w", err)
+	}
+	return c.writer.Flush()
+}
+
+func (c *Connection) sendBasicCancelToConsumers(consumers map[string]chan Message, queueName string) {
+	c.server.Info("Sending Basic.Cancel for %d consumers on queue '%s'", len(consumers), queueName)
+
+	// Group consumers by channel
+	consumersByChannel := make(map[uint16][]string)
+
+	c.mu.RLock()
+	for _, ch := range c.channels {
+		ch.mu.Lock()
+		for consumerTag, q := range ch.consumers {
+			if q == queueName {
+				if _, exists := consumers[consumerTag]; exists {
+					consumersByChannel[ch.id] = append(consumersByChannel[ch.id], consumerTag)
+				}
+			}
+		}
+		ch.mu.Unlock()
+	}
+	c.mu.RUnlock()
+
+	// Send Basic.Cancel for each consumer
+	for channelId, consumerTags := range consumersByChannel {
+		for _, consumerTag := range consumerTags {
+			if err := c.sendBasicCancelFromServer(channelId, consumerTag); err != nil {
+				c.server.Err("Failed to send Basic.Cancel for consumer '%s' on channel %d: %v",
+					consumerTag, channelId, err)
+			} else {
+				c.server.Info("Sent Basic.Cancel for consumer '%s' on channel %d",
+					consumerTag, channelId)
+			}
+		}
+	}
+}
+
+func (c *Connection) handleQueueDeclare(reader *bytes.Reader, channelId uint16) error {
+	var ticket uint16
+	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
+		// Malformed frame if basic fields cannot be read.
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (ticket)", uint16(ClassQueue), MethodQueueDeclare)
+	}
+	queueNameIn, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading queueNameIn for queue.declare: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (queueNameIn)", uint16(ClassQueue), MethodQueueDeclare)
+	}
+
+	bits, errReadByte := reader.ReadByte()
+	if errReadByte != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.declare (bits)", uint16(ClassQueue), MethodQueueDeclare)
+	}
+
+	args, errReadTable := readTable(reader) // readTable now returns (map, error)
+	if errReadTable != nil {
+		c.server.Err("Error reading arguments table for queue.declare (queue: '%s'): %v", queueNameIn, errReadTable)
+		// AMQP code 502 (SYNTAX_ERROR) for malformed table.
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed arguments table for queue.declare", uint16(ClassQueue), MethodQueueDeclare)
+	}
+
+	// Check for extra data after all arguments are read.
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of queue.declare payload for queue '%s'.", queueNameIn)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.declare payload", uint16(ClassQueue), MethodQueueDeclare)
+	}
+
+	passive := (bits & 0x01) != 0
+	durable := (bits & 0x02) != 0
+	exclusive := (bits & 0x04) != 0
+	autoDelete := (bits & 0x08) != 0 // Server doesn't fully implement auto-delete logic yet
+	noWait := (bits & 0x10) != 0
+
+	c.server.Info("Processing queue.declare: name='%s', passive=%v, durable=%v, exclusive=%v, autoDelete=%v, noWait=%v, args=%v on channel %d",
+		queueNameIn, passive, durable, exclusive, autoDelete, noWait, args, channelId)
+
+	var actualQueueName = queueNameIn
+	var messageCount uint32 = 0
+	var consumerCount uint32 = 0
+
+	vhost := c.vhost
+	vhost.mu.Lock()
+
+	if queueNameIn == "" { // Client requests server-generated name
+		if passive {
+			vhost.mu.Unlock()
+			errMsg := "passive declare of server-named queue not allowed"
+			c.server.Err("Queue.Declare passive error: %s", errMsg)
+			// AMQP code 403 (ACCESS_REFUSED)
+			return c.sendChannelClose(channelId, 403, errMsg, uint16(ClassQueue), MethodQueueDeclare)
+		}
+		// Generate a unique name
+		actualQueueName = fmt.Sprintf("amq.gen-%s-%d-%d-q", c.conn.LocalAddr().String(), channelId, c.server.listener.Addr().(*net.TCPAddr).Port)
+		tempCounter := 0
+		baseName := actualQueueName
+		// Ensure unique name (simple approach)
+		for _, existsGen := vhost.queues[actualQueueName]; existsGen; _, existsGen = vhost.queues[actualQueueName] {
+			tempCounter++
+			actualQueueName = fmt.Sprintf("%s-%d", baseName, tempCounter)
+		}
+		c.server.Info("Server generated queue name: %s", actualQueueName)
+	}
+
+	q, exists := vhost.queues[actualQueueName]
+
+	if passive {
+		if !exists {
+			vhost.mu.Unlock()
+			replyText := fmt.Sprintf("no queue '%s' in vhost '/'", actualQueueName)
+			c.server.Info("Passive Queue.Declare: Queue '%s' not found. Sending Channel.Close.", actualQueueName)
+			// AMQP code 404 (NOT_FOUND)
+			return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueueDeclare)
+		}
+		// Passive and exists: check compatibility.
+		q.mu.RLock()
+		// Per your original logic: if it's exclusive, it's a 405.
+		// This implies an attempt to use/check an exclusive queue owned by another connection.
+		// If your server tracked ownerChannel, a more nuanced check could be done here.
+		if q.Exclusive {
+			q.mu.RUnlock()
+			vhost.mu.Unlock()
+			replyText := fmt.Sprintf("queue '%s' is exclusive", actualQueueName)
+			c.server.Warn("Passive Queue.Declare: %s. Sending Channel.Close.", replyText)
+			// AMQP code 405 (RESOURCE_LOCKED)
+			return c.sendChannelClose(channelId, 405, replyText, uint16(ClassQueue), MethodQueueDeclare)
+		}
+		messageCount = uint32(len(q.Messages))
+		consumerCount = uint32(len(q.Consumers))
+		q.mu.RUnlock()
+		c.server.Info("Queue '%s' already exists (passive declare). Messages: %d, Consumers: %d. Durable: %v, Exclusive: %v",
+			actualQueueName, messageCount, consumerCount, q.Durable, q.Exclusive)
+		// For passive declare, if it exists and isn't an immediate RESOURCE_LOCKED,
+		// the server should check if other properties like durable, auto-delete, arguments match.
+		// If they don't, it's a 406 PRECONDITION_FAILED.
+		// Your original code didn't have this extra check for passive, so I'll stick to that for now,
+		// but a fully compliant server would add it. The main thing for passive is type match for exchanges.
+		// For queues, it's existence and non-exclusive access.
+
+	} else { // Not passive: declare or re-declare.
+		if exists {
+			q.mu.RLock()
+			// Per your original logic:
+			// 1. Check if it's an exclusive queue (implies owned by another if we don't track owner) -> 405
+			if q.Exclusive { // This implies an attempt to re-declare an existing exclusive queue.
+				// If this connection *is* the owner, this check might be too strict without ownerChannel tracking.
+				// However, if it *is* the owner, and tries to change 'exclusive' from true to false, that's a 406.
+				q.mu.RUnlock()
+				vhost.mu.Unlock()
+				replyText := fmt.Sprintf("queue '%s' is exclusive and cannot be redeclared by this connection or with changed exclusive status", actualQueueName)
+				c.server.Warn("Queue.Declare: %s. Sending Channel.Close.", replyText)
+				// AMQP code 405 (RESOURCE_LOCKED) if trying to access another's exclusive queue.
+				// AMQP code 406 (PRECONDITION_FAILED) if owner tries to change 'exclusive' flag.
+				// Given no owner tracking, 405 is a safe bet if q.Exclusive is true.
+				return c.sendChannelClose(channelId, 405, replyText, uint16(ClassQueue), MethodQueueDeclare)
+			}
+
+			// 2. If not q.Exclusive, check for other property mismatches -> 406
+			// Your original check: q.Durable != durable || q.Exclusive != exclusive
+			// This covers changing durable, or changing exclusive from false to true, or true to false (if it passed the first q.Exclusive check).
+			// Also consider autoDelete and arguments for full compliance.
+			propertiesMatch := (q.Durable == durable &&
+				q.Exclusive == exclusive &&
+				q.AutoDelete == autoDelete) // && areTablesEqual(q.Arguments, args)
+
+			if !propertiesMatch {
+				q.mu.RUnlock()
+				vhost.mu.Unlock()
+				replyText := fmt.Sprintf("properties mismatch for existing queue '%s' on redeclare", actualQueueName)
+				c.server.Warn("Queue.Declare: %s. Sending Channel.Close. Existing(dur:%v, excl:%v, ad:%v), Req(dur:%v, excl:%v, ad:%v)",
+					replyText, q.Durable, q.Exclusive, q.AutoDelete, durable, exclusive, autoDelete)
+				// AMQP code 406 (PRECONDITION_FAILED)
+				return c.sendChannelClose(channelId, 406, replyText, uint16(ClassQueue), MethodQueueDeclare)
+			}
+			// If properties match, it's a valid re-declaration.
+			c.server.Info("Queue '%s' re-declared with matching properties.", actualQueueName)
+			messageCount = uint32(len(q.Messages))
+			consumerCount = uint32(len(q.Consumers))
+			q.mu.RUnlock()
+		} else { // Not passive and not exists: create it.
+			vhost.queues[actualQueueName] = &Queue{
+				Name:       actualQueueName,
+				Messages:   []Message{},
+				Bindings:   make(map[string]bool),
+				Consumers:  make(map[string]chan Message),
+				Durable:    durable,
+				Exclusive:  exclusive, // If exclusive, ideally track ownerChannelId = channelId
+				AutoDelete: autoDelete,
+				// Arguments: args, // If you store and use queue arguments
+			}
+			c.server.Info("Created new queue: '%s', durable=%v, exclusive=%v, autoDelete=%v",
+				actualQueueName, durable, exclusive, autoDelete)
+			messageCount = 0
+			consumerCount = 0
+		}
+	}
+	vhost.mu.Unlock()
+
+	if !noWait {
+		// If noWait is false, server MUST reply with Queue.DeclareOk.
+		payloadOk := &bytes.Buffer{}
+		binary.Write(payloadOk, binary.BigEndian, uint16(ClassQueue))
+		binary.Write(payloadOk, binary.BigEndian, uint16(MethodQueueDeclareOk))
+		writeShortString(payloadOk, actualQueueName)
+		binary.Write(payloadOk, binary.BigEndian, messageCount)
+		binary.Write(payloadOk, binary.BigEndian, consumerCount)
+
+		if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
+			c.server.Err("Error sending queue.declare-ok for queue '%s': %v", actualQueueName, errWrite)
+			// This is an I/O error. The queue might have been created/state changed.
+			return errWrite // Propagate I/O error
+		}
+		c.server.Info("Sent queue.declare-ok for queue '%s'", actualQueueName)
+	} else {
+		c.server.Info("Queue.Declare with noWait=true processed for '%s'. No DeclareOk sent.", actualQueueName)
+	}
+	return nil // Successfully processed queue.declare
+}
+
+func (c *Connection) handleQueueBind(reader *bytes.Reader, channelId uint16) error {
+	var ticket uint16
+	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (ticket)", uint16(ClassQueue), MethodQueueBind)
+	}
+	queueName, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading queueName for queue.bind: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (queueName)", uint16(ClassQueue), MethodQueueBind)
+	}
+
+	exchangeName, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading exchangeName for queue.bind: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (exchangeName)", uint16(ClassQueue), MethodQueueBind)
+	}
+
+	routingKey, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading routingKey for queue.bind: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (routingKey)", uint16(ClassQueue), MethodQueueBind)
+	}
+
+	bits, errReadByte := reader.ReadByte()
+	if errReadByte != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.bind (bits)", uint16(ClassQueue), MethodQueueBind)
+	}
+
+	argsBind, errReadTableBind := readTable(reader) // readTable now returns (map, error)
+	if errReadTableBind != nil {
+		c.server.Err("Error reading arguments table for queue.bind (queue: '%s', exchange: '%s'): %v", queueName, exchangeName, errReadTableBind)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed arguments table for queue.bind", uint16(ClassQueue), MethodQueueBind)
+	}
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of queue.bind payload for queue '%s'.", queueName)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.bind payload", uint16(ClassQueue), MethodQueueBind)
+	}
+
+	noWait := (bits & 0x01) != 0
+
+	c.server.Info("Processing queue.bind: queue='%s', exchange='%s', routingKey='%s', noWait=%v, args=%v on channel %d",
+		queueName, exchangeName, routingKey, noWait, argsBind, channelId)
+
+	vhost := c.vhost
+	vhost.mu.RLock() // Use RLock for reading exchanges and queues initially
+	ex, exExists := vhost.exchanges[exchangeName]
+	q, qExists := vhost.queues[queueName]
+	vhost.mu.RUnlock()
+
+	if !exExists {
+		replyText := fmt.Sprintf("no exchange '%s' in vhost '/'", exchangeName)
+		c.server.Warn("Queue.Bind failed: %s. Sending Channel.Close.", replyText)
+		// AMQP code 404 (NOT_FOUND)
+		return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueueBind)
+	}
+	if !qExists {
+		replyText := fmt.Sprintf("no queue '%s' in vhost '/'", queueName)
+		c.server.Warn("Queue.Bind failed: %s. Sending Channel.Close.", replyText)
+		// AMQP code 404 (NOT_FOUND)
+		return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueueBind)
+	}
+
+	// Add binding (locking specific exchange and queue)
+	ex.mu.Lock()
+	alreadyBound := false
+	for _, existingQueueName := range ex.Bindings[routingKey] {
+		if existingQueueName == queueName {
+			alreadyBound = true
+			break
+		}
+	}
+	if !alreadyBound {
+		ex.Bindings[routingKey] = append(ex.Bindings[routingKey], queueName)
+	}
+	ex.mu.Unlock()
+
+	q.mu.Lock()
+	q.Bindings[exchangeName+":"+routingKey] = true // Store more specific binding info
+	q.mu.Unlock()
+	c.server.Info("Bound exchange '%s' (type: %s) to queue '%s' with routing key '%s'", exchangeName, ex.Type, queueName, routingKey)
+
+	if !noWait {
+		payloadBindOk := &bytes.Buffer{}
+		binary.Write(payloadBindOk, binary.BigEndian, uint16(ClassQueue))
+		binary.Write(payloadBindOk, binary.BigEndian, uint16(MethodQueueBindOk))
+
+		if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadBindOk.Bytes()}); errWrite != nil {
+			c.server.Err("Error sending queue.bind-ok for queue '%s': %v", queueName, errWrite)
+			return errWrite // Propagate I/O error
+		}
+		c.server.Info("Sent queue.bind-ok for queue '%s'", queueName)
+	}
+	return nil
+}
+
+func (c *Connection) handleQueueDelete(reader *bytes.Reader, channelId uint16) error {
+	var ticket uint16
+	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.delete (ticket)", uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	queueName, err := readShortString(reader)
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.delete (queueName)", uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.delete (bits)", uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	ifUnused := (bits & 0x01) != 0
+	ifEmpty := (bits & 0x02) != 0
+	noWait := (bits & 0x04) != 0
+
+	if reader.Len() > 0 {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.delete payload", uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	c.server.Info("Processing queue.delete: queue='%s', ifUnused=%v, ifEmpty=%v, noWait=%v on channel %d",
+		queueName, ifUnused, ifEmpty, noWait, channelId)
+
+	// Phase 1: Atomic check-and-mark for deletion
+	vhost := c.vhost
+	vhost.mu.RLock()
+	queue, exists := vhost.queues[queueName]
+	vhost.mu.RUnlock()
+
+	if !exists {
+		replyText := fmt.Sprintf("no queue '%s' in vhost '/'", queueName)
+		return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	// Atomically mark queue for deletion
+	if !queue.deleting.CompareAndSwap(false, true) {
+		// Queue is already being deleted by another operation
+		replyText := fmt.Sprintf("queue '%s' is already being deleted", queueName)
+		return c.sendChannelClose(channelId, 409, replyText, uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	// From this point, we own the deletion process
+	defer func() {
+		// Reset deletion flag if we don't complete successfully
+		if queue.deleting.Load() {
+			queue.deleting.Store(false)
+		}
+	}()
+
+	// Phase 2: Validate deletion conditions under lock
+	queue.mu.Lock()
+
+	consumerCount := len(queue.Consumers)
+	messageCount := uint32(len(queue.Messages))
+
+	if ifUnused && consumerCount > 0 {
+		queue.mu.Unlock()
+		queue.deleting.Store(false)
+		replyText := fmt.Sprintf("queue '%s' in use (has %d consumers)", queueName, consumerCount)
+		return c.sendChannelClose(channelId, 406, replyText, uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	if ifEmpty && messageCount > 0 {
+		queue.mu.Unlock()
+		queue.deleting.Store(false)
+		replyText := fmt.Sprintf("queue '%s' not empty (has %d messages)", queueName, messageCount)
+		return c.sendChannelClose(channelId, 406, replyText, uint16(ClassQueue), MethodQueueDelete)
+	}
+
+	// Collect data for cleanup while holding lock
+	consumerChannels := make(map[string]chan Message)
+	for tag, ch := range queue.Consumers {
+		consumerChannels[tag] = ch
+	}
+
+	queueBindings := make([]string, 0, len(queue.Bindings))
+	for binding := range queue.Bindings {
+		queueBindings = append(queueBindings, binding)
+	}
+
+	deletedMessageCount := messageCount
+
+	// Clear queue state immediately
+	queue.Messages = nil
+	queue.Consumers = make(map[string]chan Message)
+	queue.Bindings = make(map[string]bool)
+
+	queue.mu.Unlock()
+
+	// Phase 3: Coordinated cleanup without holding queue lock
+	var cleanupWG sync.WaitGroup
+
+	// Send Basic.Cancel messages first
+	cleanupWG.Add(1)
+	go func() {
+		defer cleanupWG.Done()
+		c.sendBasicCancelToConsumers(consumerChannels, queueName)
+	}()
+
+	// Close consumer channels
+	cleanupWG.Add(1)
+	go func() {
+		defer cleanupWG.Done()
+		for consumerTag, msgChan := range consumerChannels {
+			select {
+			case <-msgChan:
+				// Channel already closed
+			default:
+				close(msgChan)
+			}
+			c.server.Info("Closed consumer channel for '%s' on queue '%s'", consumerTag, queueName)
+		}
+	}()
+
+	// Clean up channel consumer mappings
+	cleanupWG.Add(1)
+	go func() {
+		defer cleanupWG.Done()
+		c.cleanupChannelConsumers(queueName, consumerChannels)
+	}()
+
+	// Clean up exchange bindings
+	cleanupWG.Add(1)
+	go func() {
+		defer cleanupWG.Done()
+		c.cleanupExchangeBindings(queueName, queueBindings)
+	}()
+
+	// Wait for all cleanup operations with timeout
+	done := make(chan struct{})
+	go func() {
+		cleanupWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		c.server.Info("All cleanup operations completed for queue '%s'", queueName)
+	case <-time.After(5 * time.Second):
+		c.server.Warn("Timeout during cleanup operations for queue '%s' - proceeding anyway", queueName)
+	}
+
+	// Phase 4: Remove from vhost and finalize
+	vhost.mu.Lock()
+	delete(vhost.queues, queueName)
+	vhost.mu.Unlock()
+
+	// Mark deletion as complete
+	queue.deleting.Store(false)
+
+	c.server.Info("Successfully deleted queue '%s' with %d messages", queueName, deletedMessageCount)
+
+	if !noWait {
+		payload := &bytes.Buffer{}
+		binary.Write(payload, binary.BigEndian, uint16(ClassQueue))
+		binary.Write(payload, binary.BigEndian, uint16(MethodQueueDeleteOk))
+		binary.Write(payload, binary.BigEndian, deletedMessageCount)
+
+		if err := c.writeFrame(&Frame{
+			Type:    FrameMethod,
+			Channel: channelId,
+			Payload: payload.Bytes(),
+		}); err != nil {
+			c.server.Err("Error sending queue.delete-ok for queue '%s': %v", queueName, err)
+			return err
+		}
+	}
+
+	return nil
+}
+
 // deliverToQueue handles delivery to a single queue
 func (c *Connection) deliverToQueue(queueName string, msg Message) {
 	vhost := c.vhost
@@ -4269,43 +4505,81 @@ func (c *Connection) tryDispatchFromSingleQueue(queueName string) {
 	}
 }
 
-func FindMessageInQueueNonLocking(msgIdentifier string, queue *Queue) (int, bool) {
-	for i, msg := range queue.Messages {
-		if GetMessageIdentifier(&msg) == msgIdentifier {
-			return i, true
+func (c *Connection) cleanupChannelConsumers(queueName string, consumers map[string]chan Message) {
+	// Get all channels at once
+	c.mu.RLock()
+	channels := make([]*Channel, 0, len(c.channels))
+	for _, ch := range c.channels {
+		channels = append(channels, ch)
+	}
+	c.mu.RUnlock()
+
+	// Clean each channel separately
+	for _, ch := range channels {
+		ch.mu.Lock()
+		modified := false
+		for consumerTag := range consumers {
+			if ch.consumers[consumerTag] == queueName {
+				delete(ch.consumers, consumerTag)
+				modified = true
+			}
+		}
+		ch.mu.Unlock()
+
+		if modified {
+			c.server.Debug("Removed consumers from channel %d for deleted queue '%s'", ch.id, queueName)
 		}
 	}
-	return -1, false
 }
 
-// GetMessageIdentifier creates a unique hash for a message based on its key properties
-// Note: For production code, consider adding "crypto/sha256" to your imports
-func GetMessageIdentifier(msg *Message) string {
-	if msg == nil {
-		return ""
+// Helper method to clean up exchange bindings
+func (c *Connection) cleanupExchangeBindings(queueName string, bindings []string) {
+	if len(bindings) == 0 {
+		return
 	}
 
-	// Create a buffer to concatenate all fields
-	var buffer bytes.Buffer
+	// Extract unique exchange names from bindings
+	exchangeNames := make(map[string]bool)
+	for _, binding := range bindings {
+		parts := strings.SplitN(binding, ":", 2)
+		if len(parts) >= 1 {
+			exchangeNames[parts[0]] = true
+		}
+	}
 
-	// Add message ID (or empty string if not set)
-	buffer.WriteString(msg.Properties.MessageId)
+	vhost := c.vhost
+	for exchangeName := range exchangeNames {
+		vhost.mu.RLock()
+		exchange, exists := vhost.exchanges[exchangeName]
+		vhost.mu.RUnlock()
 
-	// Add timestamp as bytes
-	binary.Write(&buffer, binary.BigEndian, msg.Properties.Timestamp)
+		if !exists {
+			continue
+		}
 
-	// Add routing key
-	buffer.WriteString(msg.RoutingKey)
+		exchange.mu.Lock()
+		modified := false
+		for routingKey, boundQueues := range exchange.Bindings {
+			newQueues := make([]string, 0, len(boundQueues))
+			for _, boundQueue := range boundQueues {
+				if boundQueue != queueName {
+					newQueues = append(newQueues, boundQueue)
+				} else {
+					modified = true
+				}
+			}
+			if len(newQueues) > 0 {
+				exchange.Bindings[routingKey] = newQueues
+			} else if len(boundQueues) > 0 {
+				delete(exchange.Bindings, routingKey)
+			}
+		}
+		exchange.mu.Unlock()
 
-	// Add message body
-	buffer.Write(msg.Body)
-
-	// Create a simple hash using built-in hash/fnv package
-	h := fnv.New64a()
-	h.Write(buffer.Bytes())
-
-	// Return hex representation of the hash
-	return fmt.Sprintf("%x", h.Sum64())
+		if modified {
+			c.server.Debug("Removed bindings for queue '%s' from exchange '%s'", queueName, exchangeName)
+		}
+	}
 }
 
 // getChannel safely retrieves a channel and checks if it's closing

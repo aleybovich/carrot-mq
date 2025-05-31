@@ -1,5 +1,10 @@
 # Changelog
 
+## [unreleased]
+
+### Added
+- Queue deletion
+
 ## [0.0.2]
 
 ### Added 
@@ -45,7 +50,6 @@
 - Transaction support
 - ExchangeDelete, ExchangeBind, ExchangeUnbind
 - Exchange-to-exchange bindings
-- Queue deletion
 - Queue purge
 - Channel flow control
 - Heartbeat monitoring

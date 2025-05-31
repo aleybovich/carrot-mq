@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"strings"
 )
@@ -607,4 +608,43 @@ func writeTable(writer *bytes.Buffer, table map[string]interface{}) error {
 		return fmt.Errorf("writing table payload bytes: %w", err)
 	}
 	return nil
+}
+
+func FindMessageInQueueNonLocking(msgIdentifier string, queue *Queue) (int, bool) {
+	for i, msg := range queue.Messages {
+		if GetMessageIdentifier(&msg) == msgIdentifier {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// GetMessageIdentifier creates a unique hash for a message based on its key properties
+// Note: For production code, consider adding "crypto/sha256" to your imports
+func GetMessageIdentifier(msg *Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	// Create a buffer to concatenate all fields
+	var buffer bytes.Buffer
+
+	// Add message ID (or empty string if not set)
+	buffer.WriteString(msg.Properties.MessageId)
+
+	// Add timestamp as bytes
+	binary.Write(&buffer, binary.BigEndian, msg.Properties.Timestamp)
+
+	// Add routing key
+	buffer.WriteString(msg.RoutingKey)
+
+	// Add message body
+	buffer.Write(msg.Body)
+
+	// Create a simple hash using built-in hash/fnv package
+	h := fnv.New64a()
+	h.Write(buffer.Bytes())
+
+	// Return hex representation of the hash
+	return fmt.Sprintf("%x", h.Sum64())
 }

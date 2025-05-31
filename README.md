@@ -349,5 +349,3 @@ This list tracks major AMQP functionalities not yet implemented or only partiall
 - [ ] **Management Interface**: An HTTP API or similar interface for inspecting server entities (queues, exchanges, connections) and performing administrative operations (e.g., purging queues, closing connections).
 
 ---
-
-**Priority Recommendation:** Start with message acknowledgments and QoS as they're fundamental to reliable messaging, followed by additional exchange types for routing flexibility. (Note: Message acknowledgments are now largely implemented; QoS remains a high priority).
