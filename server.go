@@ -1577,6 +1577,9 @@ func (c *Connection) handleQueueMethod(methodId uint16, reader *bytes.Reader, ch
 	case MethodQueueBind:
 		return c.handleQueueBind(reader, channelId)
 
+	case MethodQueuePurge:
+		return c.handleQueuePurge(reader, channelId)
+
 	case MethodQueueDelete:
 		return c.handleQueueDelete(reader, channelId)
 
@@ -3641,6 +3644,105 @@ func (c *Connection) handleQueueDelete(reader *bytes.Reader, channelId uint16) e
 	}
 
 	return nil
+}
+
+func (c *Connection) handleQueuePurge(reader *bytes.Reader, channelId uint16) error {
+	var ticket uint16
+	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.purge (ticket)", uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	queueName, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading queueName for queue.purge: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.purge (queueName)", uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed queue.purge (bits)", uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	noWait := (bits & 0x01) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of queue.purge payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.purge payload", uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	c.server.Info("Processing queue.purge: queue='%s', noWait=%v on channel %d", queueName, noWait, channelId)
+
+	// Get the vhost and queue
+	vhost := c.vhost
+	vhost.mu.RLock()
+	queue, exists := vhost.queues[queueName]
+	vhost.mu.RUnlock()
+
+	if !exists {
+		replyText := fmt.Sprintf("no queue '%s' in vhost '/'", queueName)
+		c.server.Warn("Queue.Purge: %s. Sending Channel.Close.", replyText)
+		return c.sendChannelClose(channelId, 404, replyText, uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	// Atomically check if queue is being deleted
+	if queue.deleting.Load() {
+		replyText := fmt.Sprintf("queue '%s' is being deleted", queueName)
+		return c.sendChannelClose(channelId, 409, replyText, uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	// Purge the queue
+	queue.mu.Lock()
+
+	// Double-check deletion status while holding lock
+	if queue.deleting.Load() {
+		queue.mu.Unlock()
+		replyText := fmt.Sprintf("queue '%s' is being deleted", queueName)
+		return c.sendChannelClose(channelId, 409, replyText, uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	// Check if vhost is being deleted
+	if vhost.IsDeleting() {
+		queue.mu.Unlock()
+		c.server.Info("Queue.Purge: VHost is being deleted, cannot purge queue '%s'", queueName)
+		return c.sendConnectionClose(320, "VHost deleted", uint16(ClassQueue), MethodQueuePurge)
+	}
+
+	messageCount := uint32(len(queue.Messages))
+
+	// Clear all messages
+	if messageCount > 0 {
+		queue.Messages = []Message{}
+		c.server.Info("Purged %d messages from queue '%s'", messageCount, queueName)
+	} else {
+		c.server.Info("Queue '%s' was already empty (purge had no effect)", queueName)
+	}
+
+	queue.mu.Unlock()
+
+	// Send PurgeOk if not no-wait
+	if !noWait {
+
+		if err := c.sendPurgeOk(channelId, messageCount); err != nil {
+			c.server.Err("Error sending queue.purge-ok for queue '%s': %v", queueName, err)
+			return err
+		}
+		c.server.Info("Sent queue.purge-ok for queue '%s' (purged %d messages)", queueName, messageCount)
+	}
+
+	return nil
+}
+
+func (c *Connection) sendPurgeOk(channelId uint16, messageCount uint32) error {
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassQueue))
+	binary.Write(payload, binary.BigEndian, uint16(MethodQueuePurgeOk))
+	binary.Write(payload, binary.BigEndian, messageCount)
+
+	return c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payload.Bytes(),
+	})
 }
 
 // deliverToQueue handles delivery to a single queue
