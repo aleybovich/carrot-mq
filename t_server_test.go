@@ -78,7 +78,7 @@ func TestAuth_PlainMode_ValidCredentials(t *testing.T) {
 	defer ch.Close()
 }
 
-func TestAuth_PlainMode_InvalidCredentials(t *testing.T) {
+func TestAuth_PlainMode_InvalidCredentials_SpecCompliant(t *testing.T) {
 	// Server with authentication enabled
 	addr, cleanup := setupTestServer(t, WithAuth(map[string]string{
 		"guest": "guest123",
@@ -86,38 +86,163 @@ func TestAuth_PlainMode_InvalidCredentials(t *testing.T) {
 	}))
 	defer cleanup()
 
-	// Test invalid password
-	_, err := amqp.Dial("amqp://guest:wrongpass@" + addr)
-	require.Error(t, err, "Should fail to connect with invalid password")
-
-	amqpErr, ok := err.(*amqp.Error)
-	require.True(t, ok, "Error should be of type *amqp.Error")
-	assert.Equal(t, amqp.AccessRefused, amqpErr.Code, "AMQP error code should be 403 (ACCESS_REFUSED)")
-
-	// Test invalid username
-	conn2, err := amqp.Dial("amqp://unknownuser:anypass@" + addr)
-	require.Error(t, err, "Should fail to connect with invalid username")
-	if conn2 != nil {
-		conn2.Close()
+	testCases := []struct {
+		name     string
+		username string
+		password string
+		desc     string
+	}{
+		{
+			name:     "InvalidPassword",
+			username: "guest",
+			password: "wrongpass",
+			desc:     "Should fail with invalid password",
+		},
+		{
+			name:     "InvalidUsername",
+			username: "unknownuser",
+			password: "anypass",
+			desc:     "Should fail with invalid username",
+		},
+		{
+			name:     "EmptyCredentials",
+			username: "",
+			password: "",
+			desc:     "Should fail with empty credentials",
+		},
+		{
+			name:     "EmptyPassword",
+			username: "guest",
+			password: "",
+			desc:     "Should fail with empty password",
+		},
+		{
+			name:     "EmptyUsername",
+			username: "",
+			password: "guest123",
+			desc:     "Should fail with empty username",
+		},
 	}
 
-	amqpErr2, ok := err.(*amqp.Error)
-	require.True(t, ok, "Error should be of type *amqp.Error")
-	assert.Equal(t, amqp.AccessRefused, amqpErr2.Code, "AMQP error code should be 403 (ACCESS_REFUSED)")
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+
+			// Build connection URL
+			var connURL string
+			if tc.username == "" && tc.password == "" {
+				connURL = "amqp://" + addr
+			} else {
+				connURL = fmt.Sprintf("amqp://%s:%s@%s", tc.username, tc.password, addr)
+			}
+
+			// Try to connect
+			conn, err := amqp.Dial(connURL)
+
+			// Clean up if connection somehow succeeded
+			if conn != nil {
+				conn.Close()
+			}
+
+			// Connection should fail
+			require.Error(t, err, tc.desc)
+
+			// Measure elapsed time
+			elapsed := time.Since(start)
+
+			// Per spec 4.10.2, server should pause for 1 second before closing
+			// Allow some margin for network/processing time
+			assert.GreaterOrEqual(t, elapsed, failedAuthThrottle,
+				"Server should pause for at least ~1 second before closing connection on auth failure")
+			assert.LessOrEqual(t, elapsed, failedAuthThrottle*2,
+				"Server pause should not be much longer than 1 second")
+
+			// The RabbitMQ Go client library may generate an AMQP error locally when
+			// it detects the connection was closed during authentication. This is a
+			// client-side behavior, not a protocol violation. The important thing is
+			// that the server didn't send a Connection.Close frame.
+
+			// Check if we got an AMQP error
+			amqpErr, isAMQPError := err.(*amqp.Error)
+
+			if isAMQPError {
+				// If the client generated an AMQP error, it should be an authentication error
+				// The RabbitMQ Go client uses code 403 (ACCESS_REFUSED) for auth failures
+				assert.Equal(t, amqp.AccessRefused, amqpErr.Code,
+					"AMQP error code should be 403 (ACCESS_REFUSED) for authentication failure")
+
+				// The error message should indicate authentication failure
+				assert.True(t,
+					strings.Contains(amqpErr.Reason, "username") ||
+						strings.Contains(amqpErr.Reason, "password") ||
+						strings.Contains(amqpErr.Reason, "auth"),
+					"AMQP error should indicate authentication failure, got: %s", amqpErr.Reason)
+			} else {
+				// If not an AMQP error, it should be a raw connection error
+				errStr := err.Error()
+				assert.True(t,
+					strings.Contains(errStr, "EOF") ||
+						strings.Contains(errStr, "connection reset") ||
+						strings.Contains(errStr, "closed") ||
+						strings.Contains(errStr, "broken pipe"),
+					"Non-AMQP error should indicate connection was closed/reset/EOF, got: %s", errStr)
+			}
+
+			// Log the actual error for debugging
+			t.Logf("Authentication failure resulted in error: %v (type: %T)", err, err)
+		})
+	}
 }
 
-func TestAuth_PlainMode_EmptyCredentials(t *testing.T) {
+func TestAuth_PlainMode_ValidCredentials_Timing(t *testing.T) {
 	// Server with authentication enabled
 	addr, cleanup := setupTestServer(t, WithAuth(map[string]string{
 		"guest": "guest123",
+		"admin": "secretpass",
 	}))
 	defer cleanup()
 
-	// Test empty credentials
-	conn, err := amqp.Dial("amqp://" + addr)
-	require.Error(t, err, "Should fail to connect without credentials when auth is enabled")
-	if conn != nil {
-		conn.Close()
+	testCases := []struct {
+		name     string
+		username string
+		password string
+	}{
+		{
+			name:     "ValidGuest",
+			username: "guest",
+			password: "guest123",
+		},
+		{
+			name:     "ValidAdmin",
+			username: "admin",
+			password: "secretpass",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+
+			conn, err := amqp.Dial(fmt.Sprintf("amqp://%s:%s@%s", tc.username, tc.password, addr))
+			require.NoError(t, err, "Should connect successfully with valid credentials")
+			defer conn.Close()
+
+			elapsed := time.Since(start)
+
+			// Valid credentials should connect quickly (no artificial delay)
+			assert.Less(t, elapsed, failedAuthThrottle,
+				"Valid authentication should complete quickly without delay")
+
+			// Verify connection is functional
+			ch, err := conn.Channel()
+			require.NoError(t, err, "Should open channel successfully")
+			defer ch.Close()
+
+			// Do a simple operation to verify connection is fully established
+			q, err := ch.QueueDeclare("test-queue-"+tc.name, false, false, false, false, nil)
+			require.NoError(t, err, "Should declare queue successfully")
+			assert.NotEmpty(t, q.Name, "Queue should have a name")
+		})
 	}
 }
 

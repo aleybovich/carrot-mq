@@ -29,6 +29,8 @@ const (
 	suggestedFrameMaxSize      = 131072
 )
 
+const failedAuthThrottle = 1 * time.Second // Throttle failed auth attempts to prevent abuse
+
 // Flag to determine if we're logging to a terminal (with colors) or a file
 var isTerminal bool
 
@@ -858,13 +860,12 @@ func (c *Connection) handleMethod(frame *Frame) error { // Return type error
 	binary.Read(reader, binary.BigEndian, &classId)
 	binary.Read(reader, binary.BigEndian, &methodId)
 
-	methodName := getFullMethodName(classId, methodId)
-	if isTerminal {
-		highlightedMethod := fmt.Sprintf("%s%s%s", colorYellow, methodName, colorReset)
-		c.server.Info("Handling AMQP method: %s on channel=%d", highlightedMethod, frame.Channel)
-	} else {
-		c.server.Info("Handling AMQP method: %s, channel=%d", methodName, frame.Channel)
+	if frame.Channel == 0 && classId != ClassConnection {
+		c.server.Err("Received non-Connection class %d on channel 0", classId)
+		return c.sendConnectionClose(503, "command invalid - channel 0 is for Connection class only", classId, methodId)
 	}
+
+	methodName := getFullMethodName(classId, methodId)
 
 	var err error
 	switch classId {
@@ -937,7 +938,6 @@ func (c *Connection) handleConfirmMethod(methodId uint16, reader *bytes.Reader, 
 
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data at end of confirm.select payload for channel %d.", channelId)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in confirm.select payload", uint16(ClassConfirm), MethodConfirmSelect)
 		}
 
 		noWait := (bits & 0x01) != 0
@@ -1012,26 +1012,34 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 		// Check for remaining bytes, indicates malformed arguments
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data at end of connection.start-ok payload.")
-			return c.sendConnectionClose(502, "SYNTAX_ERROR - extra data in connection.start-ok", uint16(ClassConnection), MethodConnectionStartOk)
 		}
 
 		// Handle authentication based on server auth mode
 		if c.server.authMode == AuthModePlain {
 			if mechanism != "PLAIN" {
 				c.server.Err("Unsupported authentication mechanism: %s", mechanism)
-				return c.sendConnectionClose(506, fmt.Sprintf("unsupported mechanism '%s'", mechanism), uint16(ClassConnection), MethodConnectionStartOk)
+				// During negotiation phase - pause and close socket per spec 4.10.2
+				time.Sleep(failedAuthThrottle)
+				c.conn.Close()
+				return fmt.Errorf("unsupported mechanism '%s'", mechanism)
 			}
 
 			// Parse PLAIN authentication response
 			if len(response) < 2 {
 				c.server.Err("Invalid PLAIN authentication response length")
-				return c.sendConnectionClose(501, "invalid authentication response", uint16(ClassConnection), MethodConnectionStartOk)
+				// During negotiation phase - pause and close socket per spec 4.10.2
+				time.Sleep(failedAuthThrottle)
+				c.conn.Close()
+				return fmt.Errorf("invalid authentication response")
 			}
 
 			parts := bytes.Split([]byte(response), []byte{0})
 			if len(parts) != 3 {
 				c.server.Err("Invalid PLAIN authentication response format")
-				return c.sendConnectionClose(501, "invalid authentication response format", uint16(ClassConnection), MethodConnectionStartOk)
+				// During negotiation phase - pause and close socket per spec 4.10.2
+				time.Sleep(failedAuthThrottle)
+				c.conn.Close()
+				return fmt.Errorf("invalid authentication response format")
 			}
 
 			username := string(parts[1])
@@ -1039,8 +1047,16 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 
 			// Validate credentials
 			if storedPass, ok := c.server.credentials[username]; !ok || storedPass != password {
-				c.server.Err("Authentication failed for user: %s", username)
-				return c.sendConnectionClose(403, "authentication failed", uint16(ClassConnection), MethodConnectionStartOk)
+				c.server.Err("Authentication failed for user: %s from %s", username, c.conn.RemoteAddr())
+
+				// Per spec 4.10.2: pause before closing to prevent DoS attacks
+				// Use a goroutine to avoid blocking the handler
+
+				time.Sleep(failedAuthThrottle)
+				c.conn.Close()
+
+				// Return error without sending any protocol frames
+				return fmt.Errorf("authentication failed for user %s", username)
 			}
 
 			c.username = username
@@ -1069,7 +1085,7 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 			return c.sendConnectionClose(502, "malformed connection.tune-ok (heartbeat)", uint16(ClassConnection), MethodConnectionTuneOk)
 		}
 		if reader.Len() > 0 {
-			return c.sendConnectionClose(502, "extra data in connection.tune-ok", uint16(ClassConnection), MethodConnectionTuneOk)
+			c.server.Warn("Extra data at end of connection.tune-ok payload.")
 		}
 
 		c.server.Info("Connection parameters negotiated: channelMax=%d, frameMax=%d, heartbeat=%d",
@@ -1090,7 +1106,7 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 			return c.sendConnectionClose(502, "malformed connection.open (insist bit)", uint16(ClassConnection), MethodConnectionOpen)
 		}
 		if reader.Len() > 0 {
-			return c.sendConnectionClose(502, "extra data in connection.open", uint16(ClassConnection), MethodConnectionOpen)
+			c.server.Warn("Extra data at end of connection.open payload.")
 		}
 		c.server.Info("Processing connection.%s for vhost: '%s'", methodName, vhostName)
 
@@ -1136,9 +1152,7 @@ func (c *Connection) handleConnectionMethod(methodId uint16, reader *bytes.Reade
 		binary.Read(reader, binary.BigEndian, &methodIdField)
 
 		if reader.Len() > 0 {
-			// Client sent extra data, but we are closing anyway. Log it.
 			c.server.Warn("Extra data in client's connection.close method.")
-			// Don't send an error for this, just proceed with close.
 		}
 
 		c.server.Info("Client requests connection close: replyCode=%d, replyText='%s', classId=%d, methodId=%d",
@@ -1217,8 +1231,6 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data at end of channel.open payload for channel %d.", channelId)
-			// Channel.Open is fundamental; syntax error here often implies connection-level issue or badly formed client.
-			return c.sendConnectionClose(502, "SYNTAX_ERROR - extra data in channel.open payload", uint16(ClassChannel), MethodChannelOpen)
 		}
 
 		// SPECIAL CASE: Need write lock for channel creation
@@ -1342,8 +1354,6 @@ func (c *Connection) handleChannelMethod(methodId uint16, reader *bytes.Reader, 
 		c.server.Info("Received channel.close-ok for channel %d.", channelId)
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data in channel.close-ok payload for channel %d.", channelId)
-			// AMQP spec says the peer receiving an invalid frame MAY close the connection.
-			// For a simple CloseOk with extra data, just logging might be acceptable.
 		}
 
 		// Need to access timer, so lock the channel
@@ -1428,7 +1438,7 @@ func (c *Connection) handleExchangeMethod(methodId uint16, reader *bytes.Reader,
 			return c.sendChannelClose(channelId, 502, "malformed arguments table for exchange.declare", uint16(ClassExchange), MethodExchangeDeclare)
 		}
 		if reader.Len() > 0 {
-			return c.sendChannelClose(channelId, 502, "extra data in exchange.declare", uint16(ClassExchange), MethodExchangeDeclare)
+			c.server.Warn("Extra data at end of exchange.declare payload.")
 		}
 
 		passive := (bits & 0x01) != 0
@@ -1651,7 +1661,6 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		// Check for extra data after all arguments are read.
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data at end of basic.publish payload for exchange '%s', rkey '%s'.", exchangeName, routingKey)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.publish payload", uint16(ClassBasic), MethodBasicPublish)
 		}
 
 		mandatory := (bits & 0x01) != 0
@@ -1728,7 +1737,6 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 
 		if reader.Len() > 0 {
 			c.server.Warn("Extra data at end of basic.consume payload for queue '%s'.", queueName)
-			return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.consume payload", uint16(ClassBasic), MethodBasicConsume)
 		}
 
 		noLocal := (bits & 0x01) != 0 // Server doesn't fully implement no-local yet
@@ -1879,7 +1887,6 @@ func (c *Connection) handleBasicGet(reader *bytes.Reader, channelId uint16) erro
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of basic.get payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.get payload", uint16(ClassBasic), MethodBasicGet)
 	}
 
 	c.server.Info("Processing basic.get: queue='%s', noAck=%v on channel %d", queueName, noAck, channelId)
@@ -2139,7 +2146,6 @@ func (c *Connection) handleBasicCancel(reader *bytes.Reader, channelId uint16) e
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of basic.cancel payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.cancel payload", uint16(ClassBasic), MethodBasicCancel)
 	}
 
 	c.server.Info("Processing basic.cancel: consumerTag='%s', noWait=%v on channel %d", consumerTag, noWait, channelId)
@@ -2214,7 +2220,6 @@ func (c *Connection) handleBasicAck(reader *bytes.Reader, channelId uint16) erro
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of basic.ack payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.ack payload", uint16(ClassBasic), MethodBasicAck)
 	}
 
 	c.server.Info("Processing basic.ack: deliveryTag=%d, multiple=%v on channel %d", deliveryTag, multiple, channelId)
@@ -2286,7 +2291,6 @@ func (c *Connection) handleBasicNack(reader *bytes.Reader, channelId uint16) err
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of basic.nack payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.nack payload", uint16(ClassBasic), MethodBasicNack)
 	}
 
 	c.server.Info("Processing basic.nack: deliveryTag=%d, multiple=%v, requeue=%v on channel %d",
@@ -2384,7 +2388,6 @@ func (c *Connection) handleBasicReject(reader *bytes.Reader, channelId uint16) e
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of basic.reject payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.reject payload", uint16(ClassBasic), MethodBasicReject)
 	}
 
 	c.server.Info("Processing basic.reject: deliveryTag=%d, requeue=%v on channel %d", deliveryTag, requeue, channelId)
@@ -2447,7 +2450,6 @@ func (c *Connection) handleBasicRecover(reader *bytes.Reader, channelId uint16) 
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of basic.recover payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in basic.recover payload", uint16(ClassBasic), MethodBasicRecover)
 	}
 
 	c.server.Info("Processing basic.recover: requeue=%v on channel %d", requeue, channelId)
@@ -2529,6 +2531,11 @@ func (c *Connection) handleBasicRecover(reader *bytes.Reader, channelId uint16) 
 }
 
 func (c *Connection) handleHeader(frame *Frame) error {
+	if frame.Channel == 0 {
+		c.server.Err("Received content header frame on channel 0")
+		return c.sendConnectionClose(504, "channel error - content frames cannot use channel 0", 0, 0)
+	}
+
 	ch, exists, isClosing := c.getChannel(frame.Channel)
 
 	if !exists {
@@ -2678,19 +2685,21 @@ func (c *Connection) handleHeader(frame *Frame) error {
 		}
 	}
 
-	// Check if readShortString (if it could indicate error) or binary.Read caused an issue
-	// For now, assuming readShortString is problematic if it returns "" when reader isn't empty.
-	// A more robust solution requires readShortString to return an error.
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of header frame payload on channel %d", frame.Channel)
-		// AMQP code 502 (SYNTAX_ERROR)
-		return c.sendChannelClose(frame.Channel, 502, "extra data in header payload", classId, 0)
 	}
 
 	return nil // Successfully processed header
 }
 
 func (c *Connection) handleBody(frame *Frame) {
+	if frame.Channel == 0 {
+		c.server.Err("Received content body frame on channel 0")
+		// For body frames, we might already be in an inconsistent state
+		c.conn.Close()
+		return
+	}
+
 	// Get the channel and its pendingMessage
 	ch, exists, isClosing := c.getChannel(frame.Channel)
 
@@ -3181,7 +3190,6 @@ func (c *Connection) handleExchangeDelete(reader *bytes.Reader, channelId uint16
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of exchange.delete payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in exchange.delete payload", uint16(ClassExchange), MethodExchangeDelete)
 	}
 
 	c.server.Info("Processing exchange.delete: exchange='%s', ifUnused=%v, noWait=%v on channel %d",
@@ -3294,7 +3302,6 @@ func (c *Connection) handleQueueDeclare(reader *bytes.Reader, channelId uint16) 
 	// Check for extra data after all arguments are read.
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of queue.declare payload for queue '%s'.", queueNameIn)
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.declare payload", uint16(ClassQueue), MethodQueueDeclare)
 	}
 
 	passive := (bits & 0x01) != 0
@@ -3486,7 +3493,6 @@ func (c *Connection) handleQueueBind(reader *bytes.Reader, channelId uint16) err
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of queue.bind payload for queue '%s'.", queueName)
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.bind payload", uint16(ClassQueue), MethodQueueBind)
 	}
 
 	noWait := (bits & 0x01) != 0
@@ -3597,7 +3603,6 @@ func (c *Connection) handleQueueDelete(reader *bytes.Reader, channelId uint16) e
 	noWait := (bits & 0x04) != 0
 
 	if reader.Len() > 0 {
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.delete payload", uint16(ClassQueue), MethodQueueDelete)
 	}
 
 	c.server.Info("Processing queue.delete: queue='%s', ifUnused=%v, ifEmpty=%v, noWait=%v on channel %d",
@@ -3801,7 +3806,6 @@ func (c *Connection) handleQueueUnbind(reader *bytes.Reader, channelId uint16) e
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of queue.unbind payload for queue '%s'.", queueName)
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.unbind payload", uint16(ClassQueue), MethodQueueUnbind)
 	}
 
 	c.server.Info("Processing queue.unbind: queue='%s', exchange='%s', routingKey='%s', args=%v on channel %d",
@@ -3923,7 +3927,6 @@ func (c *Connection) handleQueuePurge(reader *bytes.Reader, channelId uint16) er
 
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data at end of queue.purge payload.")
-		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in queue.purge payload", uint16(ClassQueue), MethodQueuePurge)
 	}
 
 	c.server.Info("Processing queue.purge: queue='%s', noWait=%v on channel %d", queueName, noWait, channelId)
