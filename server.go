@@ -154,6 +154,8 @@ type Exchange struct {
 	Internal   bool
 	Bindings   map[string][]string
 	mu         sync.RWMutex
+
+	deleted atomic.Bool
 }
 
 type ExchangeConfig struct {
@@ -1537,18 +1539,8 @@ func (c *Connection) handleExchangeMethod(methodId uint16, reader *bytes.Reader,
 		}
 		return nil // Successfully processed Exchange.Declare
 
-	// case MethodExchangeDelete:
-	//    // Future implementation: remember to handle 'if-unused' and 'noWait' bits.
-	//    // AMQP: Channel.Close(540, "NOT_IMPLEMENTED", ...)
-	//    return c.sendChannelClose(channelId, 540, "Exchange.Delete not implemented", uint16(ClassExchange), methodId)
-
-	// case MethodExchangeBind:   // AMQP 0-9-1 Extension: exchange_exchange_bindings capability
-	//    // Future implementation
-	//    return c.sendChannelClose(channelId, 540, "Exchange.Bind (exchange-to-exchange) not implemented", uint16(ClassExchange), methodId)
-
-	// case MethodExchangeUnbind: // AMQP 0-9-1 Extension: exchange_exchange_bindings capability
-	//    // Future implementation
-	//    return c.sendChannelClose(channelId, 540, "Exchange.Unbind (exchange-to-exchange) not implemented", uint16(ClassExchange), methodId)
+	case MethodExchangeDelete:
+		return c.handleExchangeDelete(reader, channelId)
 
 	default:
 		replyText := fmt.Sprintf("unknown or not implemented exchange method id %d", methodId)
@@ -3166,6 +3158,115 @@ func (c *Connection) sendBasicCancelToConsumers(consumers map[string]*Consumer, 
 	}
 }
 
+func (c *Connection) handleExchangeDelete(reader *bytes.Reader, channelId uint16) error {
+	// AMQP 0-9-1: ticket (short), exchange (shortstr), if-unused (bit), no-wait (bit)
+	var ticket uint16
+	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed exchange.delete (ticket)", uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	exchangeName, err := readShortString(reader)
+	if err != nil {
+		c.server.Err("Error reading exchangeName for exchange.delete: %v", err)
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed exchange.delete (exchangeName)", uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - malformed exchange.delete (bits)", uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	ifUnused := (bits & 0x01) != 0
+	noWait := (bits & 0x02) != 0
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of exchange.delete payload.")
+		return c.sendChannelClose(channelId, 502, "SYNTAX_ERROR - extra data in exchange.delete payload", uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	c.server.Info("Processing exchange.delete: exchange='%s', ifUnused=%v, noWait=%v on channel %d",
+		exchangeName, ifUnused, noWait, channelId)
+
+	// Cannot delete the default exchange
+	if exchangeName == "" {
+		replyText := "ACCESS_REFUSED - cannot delete default exchange"
+		c.server.Warn("Attempt to delete default exchange. Sending Channel.Close.")
+		return c.sendChannelClose(channelId, 403, replyText, uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	vhost := c.vhost
+
+	// Hold read lock to safely check and mark for deletion
+	vhost.mu.RLock()
+
+	if vhost.IsDeleting() {
+		vhost.mu.RUnlock()
+		c.server.Info("Exchange.Delete: VHost is being deleted")
+		return c.sendConnectionClose(320, "VHost deleted", uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	exchange, exists := vhost.exchanges[exchangeName]
+	if !exists {
+		vhost.mu.RUnlock()
+		replyText := fmt.Sprintf("NOT_FOUND - no exchange '%s' in vhost '/'", exchangeName)
+		c.server.Warn("Exchange.Delete: %s. Sending Channel.Close.", replyText)
+		return c.sendChannelClose(channelId, 404, replyText, uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	// Check if-unused condition
+	if ifUnused {
+		exchange.mu.RLock()
+		hasBindings := len(exchange.Bindings) > 0
+		exchange.mu.RUnlock()
+
+		if hasBindings {
+			vhost.mu.RUnlock()
+			replyText := fmt.Sprintf("PRECONDITION_FAILED - exchange '%s' in use (has bindings)", exchangeName)
+			c.server.Warn("Exchange.Delete: %s. Sending Channel.Close.", replyText)
+			return c.sendChannelClose(channelId, 406, replyText, uint16(ClassExchange), MethodExchangeDelete)
+		}
+	}
+
+	// Mark exchange for deletion
+	if !exchange.deleted.CompareAndSwap(false, true) {
+		vhost.mu.RUnlock()
+		replyText := fmt.Sprintf("exchange '%s' is already being deleted", exchangeName)
+		return c.sendChannelClose(channelId, 409, replyText, uint16(ClassExchange), MethodExchangeDelete)
+	}
+
+	vhost.mu.RUnlock()
+
+	// Now perform the actual deletion
+	// First, clean up any queue bindings that reference this exchange
+	c.cleanupQueueBindingsForExchange(vhost, exchangeName)
+
+	// Remove from vhost
+	vhost.mu.Lock()
+	delete(vhost.exchanges, exchangeName)
+	vhost.mu.Unlock()
+
+	c.server.Info("Successfully deleted exchange '%s'", exchangeName)
+
+	// Send Exchange.DeleteOk if not no-wait
+	if !noWait {
+		payload := &bytes.Buffer{}
+		binary.Write(payload, binary.BigEndian, uint16(ClassExchange))
+		binary.Write(payload, binary.BigEndian, uint16(MethodExchangeDeleteOk))
+
+		if err := c.writeFrame(&Frame{
+			Type:    FrameMethod,
+			Channel: channelId,
+			Payload: payload.Bytes(),
+		}); err != nil {
+			c.server.Err("Error sending exchange.delete-ok: %v", err)
+			return err
+		}
+		c.server.Info("Sent exchange.delete-ok for exchange '%s'", exchangeName)
+	}
+
+	return nil
+}
+
 func (c *Connection) handleQueueDeclare(reader *bytes.Reader, channelId uint16) error {
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
@@ -4264,6 +4365,38 @@ func (c *Connection) cleanupConnectionResources() {
 
 	c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
 	// The underlying c.conn will be closed by the caller of cleanupConnectionResources or was already closed.
+}
+
+// Helper method to clean up queue bindings when an exchange is deleted
+func (c *Connection) cleanupQueueBindingsForExchange(vhost *VHost, exchangeName string) {
+	vhost.mu.RLock()
+	// Make a copy of queue names to avoid holding the lock too long
+	queueNames := make([]string, 0, len(vhost.queues))
+	for name := range vhost.queues {
+		queueNames = append(queueNames, name)
+	}
+	vhost.mu.RUnlock()
+
+	// Clean up bindings from each queue
+	for _, queueName := range queueNames {
+		vhost.mu.RLock()
+		queue, exists := vhost.queues[queueName]
+		vhost.mu.RUnlock()
+
+		if !exists {
+			continue
+		}
+
+		queue.mu.Lock()
+		// Remove any bindings that reference the deleted exchange
+		for binding := range queue.Bindings {
+			if strings.HasPrefix(binding, exchangeName+":") {
+				delete(queue.Bindings, binding)
+				c.server.Debug("Removed binding '%s' from queue '%s' due to exchange deletion", binding, queueName)
+			}
+		}
+		queue.mu.Unlock()
+	}
 }
 
 // sendChannelClose sends a Channel.Close method to the client and cleans up the channel.

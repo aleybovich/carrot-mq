@@ -57,6 +57,8 @@ const (
 
 	MethodExchangeDeclare   = 10
 	MethodExchangeDeclareOk = 11
+	MethodExchangeDelete    = 20
+	MethodExchangeDeleteOk  = 21
 
 	MethodQueueDeclare   = 10
 	MethodQueueDeclareOk = 11

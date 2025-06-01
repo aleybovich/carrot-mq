@@ -101,6 +101,10 @@ func getMethodName(classId uint16, methodId uint16) string {
 			return "declare"
 		case MethodExchangeDeclareOk:
 			return "declare-ok"
+		case MethodExchangeDelete:
+			return "delete"
+		case MethodExchangeDeleteOk:
+			return "delete-ok"
 		}
 	case ClassQueue:
 		switch methodId {

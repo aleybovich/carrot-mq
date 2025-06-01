@@ -6,6 +6,7 @@
 - Queue deletion
 - Queue purge
 - Queue unbind
+- ExchangeDelete
 - Message delivery refactored, consumer buffer removed
 
 ## [0.0.2]
@@ -51,7 +52,7 @@
 
 ### Not Implemented
 - Transaction support
-- ExchangeDelete, ExchangeBind, ExchangeUnbind
+- ExchangeBind, ExchangeUnbind
 - Exchange-to-exchange bindings
 - Channel flow control
 - Heartbeat monitoring
