@@ -66,6 +66,8 @@ const (
 	MethodQueuePurgeOk   = 31
 	MethodQueueDelete    = 40
 	MethodQueueDeleteOk  = 41
+	MethodQueueUnbind    = 50
+	MethodQueueUnbindOk  = 51
 
 	MethodBasicConsume   = 20
 	MethodBasicConsumeOk = 21

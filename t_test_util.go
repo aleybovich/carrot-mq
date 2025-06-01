@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -78,96 +77,6 @@ func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (server *Serve
 	}
 
 	return server, addr, cleanup
-}
-
-func setupTestEnvForDispatch(t *testing.T) (*Server, *Connection, *VHost, *Queue) {
-	t.Helper()
-
-	isTerminal = true // Force colorized output for server logs during tests
-
-	srv := NewServer()
-
-	vhost, err := srv.GetVHost("/")
-	require.NoError(t, err, "Failed to get default vhost")
-
-	conn := &Connection{
-		conn:     nil,
-		reader:   nil,
-		writer:   nil,
-		channels: make(map[uint16]*Channel),
-		server:   srv,
-		vhost:    vhost,
-		writeMu:  sync.Mutex{},
-		mu:       sync.RWMutex{},
-	}
-
-	queueName := "testQueue-" + strings.ReplaceAll(t.Name(), "/", "_")
-	vhost.mu.Lock() // Lock vhost to safely add the queue
-	q := &Queue{
-		Name:      queueName,
-		Messages:  make([]Message, 0), // Ensure this Message type has `Dispatching bool`
-		Consumers: make(map[string]*Consumer),
-		Bindings:  make(map[string]bool),
-		mu:        sync.RWMutex{},
-		// durable, autoDelete, exclusive, args not strictly needed for tryDispatch unit tests
-	}
-	vhost.queues[queueName] = q
-	vhost.mu.Unlock()
-
-	return srv, conn, vhost, q
-}
-
-// makeTestMessage creates a message with unique properties for testing.
-// Ensure the returned Message struct matches the one in your main code, including `Dispatching`.
-func t_makeTestMessage(id, body, routingKey string) Message {
-	headers := make(map[string]interface{})
-	headers["unique_test_prop"] = fmt.Sprintf("%s-%d", id, time.Now().UnixNano())
-	return Message{
-		Exchange:   "", // Or relevant default
-		RoutingKey: routingKey,
-		Properties: Properties{ // Assuming Properties struct is defined as in your main code
-			MessageId: id,
-			Timestamp: uint64(time.Now().UnixNano()),
-			Headers:   headers,
-		},
-		Body:        []byte(body),
-		Dispatching: false, // Initialize Dispatching to false
-	}
-}
-
-// addMessageToQueue appends a message to a queue's message list.
-func t_addMessageToQueue(t *testing.T, q *Queue, msg Message) {
-	t.Helper()
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.Messages = append(q.Messages, msg)
-}
-
-// getMessageFromChan attempts to receive a message from a channel with a timeout.
-func t_getMessageFromChan(t *testing.T, ch <-chan Message, timeout time.Duration) (Message, bool) {
-	t.Helper()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case msg, ok := <-ch:
-		if !ok { // Channel closed
-			return Message{}, false
-		}
-		return msg, true
-	case <-timer.C:
-		return Message{}, false
-	}
-}
-
-func t_findMessageInQueue(q *Queue, messageId string) (Message, bool) {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	for _, msg := range q.Messages {
-		if msg.Properties.MessageId == messageId {
-			return msg, true
-		}
-	}
-	return Message{}, false
 }
 
 // t_publishMessage publishes a single message.

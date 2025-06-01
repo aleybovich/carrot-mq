@@ -4,6 +4,8 @@
 
 ### Added
 - Queue deletion
+- Queue purge
+- Queue unbind
 - Message delivery refactored, consumer buffer removed
 
 ## [0.0.2]
@@ -51,7 +53,6 @@
 - Transaction support
 - ExchangeDelete, ExchangeBind, ExchangeUnbind
 - Exchange-to-exchange bindings
-- Queue purge
 - Channel flow control
 - Heartbeat monitoring
 - SSL/TLS support

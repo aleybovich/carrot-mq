@@ -112,6 +112,10 @@ func getMethodName(classId uint16, methodId uint16) string {
 			return "bind"
 		case MethodQueueBindOk:
 			return "bind-ok"
+		case MethodQueueUnbind:
+			return "unbind"
+		case MethodQueueUnbindOk:
+			return "unbind-ok"
 		case MethodQueuePurge:
 			return "purge"
 		case MethodQueuePurgeOk:
