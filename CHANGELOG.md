@@ -4,6 +4,7 @@
 
 ### Added
 - Queue deletion
+- Message delivery refactored, consumer buffer removed
 
 ## [0.0.2]
 

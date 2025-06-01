@@ -132,7 +132,7 @@ type Queue struct {
 	Name       string
 	Messages   []Message
 	Bindings   map[string]bool
-	Consumers  map[string]chan Message
+	Consumers  map[string]*Consumer
 	Durable    bool
 	Exclusive  bool
 	AutoDelete bool
@@ -211,6 +211,14 @@ type Connection struct {
 	heartbeatInterval uint16
 
 	username string // Store authenticated username
+}
+
+type Consumer struct {
+	Tag       string
+	ChannelId uint16
+	NoAck     bool
+	Queue     *Queue
+	stopCh    chan struct{} // Signal to stop this consumer
 }
 
 type AuthMode int
@@ -320,7 +328,7 @@ func WithVHosts(vhosts []VHostConfig) ServerOption {
 					Name:       queueConfig.Name,
 					Messages:   []Message{},
 					Bindings:   make(map[string]bool),
-					Consumers:  make(map[string]chan Message),
+					Consumers:  make(map[string]*Consumer),
 					Durable:    queueConfig.Durable,
 					Exclusive:  queueConfig.Exclusive,
 					AutoDelete: queueConfig.AutoDelete,
@@ -1773,8 +1781,6 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		ch.consumers[actualConsumerTag] = queueName // Store mapping of consumer tag to queue name on this channel
 		ch.mu.Unlock()
 
-		msgChan := make(chan Message, 100) // Buffered channel for this consumer
-
 		q.mu.Lock() // Lock queue to modify its consumers map
 		if exclusive {
 			if len(q.Consumers) > 0 {
@@ -1803,7 +1809,15 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 			// AMQP code 530 (NOT_ALLOWED) - "consumer tag not unique"
 			return c.sendChannelClose(channelId, 530, replyText, uint16(ClassBasic), MethodBasicConsume)
 		}
-		q.Consumers[actualConsumerTag] = msgChan
+
+		consumer := &Consumer{
+			Tag:       actualConsumerTag,
+			ChannelId: channelId,
+			NoAck:     noAck,
+			Queue:     q,
+			stopCh:    make(chan struct{}),
+		}
+		q.Consumers[actualConsumerTag] = consumer
 		q.mu.Unlock()
 
 		if !noWait {
@@ -1819,8 +1833,8 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 				delete(ch.consumers, actualConsumerTag)
 				ch.mu.Unlock()
 				q.mu.Lock()
+				close(consumer.stopCh) // Close the message channel we created
 				delete(q.Consumers, actualConsumerTag)
-				close(msgChan) // Close the message channel we created
 				q.mu.Unlock()
 				return errWrite // Propagate I/O error
 			}
@@ -1828,10 +1842,10 @@ func (c *Connection) handleBasicMethod(methodId uint16, reader *bytes.Reader, ch
 		}
 
 		// Start the message delivery goroutine for this consumer
-		go c.deliverMessages(channelId, actualConsumerTag, msgChan, noAck) // Pass noAck to delivery function
+		go c.deliverMessages(channelId, actualConsumerTag, consumer) // Pass noAck to delivery function
 		c.server.Info("Started message delivery goroutine for consumer '%s' on queue '%s' (noAck=%v)", actualConsumerTag, queueName, noAck)
 
-		go c.tryDispatchFromSingleQueue(queueName)
+		//go c.tryDispatchFromSingleQueue(queueName)
 		return nil
 
 	case MethodBasicAck:
@@ -2165,8 +2179,8 @@ func (c *Connection) handleBasicCancel(reader *bytes.Reader, channelId uint16) e
 
 	if qExists && queue != nil {
 		queue.mu.Lock()
-		if msgChan, consumerExists := queue.Consumers[consumerTag]; consumerExists {
-			close(msgChan) // This will cause deliverMessages goroutine to exit
+		if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
+			close(consumer.stopCh) // This will cause deliverMessages goroutine to exit
 			delete(queue.Consumers, consumerTag)
 			c.server.Info("Cancelled consumer '%s' on queue '%s' for channel %d", consumerTag, queueName, channelId)
 		}
@@ -2363,11 +2377,11 @@ func (c *Connection) handleBasicNack(reader *bytes.Reader, channelId uint16) err
 	}
 
 	// Attempt to dispatch from affected queues if messages were requeued
-	if requeue {
-		for queueName := range affectedQueues {
-			go c.tryDispatchFromSingleQueue(queueName) // Run in a goroutine to avoid blocking the handler
-		}
-	}
+	// if requeue {
+	// 	for queueName := range affectedQueues {
+	// 		go c.tryDispatchFromSingleQueue(queueName) // Run in a goroutine to avoid blocking the handler
+	// 	}
+	// }
 
 	return nil
 }
@@ -2416,8 +2430,6 @@ func (c *Connection) handleBasicReject(reader *bytes.Reader, channelId uint16) e
 	delete(ch.unackedMessages, deliveryTag) // Remove from unacked
 	ch.mu.Unlock()                          // Unlock channel
 
-	var queueToDispatch string // To store the name of the queue if dispatch is needed
-
 	if requeue {
 		vhost := c.vhost
 		vhost.mu.RLock()
@@ -2430,7 +2442,6 @@ func (c *Connection) handleBasicReject(reader *bytes.Reader, channelId uint16) e
 			queue.mu.Lock() // Lock the specific queue
 			queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
 			c.server.Info("Requeued rejected message to queue '%s' (delivery tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
-			queueToDispatch = unacked.QueueName
 			queue.mu.Unlock() // Unlock the queue
 		} else {
 			c.server.Warn("Queue '%s' not found for requeuing rejected message (tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
@@ -2438,11 +2449,6 @@ func (c *Connection) handleBasicReject(reader *bytes.Reader, channelId uint16) e
 	} else {
 		// Message is discarded
 		c.server.Info("Discarded rejected message (requeue=false) from channel %d (delivery tag %d)", channelId, deliveryTag)
-	}
-
-	// Attempt to dispatch from the affected queue if a message was requeued
-	if queueToDispatch != "" {
-		go c.tryDispatchFromSingleQueue(queueToDispatch)
 	}
 
 	return nil
@@ -2513,9 +2519,9 @@ func (c *Connection) handleBasicRecover(reader *bytes.Reader, channelId uint16) 
 		}
 
 		// Trigger dispatch for affected queues
-		for queueName := range affectedQueues {
-			go c.tryDispatchFromSingleQueue(queueName)
-		}
+		// for queueName := range affectedQueues {
+		// 	go c.tryDispatchFromSingleQueue(queueName)
+		// }
 	} else {
 		// If requeue is false, messages should be redelivered to the original consumer
 		// Since we don't track which consumer received each message, and the AMQP spec
@@ -3160,36 +3166,15 @@ func (c *Connection) sendBasicCancelFromServer(channelId uint16, consumerTag str
 	return c.writer.Flush()
 }
 
-func (c *Connection) sendBasicCancelToConsumers(consumers map[string]chan Message, queueName string) {
+func (c *Connection) sendBasicCancelToConsumers(consumers map[string]*Consumer, queueName string) {
 	c.server.Info("Sending Basic.Cancel for %d consumers on queue '%s'", len(consumers), queueName)
-
-	// Group consumers by channel
-	consumersByChannel := make(map[uint16][]string)
-
-	c.mu.RLock()
-	for _, ch := range c.channels {
-		ch.mu.Lock()
-		for consumerTag, q := range ch.consumers {
-			if q == queueName {
-				if _, exists := consumers[consumerTag]; exists {
-					consumersByChannel[ch.id] = append(consumersByChannel[ch.id], consumerTag)
-				}
-			}
-		}
-		ch.mu.Unlock()
-	}
-	c.mu.RUnlock()
-
-	// Send Basic.Cancel for each consumer
-	for channelId, consumerTags := range consumersByChannel {
-		for _, consumerTag := range consumerTags {
-			if err := c.sendBasicCancelFromServer(channelId, consumerTag); err != nil {
-				c.server.Err("Failed to send Basic.Cancel for consumer '%s' on channel %d: %v",
-					consumerTag, channelId, err)
-			} else {
-				c.server.Info("Sent Basic.Cancel for consumer '%s' on channel %d",
-					consumerTag, channelId)
-			}
+	for _, consumer := range consumers {
+		if err := c.sendBasicCancelFromServer(consumer.ChannelId, consumer.Tag); err != nil {
+			c.server.Err("Failed to send Basic.Cancel for consumer '%s' on channel %d: %v",
+				consumer.Tag, consumer.ChannelId, err)
+		} else {
+			c.server.Info("Sent Basic.Cancel for consumer '%s' on channel %d",
+				consumer.Tag, consumer.ChannelId)
 		}
 	}
 }
@@ -3340,7 +3325,7 @@ func (c *Connection) handleQueueDeclare(reader *bytes.Reader, channelId uint16) 
 				Name:       actualQueueName,
 				Messages:   []Message{},
 				Bindings:   make(map[string]bool),
-				Consumers:  make(map[string]chan Message),
+				Consumers:  make(map[string]*Consumer),
 				Durable:    durable,
 				Exclusive:  exclusive, // If exclusive, ideally track ownerChannelId = channelId
 				AutoDelete: autoDelete,
@@ -3544,22 +3529,36 @@ func (c *Connection) handleQueueDelete(reader *bytes.Reader, channelId uint16) e
 		return c.sendChannelClose(channelId, 406, replyText, uint16(ClassQueue), MethodQueueDelete)
 	}
 
-	// Collect data for cleanup while holding lock
-	consumerChannels := make(map[string]chan Message)
-	for tag, ch := range queue.Consumers {
-		consumerChannels[tag] = ch
-	}
-
+	// --- SNAPSHOT consumers and bindings BEFORE clearing ---
 	queueBindings := make([]string, 0, len(queue.Bindings))
 	for binding := range queue.Bindings {
 		queueBindings = append(queueBindings, binding)
 	}
 
+	consumersSnapshot := make(map[string]*Consumer, len(queue.Consumers))
+	for tag, consumer := range queue.Consumers {
+		consumersSnapshot[tag] = consumer
+	}
+
+	// --- ALSO snapshot all channel->consumerTag->queueName BEFORE clearing for channel cleanup ---
+	c.mu.RLock()
+	channelConsumersSnapshot := make(map[uint16]map[string]string)
+	for channelId, ch := range c.channels {
+		ch.mu.Lock()
+		m := make(map[string]string, len(ch.consumers))
+		for tag, qName := range ch.consumers {
+			m[tag] = qName
+		}
+		ch.mu.Unlock()
+		channelConsumersSnapshot[channelId] = m
+	}
+	c.mu.RUnlock()
+
 	deletedMessageCount := messageCount
 
 	// Clear queue state immediately
 	queue.Messages = nil
-	queue.Consumers = make(map[string]chan Message)
+	queue.Consumers = make(map[string]*Consumer)
 	queue.Bindings = make(map[string]bool)
 
 	queue.mu.Unlock()
@@ -3571,29 +3570,32 @@ func (c *Connection) handleQueueDelete(reader *bytes.Reader, channelId uint16) e
 	cleanupWG.Add(1)
 	go func() {
 		defer cleanupWG.Done()
-		c.sendBasicCancelToConsumers(consumerChannels, queueName)
-	}()
-
-	// Close consumer channels
-	cleanupWG.Add(1)
-	go func() {
-		defer cleanupWG.Done()
-		for consumerTag, msgChan := range consumerChannels {
-			select {
-			case <-msgChan:
-				// Channel already closed
-			default:
-				close(msgChan)
-			}
-			c.server.Info("Closed consumer channel for '%s' on queue '%s'", consumerTag, queueName)
-		}
+		c.sendBasicCancelToConsumers(consumersSnapshot, queueName)
 	}()
 
 	// Clean up channel consumer mappings
 	cleanupWG.Add(1)
 	go func() {
 		defer cleanupWG.Done()
-		c.cleanupChannelConsumers(queueName, consumerChannels)
+		// Use the snapshot for channel consumer cleanup
+		for channelId, tagMap := range channelConsumersSnapshot {
+			ch := c.channels[channelId]
+			if ch == nil {
+				continue
+			}
+			ch.mu.Lock()
+			modified := false
+			for consumerTag, qName := range tagMap {
+				if qName == queueName {
+					delete(ch.consumers, consumerTag)
+					modified = true
+				}
+			}
+			ch.mu.Unlock()
+			if modified {
+				c.server.Debug("Removed consumers from channel %d for deleted queue '%s'", channelId, queueName)
+			}
+		}
 	}()
 
 	// Clean up exchange bindings
@@ -3748,13 +3750,7 @@ func (c *Connection) sendPurgeOk(channelId uint16, messageCount uint32) error {
 // deliverToQueue handles delivery to a single queue
 func (c *Connection) deliverToQueue(queueName string, msg Message) {
 	vhost := c.vhost
-	if vhost == nil {
-		c.server.Warn("deliverToQueue: Connection's vhost is nil")
-		return
-	}
-
-	if vhost.IsDeleting() {
-		c.server.Info("deliverToQueue: VHost is being deleted, discarding message to queue %s", queueName)
+	if vhost == nil || vhost.IsDeleting() {
 		return
 	}
 
@@ -3763,135 +3759,102 @@ func (c *Connection) deliverToQueue(queueName string, msg Message) {
 	vhost.mu.RUnlock()
 
 	if !exists || queue == nil {
-		c.server.Warn("Queue %s not found or nil during delivery", queueName)
 		return
 	}
 
 	queue.mu.Lock()
-	defer queue.mu.Unlock()
+	msgCopy := msg.DeepCopy()
+	queue.Messages = append(queue.Messages, *msgCopy)
+	queue.mu.Unlock()
 
-	// Double-check vhost deletion status while holding queue lock
-	if vhost.IsDeleting() {
-		c.server.Info("VHost deletion detected while holding queue lock, discarding message to queue %s", queueName)
-		return
-	}
-
-	// Create a deep copy of the message
-	msgCopy := Message{
-		Exchange:    msg.Exchange,
-		RoutingKey:  msg.RoutingKey,
-		Mandatory:   msg.Mandatory,
-		Immediate:   msg.Immediate,
-		Redelivered: msg.Redelivered,
-		Properties: Properties{
-			ContentType:     msg.Properties.ContentType,
-			ContentEncoding: msg.Properties.ContentEncoding,
-			DeliveryMode:    msg.Properties.DeliveryMode,
-			Priority:        msg.Properties.Priority,
-			CorrelationId:   msg.Properties.CorrelationId,
-			ReplyTo:         msg.Properties.ReplyTo,
-			Expiration:      msg.Properties.Expiration,
-			MessageId:       msg.Properties.MessageId,
-			Timestamp:       msg.Properties.Timestamp,
-			Type:            msg.Properties.Type,
-			UserId:          msg.Properties.UserId,
-			AppId:           msg.Properties.AppId,
-			ClusterId:       msg.Properties.ClusterId,
-		},
-		Body: make([]byte, len(msg.Body)),
-	}
-	copy(msgCopy.Body, msg.Body)
-
-	if msg.Properties.Headers != nil {
-		msgCopy.Properties.Headers = make(map[string]interface{})
-		maps.Copy(msgCopy.Properties.Headers, msg.Properties.Headers)
-	}
-
-	delivered := false
-	var consumerTags []string
-	for tag := range queue.Consumers {
-		consumerTags = append(consumerTags, tag)
-	}
-
-	for _, consumerTag := range consumerTags {
-		msgChan, stillExists := queue.Consumers[consumerTag]
-		if !stillExists {
-			continue
-		}
-
-		select {
-		case msgChan <- msgCopy:
-			c.server.Info("Message (ID: %s, RK: %s) delivered directly to consumer '%s' on queue '%s'",
-				msgCopy.Properties.MessageId, msgCopy.RoutingKey, consumerTag, queueName)
-			delivered = true
-			return
-		default:
-			c.server.Debug("Consumer '%s' on queue '%s' is busy or its channel is full. Trying next.",
-				consumerTag, queueName)
-			continue
-		}
-	}
-
-	// If no consumer could accept the message immediately, add it to the queue
-	if !delivered {
-		// Final deletion check before enqueuing
-		if vhost.IsDeleting() {
-			c.server.Info("VHost deletion detected, discarding message instead of enqueuing to queue '%s'", queueName)
-			return
-		}
-
-		queue.Messages = append(queue.Messages, msgCopy)
-		queueLength := len(queue.Messages)
-		c.server.Info("No consumer immediately available for message (ID: %s, RK: %s) on queue '%s'. Message enqueued. Queue now has %d messages.",
-			msgCopy.Properties.MessageId, msgCopy.RoutingKey, queueName, queueLength)
-
-		// Don't trigger dispatch if vhost is being deleted
-		if !vhost.IsDeleting() {
-			go c.tryDispatchFromSingleQueue(queueName)
-		}
-	}
+	c.server.Info("Message enqueued to queue '%s'. Queue now has %d messages.",
+		queueName, len(queue.Messages))
 }
 
-func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgChan chan Message, noAck bool) {
-	for msg := range msgChan {
-		// Check if vhost is being deleted
-		if c.vhost != nil && c.vhost.IsDeleting() {
-			c.server.Info("VHost deletion detected, stopping delivery for consumer %s on channel %d", consumerTag, channelId)
-			return
+func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consumer *Consumer) {
+	queue := consumer.Queue
+	noAck := consumer.NoAck
+
+	for {
+		var messageAvailable bool
+
+		// Quick check if we have messages
+		queue.mu.Lock()
+		messageAvailable = len(queue.Messages) > 0
+		queue.mu.Unlock()
+
+		if !messageAvailable {
+			// Only use select with timer when no messages
+			select {
+			case <-consumer.stopCh:
+				c.server.Info("Consumer %s stopped on channel %d", consumerTag, channelId)
+				return
+			case <-time.After(100 * time.Millisecond):
+				// Check again for messages
+				continue
+			}
+		} else {
+			// We have messages, just check stopCh without blocking
+			select {
+			case <-consumer.stopCh:
+				c.server.Info("Consumer %s stopped on channel %d", consumerTag, channelId)
+				return
+			default:
+				// Fall through immediately to process message
+			}
 		}
 
-		ch, exists, isClosing := c.getChannel(channelId)
+		// Try to get and process a message
+		queue.mu.Lock()
 
-		if !exists {
-			c.server.Info("Channel %d no longer exists, stopping delivery for consumer %s", channelId, consumerTag)
-			return
-		}
-
-		if isClosing {
-			c.server.Info("Channel %d is closing, stopping delivery for consumer %s", channelId, consumerTag)
-			return
-		}
-
-		// Get queue name for this consumer
-		ch.mu.Lock()
-		queueName, hasQueue := ch.consumers[consumerTag]
-
-		if !hasQueue {
-			ch.mu.Unlock()
-			c.server.Warn("Consumer %s not found in channel %d consumers map", consumerTag, channelId)
+		// Double-check we still have messages and consumer exists
+		if len(queue.Messages) == 0 {
+			queue.mu.Unlock()
 			continue
 		}
 
-		// Atomically increment delivery tag for this channel
+		if _, exists := queue.Consumers[consumerTag]; !exists {
+			queue.mu.Unlock()
+			c.server.Info("Consumer %s no longer registered, stopping delivery", consumerTag)
+			return
+		}
+
+		// Get the first message
+		msg := queue.Messages[0]
+		queue.Messages = queue.Messages[1:]
+		queue.mu.Unlock()
+
+		// Check if vhost is being deleted
+		if c.vhost != nil && c.vhost.IsDeleting() {
+			// Put message back at front of queue
+			queue.mu.Lock()
+			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.mu.Unlock()
+			c.server.Info("VHost deletion detected, stopping delivery for consumer %s", consumerTag)
+			return
+		}
+
+		// Get channel and check if it's still valid
+		ch, exists, isClosing := c.getChannel(channelId)
+		if !exists || isClosing {
+			// Put message back at front of queue
+			queue.mu.Lock()
+			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.mu.Unlock()
+			c.server.Info("Channel %d no longer valid, stopping delivery for consumer %s", channelId, consumerTag)
+			return
+		}
+
+		// Assign delivery tag and track if not noAck
+		ch.mu.Lock()
 		ch.deliveryTag++
 		deliveryTag := ch.deliveryTag
 
-		// If not noAck, track this message as unacknowledged
 		if !noAck {
 			unacked := &UnackedMessage{
 				Message:     msg,
 				ConsumerTag: consumerTag,
-				QueueName:   queueName,
+				QueueName:   queue.Name,
 				DeliveryTag: deliveryTag,
 				Delivered:   time.Now(),
 			}
@@ -3900,32 +3863,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		ch.mu.Unlock()
 
 		// Create a deep copy of the message to avoid data races
-		msgCopy := Message{
-			Exchange:    msg.Exchange,
-			RoutingKey:  msg.RoutingKey,
-			Redelivered: msg.Redelivered,
-			Properties: Properties{
-				ContentType:     msg.Properties.ContentType,
-				ContentEncoding: msg.Properties.ContentEncoding,
-				DeliveryMode:    msg.Properties.DeliveryMode,
-				Priority:        msg.Properties.Priority,
-				CorrelationId:   msg.Properties.CorrelationId,
-				ReplyTo:         msg.Properties.ReplyTo,
-				Expiration:      msg.Properties.Expiration,
-				MessageId:       msg.Properties.MessageId,
-				Timestamp:       msg.Properties.Timestamp,
-				Type:            msg.Properties.Type,
-				UserId:          msg.Properties.UserId,
-				AppId:           msg.Properties.AppId,
-				ClusterId:       msg.Properties.ClusterId,
-			},
-			Body: make([]byte, len(msg.Body)),
-		}
-		copy(msgCopy.Body, msg.Body)
-		if msg.Properties.Headers != nil {
-			msgCopy.Properties.Headers = make(map[string]interface{})
-			maps.Copy(msgCopy.Properties.Headers, msg.Properties.Headers)
-		}
+		msgCopy := msg.DeepCopy()
 
 		c.server.Info("Delivering message: channel=%d, consumerTag=%s, deliveryTag=%d, exchange=%s, routingKey=%s, bodySize=%d, noAck=%v, redelivered=%v",
 			channelId, consumerTag, deliveryTag, msgCopy.Exchange, msgCopy.RoutingKey, len(msgCopy.Body), noAck, msgCopy.Redelivered)
@@ -3954,91 +3892,91 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 
 		flags := uint16(0)
 		if msgCopy.Properties.ContentType != "" {
-			flags |= (1 << 15)
-		} // 0x8000
+			flags |= 0x8000
+		}
 		if msgCopy.Properties.ContentEncoding != "" {
-			flags |= (1 << 14)
-		} // 0x4000
+			flags |= 0x4000
+		}
 		if len(msgCopy.Properties.Headers) > 0 {
-			flags |= (1 << 13)
-		} // 0x2000
+			flags |= 0x2000
+		}
 		if msgCopy.Properties.DeliveryMode != 0 {
-			flags |= (1 << 12)
-		} // 0x1000
+			flags |= 0x1000
+		}
 		if msgCopy.Properties.Priority != 0 {
-			flags |= (1 << 11)
-		} // 0x0800
+			flags |= 0x0800
+		}
 		if msgCopy.Properties.CorrelationId != "" {
-			flags |= (1 << 10)
-		} // 0x0400
+			flags |= 0x0400
+		}
 		if msgCopy.Properties.ReplyTo != "" {
-			flags |= (1 << 9)
-		} // 0x0200
+			flags |= 0x0200
+		}
 		if msgCopy.Properties.Expiration != "" {
-			flags |= (1 << 8)
-		} // 0x0100
+			flags |= 0x0100
+		}
 		if msgCopy.Properties.MessageId != "" {
-			flags |= (1 << 7)
-		} // 0x0080
+			flags |= 0x0080
+		}
 		if msgCopy.Properties.Timestamp != 0 {
-			flags |= (1 << 6)
-		} // 0x0040
+			flags |= 0x0040
+		}
 		if msgCopy.Properties.Type != "" {
-			flags |= (1 << 5)
-		} // 0x0020
+			flags |= 0x0020
+		}
 		if msgCopy.Properties.UserId != "" {
-			flags |= (1 << 4)
-		} // 0x0010
+			flags |= 0x0010
+		}
 		if msgCopy.Properties.AppId != "" {
-			flags |= (1 << 3)
-		} // 0x0008
+			flags |= 0x0008
+		}
 		if msgCopy.Properties.ClusterId != "" {
-			flags |= (1 << 2)
-		} // 0x0004
+			flags |= 0x0004
+		}
 
 		binary.Write(headerPayload, binary.BigEndian, flags)
 
 		// Write properties based on flags
-		if (flags & (1 << 15)) != 0 {
+		if flags&0x8000 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.ContentType)
 		}
-		if (flags & (1 << 14)) != 0 {
+		if flags&0x4000 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.ContentEncoding)
 		}
-		if (flags & (1 << 13)) != 0 {
+		if flags&0x2000 != 0 {
 			writeTable(headerPayload, msgCopy.Properties.Headers)
 		}
-		if (flags & (1 << 12)) != 0 {
+		if flags&0x1000 != 0 {
 			binary.Write(headerPayload, binary.BigEndian, msgCopy.Properties.DeliveryMode)
 		}
-		if (flags & (1 << 11)) != 0 {
+		if flags&0x0800 != 0 {
 			binary.Write(headerPayload, binary.BigEndian, msgCopy.Properties.Priority)
 		}
-		if (flags & (1 << 10)) != 0 {
+		if flags&0x0400 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.CorrelationId)
 		}
-		if (flags & (1 << 9)) != 0 {
+		if flags&0x0200 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.ReplyTo)
 		}
-		if (flags & (1 << 8)) != 0 {
+		if flags&0x0100 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.Expiration)
 		}
-		if (flags & (1 << 7)) != 0 {
+		if flags&0x0080 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.MessageId)
 		}
-		if (flags & (1 << 6)) != 0 {
+		if flags&0x0040 != 0 {
 			binary.Write(headerPayload, binary.BigEndian, msgCopy.Properties.Timestamp)
 		}
-		if (flags & (1 << 5)) != 0 {
+		if flags&0x0020 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.Type)
 		}
-		if (flags & (1 << 4)) != 0 {
+		if flags&0x0010 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.UserId)
 		}
-		if (flags & (1 << 3)) != 0 {
+		if flags&0x0008 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.AppId)
 		}
-		if (flags & (1 << 2)) != 0 {
+		if flags&0x0004 != 0 {
 			writeShortString(headerPayload, msgCopy.Properties.ClusterId)
 		}
 
@@ -4050,6 +3988,17 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 		if deliveryErr != nil {
 			c.server.Err("Error buffering basic.deliver frame for tag %d: %v", deliveryTag, deliveryErr)
 			c.writeMu.Unlock()
+
+			// Put message back and clean up unacked tracking
+			queue.mu.Lock()
+			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.mu.Unlock()
+
+			if !noAck {
+				ch.mu.Lock()
+				delete(ch.unackedMessages, deliveryTag)
+				ch.mu.Unlock()
+			}
 			continue
 		}
 
@@ -4079,9 +4028,19 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, msgCh
 			c.server.Info("Successfully delivered message (method, header, body) for deliveryTag=%d", deliveryTag)
 		} else {
 			c.server.Err("Failed to fully deliver message for deliveryTag=%d", deliveryTag)
+
+			// Put message back and clean up unacked tracking
+			queue.mu.Lock()
+			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.mu.Unlock()
+
+			if !noAck {
+				ch.mu.Lock()
+				delete(ch.unackedMessages, deliveryTag)
+				ch.mu.Unlock()
+			}
 		}
 	}
-	c.server.Info("Message channel closed for consumer %s on channel %d. Exiting deliverMessages goroutine.", consumerTag, channelId)
 }
 
 func (c *Connection) cleanupConnectionResources() {
@@ -4127,9 +4086,9 @@ func (c *Connection) cleanupConnectionResources() {
 			vhost.mu.RLock() // RLock server to access s.queues
 			if queue, ok := vhost.queues[queueName]; ok {
 				queue.mu.Lock() // Lock the specific queue
-				if msgChan, consumerExists := queue.Consumers[consumerTag]; consumerExists {
+				if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
 					c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
-					close(msgChan) // This will make the deliverMessages goroutine exit
+					close(consumer.stopCh) // This will make the deliverMessages goroutine exit
 					delete(queue.Consumers, consumerTag)
 					// If this queue had messages and now has one less consumer, it might affect dispatch.
 					// The generic dispatch attempt later will cover this.
@@ -4151,12 +4110,12 @@ func (c *Connection) cleanupConnectionResources() {
 	c.mu.Unlock()                      // Unlock the connection
 
 	// NEW: After all channel cleanups and lock releases, attempt dispatch for affected queues
-	if len(affectedQueuesForDispatch) > 0 {
-		c.server.Info("Attempting dispatch for %d queues affected by connection %s cleanup", len(affectedQueuesForDispatch), c.conn.RemoteAddr())
-		for queueName := range affectedQueuesForDispatch {
-			go c.tryDispatchFromSingleQueue(queueName) // Run in a goroutine
-		}
-	}
+	// if len(affectedQueuesForDispatch) > 0 {
+	// 	c.server.Info("Attempting dispatch for %d queues affected by connection %s cleanup", len(affectedQueuesForDispatch), c.conn.RemoteAddr())
+	// 	for queueName := range affectedQueuesForDispatch {
+	// 		go c.tryDispatchFromSingleQueue(queueName) // Run in a goroutine
+	// 	}
+	// }
 
 	c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
 	// The underlying c.conn will be closed by the caller of cleanupConnectionResources or was already closed.
@@ -4233,8 +4192,8 @@ func (c *Connection) sendChannelClose(channelId uint16, replyCode uint16, replyT
 				vhost.mu.RLock() // RLock server to access s.queues
 				if queue, qExists := vhost.queues[queueName]; qExists {
 					queue.mu.Lock()
-					if msgChan, consumerExistsOnQueue := queue.Consumers[consumerTag]; consumerExistsOnQueue {
-						close(msgChan) // Signal deliverMessages goroutine to stop
+					if consumer, consumerExistsOnQueue := queue.Consumers[consumerTag]; consumerExistsOnQueue {
+						close(consumer.stopCh) // Signal deliverMessages goroutine to stop
 						delete(queue.Consumers, consumerTag)
 						c.server.Info("Closed consumer %s on queue %s for channel %d during server-initiated close", consumerTag, queueName, channelId)
 					}
@@ -4359,8 +4318,8 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 			vhost.mu.RLock()
 			if q, qExists := vhost.queues[queueName]; qExists {
 				q.mu.Lock()
-				if msgChan, consumerExists := q.Consumers[consumerTag]; consumerExists {
-					close(msgChan)
+				if consumer, consumerExists := q.Consumers[consumerTag]; consumerExists {
+					close(consumer.stopCh)
 					delete(q.Consumers, consumerTag)
 					c.server.Info("Closed consumer %s on queue %s for channel %d",
 						consumerTag, queueName, channelId)
@@ -4380,13 +4339,13 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 	c.mu.Unlock()
 
 	// Trigger dispatch for affected queues
-	if len(affectedQueuesForDispatch) > 0 {
-		c.server.Info("Attempting dispatch for %d queues affected by channel %d removal",
-			len(affectedQueuesForDispatch), channelId)
-		for queueName := range affectedQueuesForDispatch {
-			go c.tryDispatchFromSingleQueue(queueName)
-		}
-	}
+	// if len(affectedQueuesForDispatch) > 0 {
+	// 	c.server.Info("Attempting dispatch for %d queues affected by channel %d removal",
+	// 		len(affectedQueuesForDispatch), channelId)
+	// 	for queueName := range affectedQueuesForDispatch {
+	// 		go c.tryDispatchFromSingleQueue(queueName)
+	// 	}
+	// }
 	c.server.Info("Finished forcibly removing channel %d. Reason: %s", channelId, reason)
 }
 
@@ -4458,156 +4417,156 @@ func (c *Connection) sendBasicReturn(channelId uint16, replyCode uint16, replyTe
 // to available consumers. It continues as long as messages are available in the queue
 // and consumers can accept them.
 // This function handles its own locking for the specified queue.
-func (c *Connection) tryDispatchFromSingleQueue(queueName string) {
-	vhost := c.vhost
-	var log Logger = c.server
+// func (c *Connection) tryDispatchFromSingleQueue(queueName string) {
+// 	vhost := c.vhost
+// 	var log Logger = c.server
 
-	if vhost == nil {
-		log.Warn("tryDispatchFromSingleQueue: Connection's vhost is nil. Cannot dispatch from queue '%s'.", queueName)
-		return
-	}
+// 	if vhost == nil {
+// 		log.Warn("tryDispatchFromSingleQueue: Connection's vhost is nil. Cannot dispatch from queue '%s'.", queueName)
+// 		return
+// 	}
 
-	// Use atomic check
-	if vhost.IsDeleting() {
-		log.Info("tryDispatchFromSingleQueue: VHost '%s' is being deleted. Halting dispatch from queue '%s'.", vhost.name, queueName)
-		return
-	}
+// 	// Use atomic check
+// 	if vhost.IsDeleting() {
+// 		log.Info("tryDispatchFromSingleQueue: VHost '%s' is being deleted. Halting dispatch from queue '%s'.", vhost.name, queueName)
+// 		return
+// 	}
 
-	// Loop to dispatch as many messages as possible from this queue in this run.
-	for {
-		// Check deletion status on each iteration
-		if vhost.IsDeleting() {
-			log.Debug("tryDispatchFromSingleQueue: VHost deletion detected during dispatch loop. Halting.")
-			return
-		}
+// 	// Loop to dispatch as many messages as possible from this queue in this run.
+// 	for {
+// 		// Check deletion status on each iteration
+// 		if vhost.IsDeleting() {
+// 			log.Debug("tryDispatchFromSingleQueue: VHost deletion detected during dispatch loop. Halting.")
+// 			return
+// 		}
 
-		vhost.mu.RLock()
-		q, exists := vhost.queues[queueName]
-		vhost.mu.RUnlock()
+// 		vhost.mu.RLock()
+// 		q, exists := vhost.queues[queueName]
+// 		vhost.mu.RUnlock()
 
-		if !exists {
-			log.Warn("tryDispatchFromSingleQueue: Attempted to dispatch from non-existent queue: %s", queueName)
-			return
-		}
+// 		if !exists {
+// 			log.Warn("tryDispatchFromSingleQueue: Attempted to dispatch from non-existent queue: %s", queueName)
+// 			return
+// 		}
 
-		// Get message and consumer snapshot under lock
-		q.mu.Lock()
+// 		// Get message and consumer snapshot under lock
+// 		q.mu.Lock()
 
-		// Final check while holding queue lock
-		if vhost.IsDeleting() {
-			q.mu.Unlock()
-			log.Debug("tryDispatchFromSingleQueue: VHost deletion detected while holding queue lock. Halting.")
-			return
-		}
+// 		// Final check while holding queue lock
+// 		if vhost.IsDeleting() {
+// 			q.mu.Unlock()
+// 			log.Debug("tryDispatchFromSingleQueue: VHost deletion detected while holding queue lock. Halting.")
+// 			return
+// 		}
 
-		if len(q.Messages) == 0 {
-			q.mu.Unlock()
-			return // No messages left
-		}
-		if len(q.Consumers) == 0 {
-			q.mu.Unlock()
-			log.Debug("tryDispatchFromSingleQueue: No consumers for queue '%s' to dispatch messages to.", q.Name)
-			return // No consumers
-		}
+// 		if len(q.Messages) == 0 {
+// 			q.mu.Unlock()
+// 			return // No messages left
+// 		}
+// 		if len(q.Consumers) == 0 {
+// 			q.mu.Unlock()
+// 			log.Debug("tryDispatchFromSingleQueue: No consumers for queue '%s' to dispatch messages to.", q.Name)
+// 			return // No consumers
+// 		}
 
-		var selectedMsgIndex = -1
-		var msgToDispatch *Message // Declare to store the selected message
+// 		var selectedMsgIndex = -1
+// 		var msgToDispatch *Message // Declare to store the selected message
 
-		for i := 0; i < len(q.Messages); i++ {
-			if !q.Messages[i].Dispatching {
-				q.Messages[i].Dispatching = true // Mark before releasing lock
-				msgToDispatch = q.Messages[i].DeepCopy()
-				selectedMsgIndex = i
-				break
-			}
-		}
+// 		for i := 0; i < len(q.Messages); i++ {
+// 			if !q.Messages[i].Dispatching {
+// 				q.Messages[i].Dispatching = true // Mark before releasing lock
+// 				msgToDispatch = q.Messages[i].DeepCopy()
+// 				selectedMsgIndex = i
+// 				break
+// 			}
+// 		}
 
-		if selectedMsgIndex == -1 { // No available message to dispatch
-			q.mu.Unlock()
-			log.Debug("tryDispatchFromSingleQueue: No messages with Dispatching=false in queue '%s'.", q.Name)
-			return
-		}
+// 		if selectedMsgIndex == -1 { // No available message to dispatch
+// 			q.mu.Unlock()
+// 			log.Debug("tryDispatchFromSingleQueue: No messages with Dispatching=false in queue '%s'.", q.Name)
+// 			return
+// 		}
 
-		// Create a unique identifier for this dispatch attempt
-		// Using a combination of fields that should uniquely identify the message
-		msgIdentifier := GetMessageIdentifier(msgToDispatch)
+// 		// Create a unique identifier for this dispatch attempt
+// 		// Using a combination of fields that should uniquely identify the message
+// 		msgIdentifier := GetMessageIdentifier(msgToDispatch)
 
-		// Create snapshot of consumer channels
-		consumerSnapshot := make(map[string]chan Message)
-		for tag, ch := range q.Consumers {
-			consumerSnapshot[tag] = ch
-		}
+// 		// Create snapshot of consumer channels
+// 		consumerSnapshot := make(map[string]chan Message)
+// 		for tag, ch := range q.Consumers {
+// 			consumerSnapshot[tag] = ch
+// 		}
 
-		// UNLOCK before attempting dispatch
-		q.mu.Unlock()
+// 		// UNLOCK before attempting dispatch
+// 		q.mu.Unlock()
 
-		// Now try to dispatch without holding the lock
-		dispatchedThisIteration := false
-		var successfulConsumerTag string
+// 		// Now try to dispatch without holding the lock
+// 		dispatchedThisIteration := false
+// 		var successfulConsumerTag string
 
-		for consumerTag, consumerMsgChan := range consumerSnapshot {
-			shouldBreak := false
-			// we want to send to consumer without that flag
-			msgToDispatch.Dispatching = false
-			select {
-			case consumerMsgChan <- *msgToDispatch:
-				log.Info("Dispatched message (Id: %s, RK: %s) from queue '%s' to consumer '%s' via tryDispatchFromSingleQueue",
-					msgToDispatch.Properties.MessageId, msgToDispatch.RoutingKey, q.Name, consumerTag)
-				dispatchedThisIteration = true
-				successfulConsumerTag = consumerTag
-				shouldBreak = true // Exit loop after successful dispatch
-			default:
-				log.Debug("tryDispatchFromSingleQueue: Consumer '%s' on queue '%s' busy, trying next for message (Id: %s)",
-					consumerTag, q.Name, msgToDispatch.Properties.MessageId)
-				continue
-			}
-			if shouldBreak {
-				break // Exit the consumer loop after successful dispatch
-			}
-		}
+// 		for consumerTag, consumerMsgChan := range consumerSnapshot {
+// 			shouldBreak := false
+// 			// we want to send to consumer without that flag
+// 			msgToDispatch.Dispatching = false
+// 			select {
+// 			case consumerMsgChan <- *msgToDispatch:
+// 				log.Info("Dispatched message (Id: %s, RK: %s) from queue '%s' to consumer '%s' via tryDispatchFromSingleQueue",
+// 					msgToDispatch.Properties.MessageId, msgToDispatch.RoutingKey, q.Name, consumerTag)
+// 				dispatchedThisIteration = true
+// 				successfulConsumerTag = consumerTag
+// 				shouldBreak = true // Exit loop after successful dispatch
+// 			default:
+// 				log.Debug("tryDispatchFromSingleQueue: Consumer '%s' on queue '%s' busy, trying next for message (Id: %s)",
+// 					consumerTag, q.Name, msgToDispatch.Properties.MessageId)
+// 				continue
+// 			}
+// 			if shouldBreak {
+// 				break // Exit the consumer loop after successful dispatch
+// 			}
+// 		}
 
-		if dispatchedThisIteration {
-			// Lock again only to remove the message from queue
-			q.mu.Lock()
+// 		if dispatchedThisIteration {
+// 			// Lock again only to remove the message from queue
+// 			q.mu.Lock()
 
-			// Verify consumer still exists
-			if _, consumerStillExists := q.Consumers[successfulConsumerTag]; !consumerStillExists {
-				// Consumer was removed while we were dispatching
-				log.Warn("Consumer '%s' was removed during dispatch, message remains in queue", successfulConsumerTag)
-				idx, found := FindMessageInQueueNonLocking(msgIdentifier, q)
-				if found {
-					q.Messages[idx].Dispatching = false // Reset dispatching flag
-				}
-				q.mu.Unlock()
-				return
-			}
+// 			// Verify consumer still exists
+// 			if _, consumerStillExists := q.Consumers[successfulConsumerTag]; !consumerStillExists {
+// 				// Consumer was removed while we were dispatching
+// 				log.Warn("Consumer '%s' was removed during dispatch, message remains in queue", successfulConsumerTag)
+// 				idx, found := FindMessageInQueueNonLocking(msgIdentifier, q)
+// 				if found {
+// 					q.Messages[idx].Dispatching = false // Reset dispatching flag
+// 				}
+// 				q.mu.Unlock()
+// 				return
+// 			}
 
-			// Find and remove the dispatched message (it might not be at index 0 anymore)
-			idx, found := FindMessageInQueueNonLocking(msgIdentifier, q)
-			if found {
-				q.Messages = append(q.Messages[:idx], q.Messages[idx+1:]...)
-			} else {
-				// This could happen if the message was already removed by another operation
-				log.Warn("Dispatched message not found in queue during removal - possibly already consumed")
-			}
+// 			// Find and remove the dispatched message (it might not be at index 0 anymore)
+// 			idx, found := FindMessageInQueueNonLocking(msgIdentifier, q)
+// 			if found {
+// 				q.Messages = append(q.Messages[:idx], q.Messages[idx+1:]...)
+// 			} else {
+// 				// This could happen if the message was already removed by another operation
+// 				log.Warn("Dispatched message not found in queue during removal - possibly already consumed")
+// 			}
 
-			q.mu.Unlock()
-		} else {
-			log.Info("tryDispatchFromSingleQueue: No consumer immediately available for message (Id: %s) in queue '%s'. Message remains queued.",
-				msgToDispatch.Properties.MessageId, q.Name)
-			q.mu.Lock()
-			idx, found := FindMessageInQueueNonLocking(msgIdentifier, q)
-			if found {
-				q.Messages[idx].Dispatching = false // Reset dispatching flag
-			}
-			q.mu.Unlock()
-			return
-			// TODO: add x number of tries ?
-		}
-	}
-}
+// 			q.mu.Unlock()
+// 		} else {
+// 			log.Info("tryDispatchFromSingleQueue: No consumer immediately available for message (Id: %s) in queue '%s'. Message remains queued.",
+// 				msgToDispatch.Properties.MessageId, q.Name)
+// 			q.mu.Lock()
+// 			idx, found := FindMessageInQueueNonLocking(msgIdentifier, q)
+// 			if found {
+// 				q.Messages[idx].Dispatching = false // Reset dispatching flag
+// 			}
+// 			q.mu.Unlock()
+// 			return
+// 			// TODO: add x number of tries ?
+// 		}
+// 	}
+// }
 
-func (c *Connection) cleanupChannelConsumers(queueName string, consumers map[string]chan Message) {
+func (c *Connection) cleanupChannelConsumers(queueName string, consumers map[string]*Consumer) {
 	// Get all channels at once
 	c.mu.RLock()
 	channels := make([]*Channel, 0, len(c.channels))

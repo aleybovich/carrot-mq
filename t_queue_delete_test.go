@@ -698,7 +698,7 @@ func TestQueueDelete_UnackedMessagesRequeued(t *testing.T) {
 	messageCount := 5
 	for i := 0; i < messageCount; i++ {
 		err = ch.Publish("", q1.Name, false, false, amqp.Publishing{
-			Body: []byte(fmt.Sprintf("msg-%d", i)),
+			Body: fmt.Appendf(nil, "msg-%d", i),
 		})
 		require.NoError(t, err)
 	}

@@ -177,9 +177,9 @@ func (vh *VHost) stopAllConsumers(s *Server) { // s *Server is used for logging
 		queue.mu.Lock() // Lock individual queue to modify its consumers
 		if len(queue.Consumers) > 0 {
 			s.Info("VHost '%s', Queue '%s': Closing %d consumer(s).", vh.name, queue.Name, len(queue.Consumers))
-			for consumerTag, msgChan := range queue.Consumers {
+			for consumerTag, consumer := range queue.Consumers {
 				s.Debug("VHost '%s', Queue '%s': Closing consumer channel for tag '%s'.", vh.name, queue.Name, consumerTag)
-				close(msgChan) // This signals the deliverMessages goroutine to stop
+				close(consumer.stopCh) // This signals the deliverMessages goroutine to stop
 				delete(queue.Consumers, consumerTag)
 			}
 		}
@@ -200,8 +200,8 @@ func (vh *VHost) cleanup(s *Server) { // s *Server is used for logging
 		q.Bindings = make(map[string]bool)
 		if len(q.Consumers) > 0 { // Should be empty if stopAllConsumers worked
 			s.Warn("VHost '%s', Queue '%s': Consumers map not empty during final cleanup. Force clearing.", vh.name, queueName)
-			for tag, ch := range q.Consumers {
-				close(ch)
+			for tag, consumer := range q.Consumers {
+				close(consumer.stopCh)
 				delete(q.Consumers, tag)
 			}
 		}

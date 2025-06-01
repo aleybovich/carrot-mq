@@ -106,7 +106,7 @@ func setupTestEnvForDispatch(t *testing.T) (*Server, *Connection, *VHost, *Queue
 	q := &Queue{
 		Name:      queueName,
 		Messages:  make([]Message, 0), // Ensure this Message type has `Dispatching bool`
-		Consumers: make(map[string]chan Message),
+		Consumers: make(map[string]*Consumer),
 		Bindings:  make(map[string]bool),
 		mu:        sync.RWMutex{},
 		// durable, autoDelete, exclusive, args not strictly needed for tryDispatch unit tests
@@ -133,16 +133,6 @@ func t_makeTestMessage(id, body, routingKey string) Message {
 		Body:        []byte(body),
 		Dispatching: false, // Initialize Dispatching to false
 	}
-}
-
-// addConsumerToQueue adds a consumer channel to a queue.
-func t_addConsumerToQueue(t *testing.T, q *Queue, consumerTag string, bufferSize int) chan Message {
-	t.Helper()
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	consumerChan := make(chan Message, bufferSize)
-	q.Consumers[consumerTag] = consumerChan
-	return consumerChan
 }
 
 // addMessageToQueue appends a message to a queue's message list.
