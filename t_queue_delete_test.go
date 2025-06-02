@@ -696,7 +696,7 @@ func TestQueueDelete_UnackedMessagesRequeued(t *testing.T) {
 
 	// Publish messages to queue1
 	messageCount := 5
-	for i := 0; i < messageCount; i++ {
+	for i := range messageCount {
 		err = ch.Publish("", q1.Name, false, false, amqp.Publishing{
 			Body: fmt.Appendf(nil, "msg-%d", i),
 		})
@@ -708,11 +708,10 @@ func TestQueueDelete_UnackedMessagesRequeued(t *testing.T) {
 	require.NoError(t, err)
 
 	// Receive all messages but don't ack
-	var unackedDeliveries []amqp.Delivery
-	for i := 0; i < messageCount; i++ {
+	for i := range messageCount {
 		select {
-		case d := <-deliveries1:
-			unackedDeliveries = append(unackedDeliveries, d)
+		case <-deliveries1:
+			// drain deliveries without acking
 		case <-time.After(time.Second):
 			t.Fatalf("Timeout receiving message %d", i)
 		}

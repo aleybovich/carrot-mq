@@ -50,6 +50,8 @@ func getClassName(classId uint16) string {
 		return "queue"
 	case ClassBasic:
 		return "basic"
+	case ClassTx:
+		return "tx"
 	default:
 		return fmt.Sprintf("unknown(%d)", classId)
 	}
@@ -161,6 +163,21 @@ func getMethodName(classId uint16, methodId uint16) string {
 			return "recover"
 		case MethodBasicRecoverOk:
 			return "recover-ok"
+		}
+	case ClassTx:
+		switch methodId {
+		case MethodTxSelect:
+			return "select"
+		case MethodTxSelectOk:
+			return "select-ok"
+		case MethodTxCommit:
+			return "commit"
+		case MethodTxCommitOk:
+			return "commit-ok"
+		case MethodTxRollback:
+			return "rollback"
+		case MethodTxRollbackOk:
+			return "rollback-ok"
 		}
 	}
 	return fmt.Sprintf("unknown(%d)", methodId)

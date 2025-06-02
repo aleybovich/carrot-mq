@@ -35,9 +35,26 @@ const (
 	ClassQueue      = 50
 	ClassBasic      = 60
 	ClassConfirm    = 85
+	ClassTx         = 90
 )
 
 const (
+	MethodBasicConsume   = 20
+	MethodBasicConsumeOk = 21
+	MethodBasicCancel    = 30
+	MethodBasicCancelOk  = 31
+	MethodBasicPublish   = 40
+	MethodBasicReturn    = 50
+	MethodBasicDeliver   = 60
+	MethodBasicGet       = 70
+	MethodBasicGetOk     = 71
+	MethodBasicGetEmpty  = 72
+	MethodBasicAck       = 80
+	MethodBasicReject    = 90
+	MethodBasicRecover   = 110
+	MethodBasicRecoverOk = 111
+	MethodBasicNack      = 120
+
 	MethodConfirmSelect   = 10
 	MethodConfirmSelectOk = 11
 
@@ -71,21 +88,12 @@ const (
 	MethodQueueUnbind    = 50
 	MethodQueueUnbindOk  = 51
 
-	MethodBasicConsume   = 20
-	MethodBasicConsumeOk = 21
-	MethodBasicCancel    = 30
-	MethodBasicCancelOk  = 31
-	MethodBasicPublish   = 40
-	MethodBasicReturn    = 50
-	MethodBasicDeliver   = 60
-	MethodBasicGet       = 70
-	MethodBasicGetOk     = 71
-	MethodBasicGetEmpty  = 72
-	MethodBasicAck       = 80
-	MethodBasicReject    = 90
-	MethodBasicRecover   = 110
-	MethodBasicRecoverOk = 111
-	MethodBasicNack      = 120
+	MethodTxSelect     = 10
+	MethodTxSelectOk   = 11
+	MethodTxCommit     = 20
+	MethodTxCommitOk   = 21
+	MethodTxRollback   = 30
+	MethodTxRollbackOk = 31
 )
 
 var (
