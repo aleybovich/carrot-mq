@@ -73,6 +73,25 @@ type Channel struct {
 	nextPublishSeqNo uint64          // Next sequence number for published messages
 	pendingConfirms  map[uint64]bool // Map of unconfirmed delivery tags
 
+	// Transaction fields
+	txMode     bool                   // Whether transaction mode is enabled
+	txMessages []TransactionalMessage // Messages published within current transaction
+	txAcks     []uint64               // Delivery tags acknowledged within current transaction
+	txNacks    []TransactionalNack    // Delivery tags rejected within current transaction
+}
+
+type TransactionalMessage struct {
+	Message    *Message
+	RoutingKey string
+	Exchange   string
+	Mandatory  bool
+	Immediate  bool
+}
+
+type TransactionalNack struct {
+	DeliveryTag uint64
+	Multiple    bool
+	Requeue     bool
 }
 
 type Properties struct {
@@ -874,7 +893,7 @@ func (c *Connection) handleMethod(frame *Frame) error { // Return type error
 	case ClassBasic:
 		err = c.handleClassBasicMethod(methodId, reader, frame.Channel)
 	case ClassTx:
-		//err = c.handleTransactionMethod(methodId, reader, frame.Channel)
+		err = c.handleClassTxMethod(methodId, reader, frame.Channel)
 	default:
 		errMsgBase := "received method for unknown class ID"
 		c.server.Warn("%s: %d on channel %d", errMsgBase, classId, frame.Channel)
@@ -1241,17 +1260,15 @@ func (c *Connection) handleBody(frame *Frame) {
 		ch.mu.Unlock()
 
 		// Deliver the message
-		c.deliverMessage(messageToDeliver, frame.Channel)
+		c.deliverMessage(&messageToDeliver, frame.Channel)
 	} else {
 		ch.mu.Unlock()
 		c.server.Warn("Received body frame with no pending message on channel %d", frame.Channel)
 	}
 }
 
-// Add routing functions to server.go
-
 // RouteMessage handles all exchange type routing logic
-func (c *Connection) routeMessage(msg Message) ([]string, error) {
+func (c *Connection) routeMessage(msg *Message) ([]string, error) {
 	vhost := c.vhost
 
 	if msg.Exchange == "" { // Default exchange routes directly to queue by name
@@ -1330,13 +1347,43 @@ func (c *Connection) routeTopic(exchange *Exchange, routingKey string) []string 
 	return queues
 }
 
-func (c *Connection) deliverMessage(msg Message, channelId uint16) {
+func (c *Connection) deliverMessage(msg *Message, channelId uint16) {
+	c.deliverMessageInternal(msg, channelId, false)
+}
+
+func (c *Connection) deliverMessageInternal(msg *Message, channelId uint16, isCommit bool) {
+	// Check if channel is in transaction mode (but skip this check during commit)
+	if !isCommit {
+		ch, exists, _ := c.getChannel(channelId)
+		if exists && ch != nil && channelId != 0 {
+			ch.mu.Lock()
+			if ch.txMode {
+				// Store message in transaction instead of delivering immediately
+				txMsg := TransactionalMessage{
+					Message:    msg.DeepCopy(),
+					RoutingKey: msg.RoutingKey,
+					Exchange:   msg.Exchange,
+					Mandatory:  msg.Mandatory,
+					Immediate:  msg.Immediate,
+				}
+				ch.txMessages = append(ch.txMessages, txMsg)
+				ch.mu.Unlock()
+
+				c.server.Info("Stored message in transaction on channel %d: exchange=%s, routingKey=%s",
+					channelId, msg.Exchange, msg.RoutingKey)
+				return
+			}
+			ch.mu.Unlock()
+		}
+	}
+
 	c.server.Info("Message: exchange=%s, routingKey=%s, mandatory=%v", msg.Exchange, msg.RoutingKey, msg.Mandatory)
 
 	// Get channel for confirm handling
-	ch, exists, _ := c.getChannel(channelId)
 	var deliveryTag uint64
 	var confirmMode bool
+
+	ch, exists, _ := c.getChannel(channelId)
 
 	if exists && ch != nil && channelId != 0 {
 		ch.mu.Lock()
@@ -1354,14 +1401,11 @@ func (c *Connection) deliverMessage(msg Message, channelId uint16) {
 	if err != nil {
 		c.server.Err("Error routing message: %v", err)
 		if msg.Mandatory && channelId != 0 {
-			// Send basic.return for unroutable mandatory message due to error
 			if returnErr := c.sendBasicReturn(channelId, amqpError.NoRoute.Code(), "NO_ROUTE", msg.Exchange, msg.RoutingKey); returnErr != nil {
 				c.server.Err("Failed to send basic.return: %v", returnErr)
 			}
-			// Also send the header and body frames after basic.return
 			c.sendReturnedMessage(channelId, msg)
 		}
-		// Send negative acknowledgment if in confirm mode
 		if confirmMode {
 			c.sendBasicNack(channelId, deliveryTag, false, false)
 		}
@@ -1369,22 +1413,17 @@ func (c *Connection) deliverMessage(msg Message, channelId uint16) {
 	}
 
 	if len(queueNames) == 0 && msg.Mandatory && channelId != 0 {
-		// No queues found for mandatory message
 		c.server.Warn("No queues for mandatory message on exchange '%s' with routing key '%s'", msg.Exchange, msg.RoutingKey)
 
-		// Send basic.return
 		if returnErr := c.sendBasicReturn(channelId, amqpError.NoRoute.Code(), "NO_ROUTE", msg.Exchange, msg.RoutingKey); returnErr != nil {
 			c.server.Err("Failed to send basic.return: %v", returnErr)
-			// Send negative acknowledgment if in confirm mode
 			if confirmMode {
 				c.sendBasicNack(channelId, deliveryTag, false, false)
 			}
 			return
 		}
 
-		// Send the returned message content
 		c.sendReturnedMessage(channelId, msg)
-		// Send negative acknowledgment if in confirm mode
 		if confirmMode {
 			c.sendBasicNack(channelId, deliveryTag, false, false)
 		}
@@ -1396,7 +1435,6 @@ func (c *Connection) deliverMessage(msg Message, channelId uint16) {
 		c.deliverToQueue(queueName, msg)
 	}
 
-	// Send positive acknowledgment if in confirm mode
 	if confirmMode {
 		c.sendBasicAck(channelId, deliveryTag, false)
 	}
@@ -1496,7 +1534,7 @@ func (c *Connection) sendBasicNack(channelId uint16, deliveryTag uint64, multipl
 }
 
 // Helper method to send the returned message's header and body
-func (c *Connection) sendReturnedMessage(channelId uint16, msg Message) {
+func (c *Connection) sendReturnedMessage(channelId uint16, msg *Message) {
 	// Send header frame
 	headerPayload := &bytes.Buffer{}
 	binary.Write(headerPayload, binary.BigEndian, uint16(ClassBasic))
@@ -1660,7 +1698,7 @@ func (c *Connection) sendPurgeOk(channelId uint16, messageCount uint32) error {
 }
 
 // deliverToQueue handles delivery to a single queue
-func (c *Connection) deliverToQueue(queueName string, msg Message) {
+func (c *Connection) deliverToQueue(queueName string, msg *Message) {
 	vhost := c.vhost
 	if vhost == nil || vhost.IsDeleting() {
 		return
@@ -2171,7 +2209,6 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 
 	vhost := c.vhost
 
-	// Phase 1: Get channel reference and mark as closing
 	c.mu.Lock()
 	ch, exists := c.channels[channelId]
 	if !exists || ch == nil {
@@ -2180,7 +2217,6 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 		return
 	}
 
-	// Don't remove from map yet - just mark as closing
 	ch.mu.Lock()
 	if ch.closingByServer {
 		ch.mu.Unlock()
@@ -2192,10 +2228,26 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 	ch.mu.Unlock()
 	c.mu.Unlock()
 
-	// Phase 2: Clean up channel resources (channel still in map)
 	ch.mu.Lock()
 
-	// Stop timer first
+	// Clear any pending transaction data
+	if ch.txMode {
+		messagesCount := len(ch.txMessages)
+		acksCount := len(ch.txAcks)
+		nacksCount := len(ch.txNacks)
+
+		if messagesCount > 0 || acksCount > 0 || nacksCount > 0 {
+			c.server.Info("Discarding uncommitted transaction on channel %d: %d messages, %d acks, %d nacks",
+				channelId, messagesCount, acksCount, nacksCount)
+		}
+
+		ch.txMessages = nil
+		ch.txAcks = nil
+		ch.txNacks = nil
+		ch.txMode = false
+	}
+
+	// Rest of the existing cleanup logic...
 	if ch.closeOkTimer != nil {
 		if !ch.closeOkTimer.Stop() {
 			c.server.Debug("CloseOkTimer for channel %d had already fired", channelId)
@@ -2203,10 +2255,8 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 		ch.closeOkTimer = nil
 	}
 
-	// Collect queue names that will need dispatch attempts
 	affectedQueuesForDispatch := make(map[string]bool)
 
-	// Cleanup unacked messages
 	if len(ch.unackedMessages) > 0 {
 		c.server.Info("Channel %d has %d unacked messages, requeuing", channelId, len(ch.unackedMessages))
 		for deliveryTag, unacked := range ch.unackedMessages {
@@ -2230,10 +2280,8 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 		ch.unackedMessages = make(map[uint64]*UnackedMessage)
 	}
 
-	// Handle pending confirms
 	if len(ch.pendingConfirms) > 0 {
 		c.server.Info("Channel %d has %d pending confirms, sending nacks", channelId, len(ch.pendingConfirms))
-		// Send nack for all pending confirms
 		var maxTag uint64
 		for tag := range ch.pendingConfirms {
 			if tag > maxTag {
@@ -2241,13 +2289,11 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 			}
 		}
 		if maxTag > 0 {
-			// Send a single nack with multiple=true to cover all pending
 			c.sendBasicNack(channelId, maxTag, true, false)
 		}
 		ch.pendingConfirms = make(map[uint64]bool)
 	}
 
-	// Clean up consumers
 	if len(ch.consumers) > 0 {
 		c.server.Info("Channel %d cleaning up %d consumers", channelId, len(ch.consumers))
 		for consumerTag, queueName := range ch.consumers {
@@ -2269,7 +2315,6 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 	ch.pendingMessages = nil
 	ch.mu.Unlock()
 
-	// Phase 3: Remove from connection map after cleanup is complete
 	c.mu.Lock()
 	delete(c.channels, channelId)
 	c.mu.Unlock()

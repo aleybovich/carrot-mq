@@ -2035,21 +2035,54 @@ func (c *Connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 
 	ch.mu.Lock()
 
+	// Check if in transaction mode
+	if ch.txMode {
+		// Store acks for transaction
+		if deliveryTag == 0 {
+			if !multiple {
+				ch.mu.Unlock()
+				return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - delivery-tag 0 with multiple=false", uint16(ClassBasic), MethodBasicAck)
+			}
+			// Acknowledge all messages in transaction
+			for tag := range ch.unackedMessages {
+				ch.txAcks = append(ch.txAcks, tag)
+			}
+			c.server.Info("Stored ack for all messages in transaction on channel %d", channelId)
+		} else {
+			if multiple {
+				// Acknowledge all messages up to and including deliveryTag
+				for tag := range ch.unackedMessages {
+					if tag <= deliveryTag {
+						ch.txAcks = append(ch.txAcks, tag)
+					}
+				}
+				c.server.Info("Stored ack for messages up to tag %d in transaction on channel %d", deliveryTag, channelId)
+			} else {
+				// Acknowledge only the specific message
+				if _, exists := ch.unackedMessages[deliveryTag]; !exists {
+					ch.mu.Unlock()
+					return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d", deliveryTag), uint16(ClassBasic), MethodBasicAck)
+				}
+				ch.txAcks = append(ch.txAcks, deliveryTag)
+				c.server.Info("Stored ack for tag %d in transaction on channel %d", deliveryTag, channelId)
+			}
+		}
+		ch.mu.Unlock()
+		return nil
+	}
+
+	// Original non-transactional ack logic
 	if deliveryTag == 0 {
-		// delivery-tag of 0 means "all messages delivered so far"
 		if !multiple {
 			ch.mu.Unlock()
-			// If multiple is false and delivery-tag is 0, it's a protocol error
 			return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - delivery-tag 0 with multiple=false", uint16(ClassBasic), MethodBasicAck)
 		}
-		// Acknowledge all messages
 		for tag := range ch.unackedMessages {
 			delete(ch.unackedMessages, tag)
 		}
 		c.server.Info("Acknowledged all messages on channel %d", channelId)
 	} else {
 		if multiple {
-			// Acknowledge all messages up to and including deliveryTag
 			for tag := range ch.unackedMessages {
 				if tag <= deliveryTag {
 					delete(ch.unackedMessages, tag)
@@ -2058,10 +2091,8 @@ func (c *Connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 			}
 			c.server.Info("Acknowledged messages up to delivery tag %d on channel %d", deliveryTag, channelId)
 		} else {
-			// Acknowledge only the specific message
 			if _, exists := ch.unackedMessages[deliveryTag]; !exists {
 				ch.mu.Unlock()
-				// AMQP spec: unknown delivery tag is a channel error
 				return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d", deliveryTag), uint16(ClassBasic), MethodBasicAck)
 			}
 			delete(ch.unackedMessages, deliveryTag)
@@ -2073,6 +2104,7 @@ func (c *Connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 	return nil
 }
 
+// Update handleMethodBasicNack to handle transactions
 func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint16) error {
 	var deliveryTag uint64
 	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
@@ -2097,8 +2129,6 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 	ch, exists, isClosing := c.getChannel(channelId)
 
 	if !exists {
-		// This should ideally not happen if channel existence is checked before calling handlers for specific classes.
-		// However, if it does, it's a server-side issue with channel management.
 		c.server.Err("Internal error: channel object nil for basic.nack on channel %d", channelId)
 		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR - channel object nil for nack", uint16(ClassBasic), MethodBasicNack)
 	}
@@ -2108,10 +2138,27 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 		return nil
 	}
 
-	ch.mu.Lock() // Lock channel to safely access unackedMessages
+	ch.mu.Lock()
 
+	// Check if in transaction mode
+	if ch.txMode {
+		// Store nacks for transaction
+		nack := TransactionalNack{
+			DeliveryTag: deliveryTag,
+			Multiple:    multiple,
+			Requeue:     requeue,
+		}
+		ch.txNacks = append(ch.txNacks, nack)
+		ch.mu.Unlock()
+
+		c.server.Info("Stored nack in transaction on channel %d: tag=%d, multiple=%v, requeue=%v",
+			channelId, deliveryTag, multiple, requeue)
+		return nil
+	}
+
+	// Original non-transactional nack logic continues...
 	var messagesToProcess []*UnackedMessage
-	var affectedQueues = make(map[string]bool) // To track queues that need dispatch attempt
+	var affectedQueues = make(map[string]bool)
 
 	if deliveryTag == 0 {
 		if !multiple {
@@ -2121,7 +2168,6 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 		for _, unacked := range ch.unackedMessages {
 			messagesToProcess = append(messagesToProcess, unacked)
 		}
-		// Clear all unacked messages after collecting them
 		ch.unackedMessages = make(map[uint64]*UnackedMessage)
 	} else {
 		if multiple {
@@ -2141,7 +2187,7 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 			delete(ch.unackedMessages, deliveryTag)
 		}
 	}
-	ch.mu.Unlock() // Unlock channel as soon as unackedMessages modification is done
+	ch.mu.Unlock()
 
 	// Process the nacked messages
 	if requeue {
@@ -2152,26 +2198,25 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 			vhost.mu.RUnlock()
 
 			if qExists && queue != nil {
-				unacked.Message.Redelivered = true // Mark message as redelivered
+				unacked.Message.Redelivered = true
 
-				queue.mu.Lock() // Lock the specific queue
-				// Prepend to queue (requeued messages go to front)
+				queue.mu.Lock()
 				queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
 				c.server.Info("Requeued message to queue '%s' (original delivery tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
 				affectedQueues[unacked.QueueName] = true
-				queue.mu.Unlock() // Unlock the queue
+				queue.mu.Unlock()
 			} else {
 				c.server.Warn("Queue '%s' not found for requeuing nacked message (tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
 			}
 		}
 	} else {
-		// Messages are discarded (potentially dead-lettered in a more advanced server)
 		c.server.Info("Discarded %d nacked messages (requeue=false) from channel %d", len(messagesToProcess), channelId)
 	}
 
 	return nil
 }
 
+// Update handleMethodBasicReject to handle transactions
 func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uint16) error {
 	var deliveryTag uint64
 	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
@@ -2201,7 +2246,25 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 		return nil
 	}
 
-	ch.mu.Lock() // Lock channel
+	ch.mu.Lock()
+
+	// Check if in transaction mode
+	if ch.txMode {
+		// Store reject as nack for transaction (reject is equivalent to nack with multiple=false)
+		nack := TransactionalNack{
+			DeliveryTag: deliveryTag,
+			Multiple:    false,
+			Requeue:     requeue,
+		}
+		ch.txNacks = append(ch.txNacks, nack)
+		ch.mu.Unlock()
+
+		c.server.Info("Stored reject as nack in transaction on channel %d: tag=%d, requeue=%v",
+			channelId, deliveryTag, requeue)
+		return nil
+	}
+
+	// Original non-transactional reject logic
 	if deliveryTag == 0 {
 		ch.mu.Unlock()
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - delivery-tag cannot be 0 for basic.reject", uint16(ClassBasic), MethodBasicReject)
@@ -2212,8 +2275,8 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 		ch.mu.Unlock()
 		return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d for reject", deliveryTag), uint16(ClassBasic), MethodBasicReject)
 	}
-	delete(ch.unackedMessages, deliveryTag) // Remove from unacked
-	ch.mu.Unlock()                          // Unlock channel
+	delete(ch.unackedMessages, deliveryTag)
+	ch.mu.Unlock()
 
 	if requeue {
 		vhost := c.vhost
@@ -2222,17 +2285,16 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 		vhost.mu.RUnlock()
 
 		if qExists && queue != nil {
-			unacked.Message.Redelivered = true // Mark message as redelivered
+			unacked.Message.Redelivered = true
 
-			queue.mu.Lock() // Lock the specific queue
+			queue.mu.Lock()
 			queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
 			c.server.Info("Requeued rejected message to queue '%s' (delivery tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
-			queue.mu.Unlock() // Unlock the queue
+			queue.mu.Unlock()
 		} else {
 			c.server.Warn("Queue '%s' not found for requeuing rejected message (tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
 		}
 	} else {
-		// Message is discarded
 		c.server.Info("Discarded rejected message (requeue=false) from channel %d (delivery tag %d)", channelId, deliveryTag)
 	}
 
@@ -2379,5 +2441,281 @@ func (c *Connection) handleClassBasicMethod(methodId uint16, reader *bytes.Reade
 		c.server.Err("Unhandled basic method on channel %d: %s. Sending Channel.Close.", channelId, replyText)
 		// AMQP code 540 (NOT_IMPLEMENTED) or 503 (COMMAND_INVALID)
 		return c.sendChannelClose(channelId, amqpError.NotImplemented.Code(), replyText, uint16(ClassBasic), methodId)
+	}
+}
+
+// ------ Helper functions for Tx methods ------
+
+func (c *Connection) handleMethodTxSelect(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+	c.server.Info("Processing tx.select for channel %d", channelId)
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of tx.select payload for channel %d.", channelId)
+	}
+
+	ch.mu.Lock()
+
+	// Check if already in confirm mode
+	if ch.confirmMode {
+		ch.mu.Unlock()
+		return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(),
+			"PRECONDITION_FAILED - cannot use transactions with confirm mode", uint16(ClassTx), MethodTxSelect)
+	}
+
+	// Enable transaction mode
+	ch.txMode = true
+	// Initialize transaction storage if needed
+	if ch.txMessages == nil {
+		ch.txMessages = make([]TransactionalMessage, 0)
+	}
+	if ch.txAcks == nil {
+		ch.txAcks = make([]uint64, 0)
+	}
+	if ch.txNacks == nil {
+		ch.txNacks = make([]TransactionalNack, 0)
+	}
+
+	ch.mu.Unlock()
+
+	c.server.Info("Enabled transaction mode on channel %d", channelId)
+
+	// Send Tx.SelectOk
+	payloadOk := &bytes.Buffer{}
+	binary.Write(payloadOk, binary.BigEndian, uint16(ClassTx))
+	binary.Write(payloadOk, binary.BigEndian, uint16(MethodTxSelectOk))
+
+	if err := c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payloadOk.Bytes(),
+	}); err != nil {
+		c.server.Err("Error sending tx.select-ok: %v", err)
+		return err
+	}
+
+	c.server.Info("Sent tx.select-ok for channel %d", channelId)
+	return nil
+}
+
+func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+	c.server.Info("Processing tx.commit for channel %d", channelId)
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of tx.commit payload for channel %d.", channelId)
+	}
+
+	ch.mu.Lock()
+
+	if !ch.txMode {
+		ch.mu.Unlock()
+		return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(),
+			"PRECONDITION_FAILED - channel not in transaction mode", uint16(ClassTx), MethodTxCommit)
+	}
+
+	// Capture transaction data and clear it
+	messagesToPublish := make([]TransactionalMessage, len(ch.txMessages))
+	copy(messagesToPublish, ch.txMessages)
+	ch.txMessages = ch.txMessages[:0] // Clear but keep capacity
+
+	acksToProcess := make([]uint64, len(ch.txAcks))
+	copy(acksToProcess, ch.txAcks)
+	ch.txAcks = ch.txAcks[:0]
+
+	nacksToProcess := make([]TransactionalNack, len(ch.txNacks))
+	copy(nacksToProcess, ch.txNacks)
+	ch.txNacks = ch.txNacks[:0]
+
+	ch.mu.Unlock()
+
+	c.server.Info("Committing transaction on channel %d: %d messages, %d acks, %d nacks",
+		channelId, len(messagesToPublish), len(acksToProcess), len(nacksToProcess))
+
+	// Process all published messages
+	for _, txMsg := range messagesToPublish {
+		// Create a deep copy of the message for delivery
+		msgToDeliver := txMsg.Message.DeepCopy()
+		msgToDeliver.Exchange = txMsg.Exchange
+		msgToDeliver.RoutingKey = txMsg.RoutingKey
+		msgToDeliver.Mandatory = txMsg.Mandatory
+		msgToDeliver.Immediate = txMsg.Immediate
+
+		c.deliverMessageInternal(msgToDeliver, channelId, true)
+	}
+
+	// Process all acknowledgements and negative acknowledgements together under lock
+	ch.mu.Lock()
+
+	// Process acknowledgements
+	for _, deliveryTag := range acksToProcess {
+		delete(ch.unackedMessages, deliveryTag)
+		c.server.Debug("Committed ack for delivery tag %d on channel %d", deliveryTag, channelId)
+	}
+
+	// Collect messages that need to be requeued from nacks
+	var messagesToRequeue []struct {
+		Message   Message
+		QueueName string
+	}
+
+	// Process negative acknowledgements
+	for _, nack := range nacksToProcess {
+		if nack.Multiple {
+			// Handle multiple nacks
+			for tag, unacked := range ch.unackedMessages {
+				if tag <= nack.DeliveryTag {
+					if nack.Requeue {
+						messagesToRequeue = append(messagesToRequeue, struct {
+							Message   Message
+							QueueName string
+						}{
+							Message:   unacked.Message,
+							QueueName: unacked.QueueName,
+						})
+					}
+					delete(ch.unackedMessages, tag)
+					c.server.Debug("Processed nack for tag %d in transaction on channel %d", tag, channelId)
+				}
+			}
+		} else {
+			// Handle single nack
+			if unacked, exists := ch.unackedMessages[nack.DeliveryTag]; exists {
+				if nack.Requeue {
+					messagesToRequeue = append(messagesToRequeue, struct {
+						Message   Message
+						QueueName string
+					}{
+						Message:   unacked.Message,
+						QueueName: unacked.QueueName,
+					})
+				}
+				delete(ch.unackedMessages, nack.DeliveryTag)
+				c.server.Debug("Processed nack for tag %d in transaction on channel %d", nack.DeliveryTag, channelId)
+			}
+		}
+	}
+
+	ch.mu.Unlock()
+
+	// Now requeue messages outside the channel lock to avoid potential deadlocks
+	if len(messagesToRequeue) > 0 {
+		vhost := c.vhost
+		for _, item := range messagesToRequeue {
+			vhost.mu.RLock()
+			queue, exists := vhost.queues[item.QueueName]
+			vhost.mu.RUnlock()
+
+			if exists && queue != nil {
+				item.Message.Redelivered = true
+				queue.mu.Lock()
+				queue.Messages = append([]Message{item.Message}, queue.Messages...)
+				queue.mu.Unlock()
+				c.server.Debug("Requeued message to queue '%s' via transaction commit", item.QueueName)
+			}
+		}
+	}
+
+	// Send Tx.CommitOk
+	payloadOk := &bytes.Buffer{}
+	binary.Write(payloadOk, binary.BigEndian, uint16(ClassTx))
+	binary.Write(payloadOk, binary.BigEndian, uint16(MethodTxCommitOk))
+
+	if err := c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payloadOk.Bytes(),
+	}); err != nil {
+		c.server.Err("Error sending tx.commit-ok: %v", err)
+		return err
+	}
+
+	c.server.Info("Sent tx.commit-ok for channel %d", channelId)
+	return nil
+}
+
+func (c *Connection) handleMethodTxRollback(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+	c.server.Info("Processing tx.rollback for channel %d", channelId)
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of tx.rollback payload for channel %d.", channelId)
+	}
+
+	ch.mu.Lock()
+
+	if !ch.txMode {
+		ch.mu.Unlock()
+		return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(),
+			"PRECONDITION_FAILED - channel not in transaction mode", uint16(ClassTx), MethodTxRollback)
+	}
+
+	// Clear all transaction data
+	messagesCount := len(ch.txMessages)
+	acksCount := len(ch.txAcks)
+	nacksCount := len(ch.txNacks)
+
+	ch.txMessages = ch.txMessages[:0]
+	ch.txAcks = ch.txAcks[:0]
+	ch.txNacks = ch.txNacks[:0]
+
+	ch.mu.Unlock()
+
+	c.server.Info("Rolled back transaction on channel %d: discarded %d messages, %d acks, %d nacks",
+		channelId, messagesCount, acksCount, nacksCount)
+
+	// Send Tx.RollbackOk
+	payloadOk := &bytes.Buffer{}
+	binary.Write(payloadOk, binary.BigEndian, uint16(ClassTx))
+	binary.Write(payloadOk, binary.BigEndian, uint16(MethodTxRollbackOk))
+
+	if err := c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payloadOk.Bytes(),
+	}); err != nil {
+		c.server.Err("Error sending tx.rollback-ok: %v", err)
+		return err
+	}
+
+	c.server.Info("Sent tx.rollback-ok for channel %d", channelId)
+	return nil
+}
+
+func (c *Connection) handleClassTxMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+	methodName := getMethodName(ClassTx, methodId)
+
+	ch, channelExists, isClosing := c.getChannel(channelId)
+
+	if !channelExists && channelId != 0 {
+		replyText := fmt.Sprintf("COMMAND_INVALID - unknown channel id %d for tx operation", channelId)
+		c.server.Err("Tx method %s on non-existent channel %d. Sending Connection.Close.", methodName, channelId)
+		return c.sendConnectionClose(amqpError.CommandInvalid.Code(), replyText, uint16(ClassTx), methodId)
+	}
+
+	if ch == nil && channelId != 0 {
+		c.server.Err("Internal error: channel %d object not found for tx method %s", channelId, methodName)
+		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR - channel state inconsistency", uint16(ClassTx), methodId)
+	}
+
+	if channelId == 0 {
+		replyText := "COMMAND_INVALID - tx methods cannot be used on channel 0"
+		c.server.Err("Tx method %s on channel 0. Sending Connection.Close.", methodName)
+		return c.sendConnectionClose(amqpError.CommandInvalid.Code(), replyText, uint16(ClassTx), methodId)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring tx method %s on channel %d that is being closed", methodName, channelId)
+		return nil
+	}
+
+	switch methodId {
+	case MethodTxSelect:
+		return c.handleMethodTxSelect(reader, channelId, ch)
+	case MethodTxCommit:
+		return c.handleMethodTxCommit(reader, channelId, ch)
+	case MethodTxRollback:
+		return c.handleMethodTxRollback(reader, channelId, ch)
+	default:
+		replyText := fmt.Sprintf("unknown or not implemented tx method id %d", methodId)
+		c.server.Err("Unhandled tx method on channel %d: %s. Sending Channel.Close.", channelId, replyText)
+		return c.sendChannelClose(channelId, amqpError.NotImplemented.Code(), replyText, uint16(ClassTx), methodId)
 	}
 }

@@ -7,6 +7,7 @@
 - Queue purge
 - Queue unbind
 - ExchangeDelete
+- Transaction support
 - Message delivery refactored, consumer buffer removed
 
 ## [0.0.2]
@@ -51,9 +52,7 @@
 - Custom logger interface for external logging integration
 
 ### Not Implemented
-- Transaction support
-- ExchangeBind, ExchangeUnbind
-- Exchange-to-exchange bindings
+- ExchangeBind, ExchangeUnbind (Exchange-to-exchange bindings) - not a priority as it's AMQP 091 extension, not core func
 - Channel flow control
 - Heartbeat monitoring
 - SSL/TLS support

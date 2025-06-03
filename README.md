@@ -248,6 +248,47 @@ func main() {
 }
 ```
 
+## Transactions
+
+The server implements AMQP 0-9-1 transaction support, allowing clients to group multiple operations that will be executed atomically.
+
+### Supported Operations
+
+Transactions can include:
+- Message publishing (`basic.publish`)
+- Message acknowledgments (`basic.ack`)
+- Message negative acknowledgments (`basic.nack`)
+- Message rejection (`basic.reject`)
+
+All operations are buffered until either committed (executed atomically) or rolled back (discarded). If a channel or connection is closed before committing, all pending operations are automatically discarded.
+
+### Client Usage Example
+
+```go
+// Enable transaction mode on a channel
+err = channel.Tx()
+if err != nil {
+    // Handle error
+}
+
+// Perform operations within transaction
+// These operations won't take effect until commit
+err = channel.Publish("exchange", "routing.key", false, false, 
+    amqp.Publishing{Body: []byte("message")})
+    
+// Acknowledge a received message
+err = delivery.Ack(false)
+
+// Commit all operations atomically
+err = channel.TxCommit()
+if err != nil {
+    // Handle error
+}
+
+// Alternatively, roll back all operations
+// err = channel.TxRollback()
+```
+
 ## Custom Logging Integration
 
 The server supports pluggable logging through the `Logger` interface:
@@ -318,13 +359,9 @@ This list tracks major AMQP functionalities not yet implemented or only partiall
 
 ## Queue & Exchange Management
 - [ ] **Queue Operations**
-  - `queue.delete` - remove queues.
-  - `queue.purge` - clear queue contents.
-  - `queue.unbind` - remove queue bindings.
   - Full auto-delete queue logic (e.g., delete when last consumer disconnects and other specific conditions are met).
   - Full exclusive queue logic (e.g., strict per-connection isolation and behavior according to spec).
 - [ ] **Exchange Operations**
-  - `exchange.delete` - remove exchanges.
   - `exchange.bind` / `exchange.unbind` - for creating and removing exchange-to-exchange bindings.
 
 ## Reliability & Error Handling
@@ -337,8 +374,7 @@ This list tracks major AMQP functionalities not yet implemented or only partiall
   - True durable queues and exchanges that survive server restarts.
   - Persistent messages (delivery mode 2) actually saved to disk.
   - Recovery of durable entities (queues, exchanges, messages) on server startup.
-- [ ] **Transaction Support**
-  - `tx.select` / `tx.commit` / `tx.rollback` for atomic message publishing and acknowledgments within a channel.
+
 
 ## Advanced Features
 - [ ] **Connection/Channel Flow Control**: Implementation of `connection.blocked` / `connection.unblocked` and `channel.flow` / `channel.flow-ok` for pausing/resuming message delivery to prevent overwhelming clients or server.
