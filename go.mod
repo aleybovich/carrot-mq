@@ -1,4 +1,4 @@
-module amqp-go
+module carrot-mq
 
 go 1.24.3
 

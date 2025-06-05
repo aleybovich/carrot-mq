@@ -1,5 +1,4 @@
-// server_test.go
-package main
+package carrotmq
 
 import (
 	"fmt"

@@ -1,8 +1,8 @@
-package main
+package carrotmq
 
 import (
-	amqpError "amqp-go/amqperror"
 	"bytes"
+	amqpError "carrot-mq/amqperror"
 	"encoding/binary"
 	"fmt"
 	"net"

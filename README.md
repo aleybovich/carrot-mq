@@ -1,4 +1,4 @@
-# AMQP-Go Server
+# Carrot MQ (AMQP Server Lite)
 
 A lightweight, pure Go implementation of the AMQP 0-9-1 protocol, designed for simulations, testing, and development environments.
 

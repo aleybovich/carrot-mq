@@ -1,9 +1,9 @@
-package main
+package carrotmq
 
 import (
-	amqpError "amqp-go/amqperror"
 	"bufio"
 	"bytes"
+	amqpError "carrot-mq/amqperror"
 	"encoding/binary"
 	"errors"
 	"fmt"

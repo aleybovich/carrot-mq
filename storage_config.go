@@ -1,7 +1,7 @@
-package main
+package carrotmq
 
 import (
-	"amqp-go/storage"
+	"carrot-mq/storage"
 	"fmt"
 )
 
