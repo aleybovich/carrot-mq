@@ -226,7 +226,6 @@ type PersistenceManager struct {
 	storage    storage.StorageProvider
 	logger     Logger
 	messageSeq atomic.Int64 // Global message sequence counter
-	mu         sync.RWMutex
 
 	// per-queue mutexes for message operations
 	queueMutexes sync.Map // map[string]*sync.Mutex where key is "vhost:queue"
@@ -255,7 +254,7 @@ func (pm *PersistenceManager) Initialize() error {
 	if err := pm.storage.Initialize(); err != nil {
 		return err
 	}
-	
+
 	// Recover the sequence counter
 	return pm.recoverSequenceCounter()
 }
@@ -280,12 +279,12 @@ func (pm *PersistenceManager) recoverSequenceCounter() error {
 		}
 		return fmt.Errorf("loading sequence counter: %w", err)
 	}
-	
+
 	var seqNo int64
 	if err := json.Unmarshal(data, &seqNo); err != nil {
-		return fmt.Errorf("unmarshaling sequence counter: %w", err)
+		return fmt.Errorf("unmarshalling sequence counter: %w", err)
 	}
-	
+
 	pm.messageSeq.Store(seqNo)
 	pm.logger.Info("Recovered message sequence counter: %d", seqNo)
 	return nil
@@ -298,7 +297,7 @@ func (pm *PersistenceManager) saveSequenceCounter() error {
 	if err != nil {
 		return fmt.Errorf("marshaling sequence counter: %w", err)
 	}
-	
+
 	return pm.storage.Set(storage.KeySeqCounter, data)
 }
 

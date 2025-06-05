@@ -163,6 +163,10 @@ func getMethodName(classId uint16, methodId uint16) string {
 			return "recover"
 		case MethodBasicRecoverOk:
 			return "recover-ok"
+		case MethodBasicQos:
+			return "qos"
+		case MethodBasicQosOk:
+			return "qos-ok"
 		}
 	case ClassTx:
 		switch methodId {

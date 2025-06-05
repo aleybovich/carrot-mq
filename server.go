@@ -78,6 +78,11 @@ type Channel struct {
 	txMessages []TransactionalMessage // Messages published within current transaction
 	txAcks     []uint64               // Delivery tags acknowledged within current transaction
 	txNacks    []TransactionalNack    // Delivery tags rejected within current transaction
+
+	// QoS settings
+	prefetchCount uint16 // 0 means unlimited
+	prefetchSize  uint32 // ignored for simplicity
+	qosGlobal     bool   // ignored for simplicity
 }
 
 type TransactionalMessage struct {
@@ -1986,6 +1991,52 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 			}
 		}
 
+		ch, exists, isClosing := c.getChannel(channelId)
+		if !exists || isClosing {
+			c.server.Info("Channel %d no longer valid, stopping delivery for consumer %s", channelId, consumerTag)
+			return
+		}
+
+		// Check QoS prefetch limit BEFORE taking a message
+		// Check if we've hit the prefetch limit
+		ch.mu.Lock()
+		prefetchCount := ch.prefetchCount
+		prefetchSize := ch.prefetchSize
+		unackedCount := uint16(0)
+		unackedSize := uint32(0)
+
+		// Count unacked messages and size for this consumer
+		if !noAck && (prefetchCount > 0 || prefetchSize > 0) {
+			for _, unacked := range ch.unackedMessages {
+				if unacked.ConsumerTag == consumerTag {
+					unackedCount++
+					// Calculate message size: body + properties overhead
+					messageSize := uint32(len(unacked.Message.Body))
+					// Add estimated overhead for properties (rough estimate)
+					unackedSize += messageSize
+				}
+			}
+
+			// Check count limit
+			if prefetchCount > 0 && unackedCount >= prefetchCount {
+				ch.mu.Unlock()
+				c.server.Debug("Consumer %s has %d unacked messages (limit %d), waiting",
+					consumerTag, unackedCount, prefetchCount)
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			// Check size limit
+			if prefetchSize > 0 && unackedSize >= prefetchSize {
+				ch.mu.Unlock()
+				c.server.Debug("Consumer %s has %d bytes unacked (limit %d), waiting",
+					consumerTag, unackedSize, prefetchSize)
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+		}
+		ch.mu.Unlock()
+
 		// Try to get and process a message
 		queue.mu.Lock()
 
@@ -2001,8 +2052,22 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 			return
 		}
 
-		// Get the first message
+		// Peek at the first message to check if it would exceed size limit
 		msg := queue.Messages[0]
+
+		// Calculate the size of this message
+		nextMessageSize := uint32(len(msg.Body))
+
+		// Check if adding this message would exceed the size limit
+		if !noAck && prefetchSize > 0 && (unackedSize+nextMessageSize) > prefetchSize {
+			queue.mu.Unlock()
+			c.server.Debug("Next message would exceed size limit for consumer %s (current: %d, next: %d, limit: %d)",
+				consumerTag, unackedSize, nextMessageSize, prefetchSize)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		// Remove the message from queue
 		queue.Messages = queue.Messages[1:]
 		queue.mu.Unlock()
 
@@ -2017,7 +2082,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 		}
 
 		// Get channel and check if it's still valid
-		ch, exists, isClosing := c.getChannel(channelId)
+		ch, exists, isClosing = c.getChannel(channelId)
 		if !exists || isClosing {
 			// Put message back at front of queue
 			queue.mu.Lock()

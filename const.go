@@ -39,6 +39,8 @@ const (
 )
 
 const (
+	MethodBasicQos       = 10
+	MethodBasicQosOk     = 11
 	MethodBasicConsume   = 20
 	MethodBasicConsumeOk = 21
 	MethodBasicCancel    = 30

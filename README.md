@@ -335,6 +335,59 @@ func main() {
 }
 ```
 
+## Quality of Service (QoS)
+
+The server implements basic QoS functionality to control message delivery flow to consumers.
+
+### Prefetch Limits
+
+QoS allows you to limit how many unacknowledged messages a consumer can have at any given time. This prevents fast producers from overwhelming slow consumers.
+
+```go
+// Set QoS on a channel
+err = channel.Qos(
+    1,     // prefetch count - max unacknowledged messages
+    0,     // prefetch size - max unacknowledged message size in bytes (0 = unlimited)
+    false, // global - false means per-consumer, true means per-channel
+)
+```
+
+### How It Works
+
+- **Prefetch Count**: Limits the number of unacknowledged messages. If set to 10, the server will stop sending new messages to a consumer once it has 10 unacknowledged messages.
+- **Prefetch Size**: Limits the total size of unacknowledged message bodies in bytes. If set to 1048576 (1MB), the server stops sending when the total size of unacked messages reaches this limit.
+- **Global Flag**: When false (default), limits apply per consumer. When true, limits apply to all consumers on the channel combined.
+
+### Example Usage
+
+```go
+// Connect and create channel
+conn, _ := amqp.Dial("amqp://localhost:5672/")
+channel, _ := conn.Channel()
+
+// Set prefetch to process one message at a time
+channel.Qos(1, 0, false)
+
+// Start consuming
+messages, _ := channel.Consume("my-queue", "", false, false, false, false, nil)
+
+for msg := range messages {
+    // Process message
+    processMessage(msg)
+    
+    // Acknowledge when done - this allows the next message to be delivered
+    msg.Ack(false)
+}
+```
+
+### Important Notes
+
+- QoS only applies when auto-acknowledgment is **disabled** (autoAck = false when consuming)
+- With autoAck = true, messages are acknowledged immediately upon delivery and QoS has no effect
+- The server tracks unacknowledged messages per consumer
+- When a connection is closed, all unacknowledged messages are automatically requeued
+
+
 ## Transactions
 
 The server implements AMQP 0-9-1 transaction support, allowing clients to group multiple operations that will be executed atomically.

@@ -2481,6 +2481,65 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 	return nil
 }
 
+func (c *Connection) handleMethodBasicQos(reader *bytes.Reader, channelId uint16) error {
+	var prefetchSize uint32
+	var prefetchCount uint16
+
+	if err := binary.Read(reader, binary.BigEndian, &prefetchSize); err != nil {
+		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.qos (prefetch-size)", uint16(ClassBasic), MethodBasicQos)
+	}
+
+	if err := binary.Read(reader, binary.BigEndian, &prefetchCount); err != nil {
+		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.qos (prefetch-count)", uint16(ClassBasic), MethodBasicQos)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.qos (global bit)", uint16(ClassBasic), MethodBasicQos)
+	}
+	global := (bits & 0x01) != 0
+
+	c.server.Info("Processing basic.qos: prefetchSize=%d, prefetchCount=%d, global=%v on channel %d",
+		prefetchSize, prefetchCount, global, channelId)
+
+	// Get the channel
+	ch, exists, isClosing := c.getChannel(channelId)
+	if !exists {
+		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR - channel object nil", uint16(ClassBasic), MethodBasicQos)
+	}
+
+	if isClosing {
+		c.server.Debug("Ignoring basic.qos on channel %d that is being closed", channelId)
+		return nil
+	}
+
+	// Set QoS parameters (ignoring size and global for simplicity)
+	ch.mu.Lock()
+	ch.prefetchCount = prefetchCount
+	ch.prefetchSize = prefetchSize
+	ch.qosGlobal = global
+	ch.mu.Unlock()
+
+	c.server.Info("Set QoS on channel %d: prefetchCount=%d", channelId, prefetchCount)
+
+	// Send Basic.QosOk
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
+	binary.Write(payload, binary.BigEndian, uint16(MethodBasicQosOk))
+
+	if err := c.writeFrame(&Frame{
+		Type:    FrameMethod,
+		Channel: channelId,
+		Payload: payload.Bytes(),
+	}); err != nil {
+		c.server.Err("Error sending basic.qos-ok: %v", err)
+		return err
+	}
+
+	c.server.Info("Sent basic.qos-ok for channel %d", channelId)
+	return nil
+}
+
 func (c *Connection) handleMethodBasicRecover(reader *bytes.Reader, channelId uint16) error {
 	bits, err := reader.ReadByte()
 	if err != nil {
@@ -2616,6 +2675,8 @@ func (c *Connection) handleClassBasicMethod(methodId uint16, reader *bytes.Reade
 		return c.handleMethodBasicReject(reader, channelId)
 	case MethodBasicCancel:
 		return c.handleMethodBasicCancel(reader, channelId)
+	case MethodBasicQos:
+		return c.handleMethodBasicQos(reader, channelId)
 	default:
 		replyText := fmt.Sprintf("unknown or not implemented basic method id %d", methodId)
 		c.server.Err("Unhandled basic method on channel %d: %s. Sending Channel.Close.", channelId, replyText)

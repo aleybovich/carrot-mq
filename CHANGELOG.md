@@ -9,6 +9,7 @@
 - ExchangeDelete
 - Transaction support
 - Message persistence (BuntDB)
+- Per-consumer QoS
 - Message delivery refactored, consumer buffer removed
 
 ## [0.0.2]
@@ -62,5 +63,4 @@
 - Auto-delete functionality for exchanges and queues
 - Connection.Blocked/Unblocked
 - Consumer priorities
-- Per-consumer QoS
 
