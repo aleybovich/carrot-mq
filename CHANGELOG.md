@@ -8,6 +8,7 @@
 - Queue unbind
 - ExchangeDelete
 - Transaction support
+- Message persistence (BuntDB)
 - Message delivery refactored, consumer buffer removed
 
 ## [0.0.2]
@@ -62,4 +63,4 @@
 - Connection.Blocked/Unblocked
 - Consumer priorities
 - Per-consumer QoS
-- Message persistence
+

@@ -23,12 +23,13 @@ type VHostConfig struct {
 	queues    []QueueConfig
 }
 
-func (s *Server) AddVHost(name string) error {
+// Helper method to add vhost with optional persistence
+func (s *Server) addVHostInternal(name string, persist bool) error {
 	if name == "" {
 		return errors.New("vhost name cannot be empty")
 	}
 
-	s.mu.Lock() // Full lock to check and add
+	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if _, exists := s.vhosts[name]; exists {
@@ -49,8 +50,25 @@ func (s *Server) AddVHost(name string) error {
 	}
 
 	s.vhosts[name] = newVHost
+
+	// Persist if requested
+	if persist && s.persistenceManager != nil {
+		record := &VHostRecord{
+			Name:      name,
+			CreatedAt: time.Now(),
+		}
+		if err := s.persistenceManager.SaveVHost(record); err != nil {
+			s.Err("Failed to persist vhost %s: %v", name, err)
+		}
+	}
+
 	s.Info("Created new vhost: '%s'", name)
 	return nil
+}
+
+// Update public AddVHost to persist
+func (s *Server) AddVHost(name string) error {
+	return s.addVHostInternal(name, true)
 }
 
 func (s *Server) DeleteVHost(name string) error {
@@ -135,6 +153,13 @@ func (s *Server) DeleteVHost(name string) error {
 	s.mu.Lock()
 	delete(s.vhosts, name)
 	s.mu.Unlock()
+
+	// PERSISTENCE: Delete all vhost data at the end
+	if s.persistenceManager != nil {
+		if err := s.persistenceManager.DeleteAllVHostData(name); err != nil {
+			s.Err("Failed to delete vhost %s from persistence: %v", name, err)
+		}
+	}
 
 	s.Info("Successfully deleted vhost: '%s'", name)
 	return nil

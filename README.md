@@ -125,6 +125,93 @@ func ConnectAndDeclare() {
 }
 ```
 
+## Storage and Persistence
+
+The server supports pluggable storage backends for message and metadata persistence. By default, the server runs without persistence (all data is in-memory), but you can enable various storage options.
+
+### Built-in Storage Providers
+
+#### In-Memory Storage
+Fast, no persistence across restarts. Useful for development and testing.
+
+```go
+server := NewServer(
+    WithInMemoryStorage(),
+)
+```
+
+#### BuntDB Storage
+File-based embedded database providing persistence with good performance.
+
+```go
+// Persistent storage to file
+server := NewServer(
+    WithBuntDBStorage("./amqp-data.db"),
+)
+
+// Or use the full configuration
+server := NewServer(
+    WithStorage(StorageConfig{
+        Type: StorageTypeBuntDB,
+        BuntDB: &BuntDBConfig{
+            Path: "/var/lib/amqp/data.db",
+        },
+    }),
+)
+```
+
+#### No Storage (Default)
+Explicitly disable persistence (default behavior, not necessary to provide).
+
+```go
+server := NewServer(
+    WithNoStorage(),
+)
+```
+
+### What Gets Persisted?
+
+When persistence is enabled, the following entities are saved:
+- **Virtual Hosts**: All vhost configurations
+- **Exchanges**: Exchange declarations (name, type, durability flags)
+- **Queues**: Queue declarations (name, durability flags) - excluding exclusive queues
+- **Bindings**: Queue-to-exchange binding relationships
+- **Messages**: Messages with delivery mode 2 (persistent) sent to durable queues
+- **Message Order**: Message sequence is preserved within each queue
+
+### Recovery on Restart
+
+When the server starts with persistence enabled:
+1. All durable entities (vhosts, exchanges, queues, bindings) are restored
+2. Persistent messages in durable queues are recovered in order
+3. Exclusive queues are not recovered (per AMQP specification)
+4. All recovered messages are marked as redelivered
+
+### Custom Storage Providers
+
+You can implement custom storage backends by implementing the `StorageProvider` interface. This is useful for testing or integrating with existing infrastructure.
+
+```go
+// Use a custom storage provider
+customProvider := NewCustomStorageProvider()
+server := NewServer(
+    WithStorageProvider(customProvider),
+)
+```
+
+The `StorageProvider` interface includes methods for basic CRUD operations, batch operations, key scanning, and transaction support.
+
+### Storage Configuration Examples
+
+```go
+// Testing setup - in-memory with inspection
+testServer := NewServer(
+    WithInMemoryStorage(),
+)
+```
+
+The storage abstraction ensures that switching between providers requires only a configuration change, not code modifications.
+
 ## Advanced Server Configuration
 
 The server supports several options for customization at startup, passed to the `NewServer` function.

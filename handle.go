@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -526,15 +528,30 @@ func (c *Connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 			}
 			c.server.Info("Exchange '%s' re-declared with matching properties.", exchangeName)
 		} else { // Not passive and not exists: create it.
-			vhost.exchanges[exchangeName] = &Exchange{
+
+			newExchange := &Exchange{
 				Name:       exchangeName,
 				Type:       exchangeType,
 				Durable:    durable,
 				AutoDelete: autoDelete,
 				Internal:   internal,
 				Bindings:   make(map[string][]string),
-				// Arguments: args, // If you decide to store and use exchange arguments
 			}
+
+			// PERSISTENCE: Save durable exchange after successful creation
+			if c.server.persistenceManager != nil && durable {
+				vhost.mu.Unlock() // Unlock before persistence operation
+
+				record := ExchangeToRecord(newExchange)
+				if err := c.server.persistenceManager.SaveExchange(vhost.name, record); err != nil {
+					c.server.Err("Failed to persist exchange %s: %v", exchangeName, err)
+				}
+
+				vhost.mu.Lock() // Re-lock for consistency
+			}
+
+			vhost.exchanges[exchangeName] = newExchange
+
 			c.server.Info("Created new exchange: '%s' type '%s', durable: %v", exchangeName, exchangeType, durable)
 		}
 	}
@@ -655,6 +672,13 @@ func (c *Connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId 
 	vhost.mu.Unlock()
 
 	c.server.Info("Successfully deleted exchange '%s'", exchangeName)
+
+	// PERSISTENCE: Delete exchange after successful memory deletion
+	if c.server.persistenceManager != nil {
+		if err := c.server.persistenceManager.DeleteExchange(vhost.name, exchangeName); err != nil {
+			c.server.Err("Failed to delete exchange %s from persistence: %v", exchangeName, err)
+		}
+	}
 
 	// Send Exchange.DeleteOk if not no-wait
 	if !noWait {
@@ -848,18 +872,32 @@ func (c *Connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 			consumerCount = uint32(len(q.Consumers))
 			q.mu.RUnlock()
 		} else { // Not passive and not exists: create it.
-			vhost.queues[actualQueueName] = &Queue{
+			newQueue := &Queue{
 				Name:       actualQueueName,
 				Messages:   []Message{},
 				Bindings:   make(map[string]bool),
 				Consumers:  make(map[string]*Consumer),
 				Durable:    durable,
-				Exclusive:  exclusive, // If exclusive, ideally track ownerChannelId = channelId
+				Exclusive:  exclusive,
 				AutoDelete: autoDelete,
-				// Arguments: args, // If you store and use queue arguments
 			}
+			vhost.queues[actualQueueName] = newQueue
+
 			c.server.Info("Created new queue: '%s', durable=%v, exclusive=%v, autoDelete=%v",
 				actualQueueName, durable, exclusive, autoDelete)
+
+			// PERSISTENCE: Save durable queue after successful creation
+			if c.server.persistenceManager != nil && durable {
+				vhost.mu.Unlock() // Unlock before persistence
+
+				record := QueueToRecord(newQueue)
+				if err := c.server.persistenceManager.SaveQueue(vhost.name, record); err != nil {
+					c.server.Err("Failed to persist queue %s: %v", actualQueueName, err)
+				}
+
+				vhost.mu.Lock() // Re-lock
+			}
+
 			messageCount = 0
 			consumerCount = 0
 		}
@@ -978,26 +1016,41 @@ func (c *Connection) handleMethodQueueBind(reader *bytes.Reader, channelId uint1
 	}
 
 	// Perform binding atomically on both structures
-	alreadyBound := false
-	for _, existingQueueName := range ex.Bindings[routingKey] {
-		if existingQueueName == queueName {
-			alreadyBound = true
-			break
-		}
-	}
+	alreadyBound := slices.Contains(ex.Bindings[routingKey], queueName)
 
 	if !alreadyBound {
 		ex.Bindings[routingKey] = append(ex.Bindings[routingKey], queueName)
 		q.Bindings[exchangeName+":"+routingKey] = true
 		c.server.Info("Bound exchange '%s' (type: %s) to queue '%s' with routing key '%s'",
 			exchangeName, ex.Type, queueName, routingKey)
+
+		q.mu.Unlock()
+		ex.mu.Unlock()
+
+		// PERSISTENCE: Save binding if both exchange and queue are durable
+		if c.server.persistenceManager != nil && ex.Durable && q.Durable {
+			// Need to unlock before persistence operation
+
+			bindingRecord := &BindingRecord{
+				Exchange:   exchangeName,
+				Queue:      queueName,
+				RoutingKey: routingKey,
+				Arguments:  argsBind,
+				CreatedAt:  time.Now(),
+			}
+
+			if err := c.server.persistenceManager.SaveBinding(vhost.name, bindingRecord); err != nil {
+				c.server.Err("Failed to persist binding %s:%s->%s: %v",
+					exchangeName, routingKey, queueName, err)
+			}
+		}
 	} else {
+		q.mu.Unlock()
+		ex.mu.Unlock()
+
 		c.server.Info("Binding already exists for exchange '%s' to queue '%s' with routing key '%s'",
 			exchangeName, queueName, routingKey)
 	}
-
-	q.mu.Unlock()
-	ex.mu.Unlock()
 
 	if !noWait {
 		payloadBindOk := &bytes.Buffer{}
@@ -1186,6 +1239,19 @@ func (c *Connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uin
 
 	c.server.Info("Successfully deleted queue '%s' with %d messages", queueName, deletedMessageCount)
 
+	// PERSISTENCE: Delete queue and all its messages
+	if c.server.persistenceManager != nil {
+		// Delete all messages in the queue
+		if err := c.server.persistenceManager.DeleteAllQueueMessages(vhost.name, queueName); err != nil {
+			c.server.Err("Failed to delete messages for queue %s from persistence: %v", queueName, err)
+		}
+
+		// Delete the queue itself
+		if err := c.server.persistenceManager.DeleteQueue(vhost.name, queueName); err != nil {
+			c.server.Err("Failed to delete queue %s from persistence: %v", queueName, err)
+		}
+	}
+
 	if !noWait {
 		payload := &bytes.Buffer{}
 		binary.Write(payload, binary.BigEndian, uint16(ClassQueue))
@@ -1320,6 +1386,13 @@ func (c *Connection) handleMethodQueueUnbind(reader *bytes.Reader, channelId uin
 
 	if bindingRemoved {
 		c.server.Info("Unbound queue '%s' from exchange '%s' with routing key '%s'", queueName, exchangeName, routingKey)
+
+		// PERSISTENCE: Delete binding
+		if c.server.persistenceManager != nil {
+			if err := c.server.persistenceManager.DeleteBinding(vhost.name, exchangeName, queueName, routingKey); err != nil {
+				c.server.Err("Failed to delete binding from persistence: %v", err)
+			}
+		}
 	} else {
 		c.server.Info("No binding found to remove for queue '%s', exchange '%s', routing key '%s'", queueName, exchangeName, routingKey)
 	}
@@ -1400,6 +1473,16 @@ func (c *Connection) handleMethodQueuePurge(reader *bytes.Reader, channelId uint
 
 	messageCount := uint32(len(queue.Messages))
 
+	// Collect IDs of persistent messages before clearing
+	var persistentMessageIds []string
+	if c.server.persistenceManager != nil && queue.Durable {
+		for _, msg := range queue.Messages {
+			if msg.Properties.DeliveryMode == 2 { // Persistent
+				persistentMessageIds = append(persistentMessageIds, GetMessageIdentifier(&msg))
+			}
+		}
+	}
+
 	// Clear all messages
 	if messageCount > 0 {
 		queue.Messages = []Message{}
@@ -1409,6 +1492,15 @@ func (c *Connection) handleMethodQueuePurge(reader *bytes.Reader, channelId uint
 	}
 
 	queue.mu.Unlock()
+
+	// PERSISTENCE: Delete purged messages
+	if c.server.persistenceManager != nil && len(persistentMessageIds) > 0 {
+		for _, messageId := range persistentMessageIds {
+			if err := c.server.persistenceManager.DeleteMessage(vhost.name, queueName, messageId); err != nil {
+				c.server.Err("Failed to delete purged message %s from persistence: %v", messageId, err)
+			}
+		}
+	}
 
 	// Send PurgeOk if not no-wait
 	if !noWait {
@@ -2033,6 +2125,9 @@ func (c *Connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 		return nil
 	}
 
+	// Collect messages to delete from persistence
+	var messagesToDelete []AckedMessageInfo
+
 	ch.mu.Lock()
 
 	// Check if in transaction mode
@@ -2077,34 +2172,78 @@ func (c *Connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 			ch.mu.Unlock()
 			return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - delivery-tag 0 with multiple=false", uint16(ClassBasic), MethodBasicAck)
 		}
-		for tag := range ch.unackedMessages {
+		for tag, unacked := range ch.unackedMessages {
+			if unacked.Message.Properties.DeliveryMode == 2 { // Persistent
+				messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+					MessageId: GetMessageIdentifier(&unacked.Message),
+					QueueName: unacked.QueueName,
+					VHostName: c.vhost.name,
+				})
+			}
 			delete(ch.unackedMessages, tag)
 		}
 		c.server.Info("Acknowledged all messages on channel %d", channelId)
 	} else {
 		if multiple {
-			for tag := range ch.unackedMessages {
+			for tag, unacked := range ch.unackedMessages {
 				if tag <= deliveryTag {
+					if unacked.Message.Properties.DeliveryMode == 2 { // Persistent
+						messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+							MessageId: GetMessageIdentifier(&unacked.Message),
+							QueueName: unacked.QueueName,
+							VHostName: c.vhost.name,
+						})
+					}
 					delete(ch.unackedMessages, tag)
 					c.server.Debug("Acknowledged message with delivery tag %d on channel %d", tag, channelId)
 				}
 			}
 			c.server.Info("Acknowledged messages up to delivery tag %d on channel %d", deliveryTag, channelId)
 		} else {
-			if _, exists := ch.unackedMessages[deliveryTag]; !exists {
+			if unacked, exists := ch.unackedMessages[deliveryTag]; exists {
+				if unacked.Message.Properties.DeliveryMode == 2 { // Persistent
+					messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+						MessageId: GetMessageIdentifier(&unacked.Message),
+						QueueName: unacked.QueueName,
+						VHostName: c.vhost.name,
+					})
+				}
+				delete(ch.unackedMessages, deliveryTag)
+				c.server.Info("Acknowledged message with delivery tag %d on channel %d", deliveryTag, channelId)
+			} else {
 				ch.mu.Unlock()
-				return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d", deliveryTag), uint16(ClassBasic), MethodBasicAck)
+				return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(),
+					fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d", deliveryTag), uint16(ClassBasic), MethodBasicAck)
 			}
-			delete(ch.unackedMessages, deliveryTag)
-			c.server.Info("Acknowledged message with delivery tag %d on channel %d", deliveryTag, channelId)
 		}
 	}
 
 	ch.mu.Unlock()
+
+	// PERSISTENCE: Delete acknowledged messages
+	if c.server.persistenceManager != nil && len(messagesToDelete) > 0 {
+		// Group messages by queue for batch operations
+		messagesByQueue := make(map[string][]string)
+
+		for _, msgInfo := range messagesToDelete {
+			key := msgInfo.VHostName + ":" + msgInfo.QueueName
+			messagesByQueue[key] = append(messagesByQueue[key], msgInfo.MessageId)
+		}
+
+		// Delete in batches by queue
+		for queueKey, messageIds := range messagesByQueue {
+			parts := strings.Split(queueKey, ":")
+			vhostName, queueName := parts[0], parts[1]
+
+			if err := c.server.persistenceManager.DeleteMessagesBatch(vhostName, queueName, messageIds); err != nil {
+				c.server.Err("Failed to delete nacked messages from queue %s: %v", queueName, err)
+			}
+		}
+	}
+
 	return nil
 }
 
-// Update handleMethodBasicNack to handle transactions
 func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint16) error {
 	var deliveryTag uint64
 	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
@@ -2189,6 +2328,8 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 	}
 	ch.mu.Unlock()
 
+	var messagesToDelete []AckedMessageInfo
+
 	// Process the nacked messages
 	if requeue {
 		vhost := c.vhost
@@ -2210,13 +2351,33 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 			}
 		}
 	} else {
+		// Collect persistent messages to delete
+		for _, unacked := range messagesToProcess {
+			if unacked.Message.Properties.DeliveryMode == 2 {
+				messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+					MessageId: GetMessageIdentifier(&unacked.Message),
+					QueueName: unacked.QueueName,
+					VHostName: c.vhost.name,
+				})
+			}
+		}
+
 		c.server.Info("Discarded %d nacked messages (requeue=false) from channel %d", len(messagesToProcess), channelId)
+
+		// PERSISTENCE: Delete nacked messages
+		if c.server.persistenceManager != nil && len(messagesToDelete) > 0 {
+			for _, msgInfo := range messagesToDelete {
+				if err := c.server.persistenceManager.DeleteMessage(msgInfo.VHostName,
+					msgInfo.QueueName, msgInfo.MessageId); err != nil {
+					c.server.Err("Failed to delete nacked message %s from persistence: %v", msgInfo.MessageId, err)
+				}
+			}
+		}
 	}
 
 	return nil
 }
 
-// Update handleMethodBasicReject to handle transactions
 func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uint16) error {
 	var deliveryTag uint64
 	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
@@ -2275,6 +2436,17 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 		ch.mu.Unlock()
 		return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), fmt.Sprintf("PRECONDITION_FAILED - unknown delivery-tag %d for reject", deliveryTag), uint16(ClassBasic), MethodBasicReject)
 	}
+
+	// Store info for persistence deletion if not requeuing
+	var messageToDelete *AckedMessageInfo
+	if !requeue && unacked.Message.Properties.DeliveryMode == 2 {
+		messageToDelete = &AckedMessageInfo{
+			MessageId: GetMessageIdentifier(&unacked.Message),
+			QueueName: unacked.QueueName,
+			VHostName: c.vhost.name,
+		}
+	}
+
 	delete(ch.unackedMessages, deliveryTag)
 	ch.mu.Unlock()
 
@@ -2296,6 +2468,14 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 		}
 	} else {
 		c.server.Info("Discarded rejected message (requeue=false) from channel %d (delivery tag %d)", channelId, deliveryTag)
+
+		// PERSISTENCE: Delete rejected message if not requeued
+		if c.server.persistenceManager != nil && messageToDelete != nil {
+			if err := c.server.persistenceManager.DeleteMessage(messageToDelete.VHostName,
+				messageToDelete.QueueName, messageToDelete.MessageId); err != nil {
+				c.server.Err("Failed to delete rejected message %s from persistence: %v", messageToDelete.MessageId, err)
+			}
+		}
 	}
 
 	return nil
@@ -2545,8 +2725,20 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 	// Process all acknowledgements and negative acknowledgements together under lock
 	ch.mu.Lock()
 
+	// Collect messages to delete from persistence
+	var messagesToDelete []AckedMessageInfo
+
 	// Process acknowledgements
 	for _, deliveryTag := range acksToProcess {
+		if unacked, exists := ch.unackedMessages[deliveryTag]; exists {
+			if unacked.Message.Properties.DeliveryMode == 2 { // Persistent message
+				messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+					MessageId: GetMessageIdentifier(&unacked.Message),
+					QueueName: unacked.QueueName,
+					VHostName: c.vhost.name,
+				})
+			}
+		}
 		delete(ch.unackedMessages, deliveryTag)
 		c.server.Debug("Committed ack for delivery tag %d on channel %d", deliveryTag, channelId)
 	}
@@ -2571,6 +2763,13 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 							Message:   unacked.Message,
 							QueueName: unacked.QueueName,
 						})
+					} else if unacked.Message.Properties.DeliveryMode == 2 {
+						// Not requeuing and message is persistent - delete from storage
+						messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+							MessageId: GetMessageIdentifier(&unacked.Message),
+							QueueName: unacked.QueueName,
+							VHostName: c.vhost.name,
+						})
 					}
 					delete(ch.unackedMessages, tag)
 					c.server.Debug("Processed nack for tag %d in transaction on channel %d", tag, channelId)
@@ -2586,6 +2785,13 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 					}{
 						Message:   unacked.Message,
 						QueueName: unacked.QueueName,
+					})
+				} else if unacked.Message.Properties.DeliveryMode == 2 {
+					// Not requeuing and message is persistent - delete from storage
+					messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+						MessageId: GetMessageIdentifier(&unacked.Message),
+						QueueName: unacked.QueueName,
+						VHostName: c.vhost.name,
 					})
 				}
 				delete(ch.unackedMessages, nack.DeliveryTag)
@@ -2610,6 +2816,16 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 				queue.Messages = append([]Message{item.Message}, queue.Messages...)
 				queue.mu.Unlock()
 				c.server.Debug("Requeued message to queue '%s' via transaction commit", item.QueueName)
+			}
+		}
+	}
+
+	// PERSISTENCE: Delete all acknowledged/nacked messages in the transaction
+	if c.server.persistenceManager != nil && len(messagesToDelete) > 0 {
+		for _, msgInfo := range messagesToDelete {
+			if err := c.server.persistenceManager.DeleteMessage(msgInfo.VHostName,
+				msgInfo.QueueName, msgInfo.MessageId); err != nil {
+				c.server.Err("Failed to delete message %s from persistence in transaction: %v", msgInfo.MessageId, err)
 			}
 		}
 	}

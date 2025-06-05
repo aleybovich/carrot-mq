@@ -269,6 +269,9 @@ type Server struct {
 	// track active connections
 	connections   map[*Connection]struct{}
 	connectionsMu sync.RWMutex
+
+	// Persistence fields
+	persistenceManager *PersistenceManager
 }
 
 type AmqpDecimal struct {
@@ -537,6 +540,22 @@ func NewServer(opts ...ServerOption) *Server {
 		s.customLogger = s
 	}
 
+	// Initialize persistence if configured
+	if s.persistenceManager != nil {
+		if err := s.persistenceManager.Initialize(); err != nil {
+			s.Err("Failed to initialize persistence: %v", err)
+			s.persistenceManager = nil
+		} else {
+			// Server owns the recovery logic
+			if err := s.recoverPersistedState(); err != nil {
+				s.Err("Failed to recover persisted state: %v", err)
+			}
+			s.Info("Persistence enabled")
+		}
+	} else {
+		s.Info("Running without persistence")
+	}
+
 	s.Info("AMQP server created with default direct exchange")
 	return s
 }
@@ -565,6 +584,183 @@ func (s *Server) Start(addr string) error {
 		s.Info("New connection from %s", conn.RemoteAddr())
 		go s.handleConnection(conn)
 	}
+}
+
+func (s *Server) Shutdown() error {
+	s.Info("Shutting down AMQP server")
+
+	// Close all connections
+	s.connectionsMu.RLock()
+	conns := make([]*Connection, 0, len(s.connections))
+	for conn := range s.connections {
+		conns = append(conns, conn)
+	}
+	s.connectionsMu.RUnlock()
+
+	for _, conn := range conns {
+		conn.conn.Close()
+	}
+
+	// Close listener
+	if s.listener != nil {
+		s.listener.Close()
+	}
+
+	// Close persistence
+	if s.persistenceManager != nil {
+		if err := s.persistenceManager.Close(); err != nil {
+			s.Err("Error closing persistence: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) recoverPersistedState() error {
+	s.Info("Starting state recovery from persistence")
+
+	// Recover vhosts
+	vhostRecords, err := s.persistenceManager.LoadAllVHosts()
+	if err != nil {
+		return fmt.Errorf("loading vhosts: %w", err)
+	}
+
+	// Always recover entities for default vhost if it exists in persistence
+	if err := s.recoverVHostEntities("/"); err != nil {
+		s.Warn("Failed to recover entities for default vhost: %v", err)
+	}
+
+	for _, vhostRec := range vhostRecords {
+		// Skip default vhost as it's already created
+		if vhostRec.Name == "/" {
+			continue
+		}
+
+		// Create vhost without persisting it again
+		if err := s.addVHostInternal(vhostRec.Name, false); err != nil {
+			s.Warn("Failed to recover vhost %s: %v", vhostRec.Name, err)
+			continue
+		}
+
+		// Recover all entities in this vhost
+		if err := s.recoverVHostEntities(vhostRec.Name); err != nil {
+			s.Warn("Failed to recover entities for vhost %s: %v", vhostRec.Name, err)
+		}
+	}
+
+	s.Info("State recovery completed")
+	return nil
+}
+
+// Recover all entities within a vhost
+func (s *Server) recoverVHostEntities(vhostName string) error {
+	vhost, err := s.GetVHost(vhostName)
+	if err != nil {
+		return err
+	}
+
+	// Recover exchanges
+	exchangeRecords, err := s.persistenceManager.LoadAllExchanges(vhostName)
+	if err != nil {
+		s.Warn("Failed to load exchanges for vhost %s: %v", vhostName, err)
+	} else {
+		for _, exchRec := range exchangeRecords {
+			// Skip default exchange
+			if exchRec.Name == "" {
+				continue
+			}
+
+			vhost.mu.Lock()
+			vhost.exchanges[exchRec.Name] = RecordToExchange(exchRec)
+			vhost.mu.Unlock()
+
+			s.Info("Recovered exchange %s in vhost %s", exchRec.Name, vhostName)
+		}
+	}
+
+	// Recover queues
+	queueRecords, err := s.persistenceManager.LoadAllQueues(vhostName)
+	if err != nil {
+		s.Warn("Failed to load queues for vhost %s: %v", vhostName, err)
+	} else {
+		for _, queueRec := range queueRecords {
+			// Skip exclusive queues on recovery
+			if queueRec.Exclusive {
+				s.Info("Skipping exclusive queue %s on recovery", queueRec.Name)
+				continue
+			}
+
+			vhost.mu.Lock()
+			vhost.queues[queueRec.Name] = RecordToQueue(queueRec)
+			vhost.mu.Unlock()
+
+			s.Info("Recovered queue %s in vhost %s", queueRec.Name, vhostName)
+		}
+	}
+
+	// Recover bindings
+	bindingRecords, err := s.persistenceManager.LoadAllBindings(vhostName)
+	if err != nil {
+		s.Warn("Failed to load bindings for vhost %s: %v", vhostName, err)
+	} else {
+		for _, bindRec := range bindingRecords {
+			vhost.mu.RLock()
+			exchange, exExists := vhost.exchanges[bindRec.Exchange]
+			queue, qExists := vhost.queues[bindRec.Queue]
+			vhost.mu.RUnlock()
+
+			if exExists && qExists {
+				// Restore binding in both directions
+				exchange.mu.Lock()
+				exchange.Bindings[bindRec.RoutingKey] = append(exchange.Bindings[bindRec.RoutingKey], bindRec.Queue)
+				exchange.mu.Unlock()
+
+				queue.mu.Lock()
+				queue.Bindings[bindRec.Exchange+":"+bindRec.RoutingKey] = true
+				queue.mu.Unlock()
+
+				s.Info("Recovered binding %s:%s -> %s in vhost %s",
+					bindRec.Exchange, bindRec.RoutingKey, bindRec.Queue, vhostName)
+			}
+		}
+	}
+
+	// Recover messages for each queue
+	vhost.mu.RLock()
+	queueNames := make([]string, 0, len(vhost.queues))
+	for name := range vhost.queues {
+		queueNames = append(queueNames, name)
+	}
+	vhost.mu.RUnlock()
+
+	for _, queueName := range queueNames {
+		messageRecords, err := s.persistenceManager.LoadQueueMessages(vhostName, queueName)
+		if err != nil {
+			s.Warn("Failed to load messages for queue %s in vhost %s: %v",
+				queueName, vhostName, err)
+			continue
+		}
+
+		if len(messageRecords) > 0 {
+			vhost.mu.RLock()
+			queue, exists := vhost.queues[queueName]
+			vhost.mu.RUnlock()
+
+			if exists {
+				queue.mu.Lock()
+				for _, msgRec := range messageRecords {
+					message := RecordToMessage(msgRec)
+					queue.Messages = append(queue.Messages, *message)
+				}
+				queue.mu.Unlock()
+
+				s.Info("Recovered %d messages for queue %s in vhost %s",
+					len(messageRecords), queueName, vhostName)
+			}
+		}
+	}
+
+	return nil
 }
 
 // Add new connection to the active server connections map
@@ -1698,10 +1894,10 @@ func (c *Connection) sendPurgeOk(channelId uint16, messageCount uint32) error {
 }
 
 // deliverToQueue handles delivery to a single queue
-func (c *Connection) deliverToQueue(queueName string, msg *Message) {
+func (c *Connection) deliverToQueue(queueName string, msg *Message) error {
 	vhost := c.vhost
 	if vhost == nil || vhost.IsDeleting() {
-		return
+		return fmt.Errorf("vhost is nil or being deleted")
 	}
 
 	vhost.mu.RLock()
@@ -1709,16 +1905,52 @@ func (c *Connection) deliverToQueue(queueName string, msg *Message) {
 	vhost.mu.RUnlock()
 
 	if !exists || queue == nil {
-		return
+		return fmt.Errorf("queue %s not found", queueName)
 	}
 
-	queue.mu.Lock()
 	msgCopy := msg.DeepCopy()
-	queue.Messages = append(queue.Messages, *msgCopy)
-	queue.mu.Unlock()
+
+	// For persistent messages to durable queues, use transactions
+	if c.server.persistenceManager != nil &&
+		msg.Properties.DeliveryMode == 2 &&
+		queue.Durable {
+
+		// Start transaction
+		tx, err := c.server.persistenceManager.BeginTransaction()
+		if err != nil {
+			return fmt.Errorf("beginning transaction: %w", err)
+		}
+
+		// Prepare message record
+		messageId := GetMessageIdentifier(msgCopy)
+		record := MessageToRecord(msgCopy, messageId, 0)
+
+		// Save to transaction
+		if err := tx.SaveMessage(vhost.name, queueName, record); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("saving message to transaction: %w", err)
+		}
+
+		// Commit persistence
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing message: %w", err)
+		}
+
+		// Only add to memory after successful persistence
+		queue.mu.Lock()
+		queue.Messages = append(queue.Messages, *msgCopy)
+		queue.mu.Unlock()
+	} else {
+		// Non-persistent or non-durable: just add to memory
+		queue.mu.Lock()
+		queue.Messages = append(queue.Messages, *msgCopy)
+		queue.mu.Unlock()
+	}
 
 	c.server.Info("Message enqueued to queue '%s'. Queue now has %d messages.",
 		queueName, len(queue.Messages))
+
+	return nil
 }
 
 func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consumer *Consumer) {
@@ -1976,6 +2208,15 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 
 		if deliveryErr == nil {
 			c.server.Info("Successfully delivered message (method, header, body) for deliveryTag=%d", deliveryTag)
+
+			// PERSISTENCE: Delete auto-acked persistent messages
+			if noAck && c.server.persistenceManager != nil &&
+				msgCopy.Properties.DeliveryMode == 2 && queue.Durable {
+				messageId := GetMessageIdentifier(msgCopy)
+				if err := c.server.persistenceManager.DeleteMessage(c.vhost.name, queue.Name, messageId); err != nil {
+					c.server.Err("Failed to delete auto-acked message %s from persistence: %v", messageId, err)
+				}
+			}
 		} else {
 			c.server.Err("Failed to fully deliver message for deliveryTag=%d", deliveryTag)
 
