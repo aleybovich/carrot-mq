@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-const VERSION = "0.0.1"
+const VERSION = "0.1.0"
 
 // How log to wait until cleanup if channel Close Ok not received from client
 // TODO: make server config value
