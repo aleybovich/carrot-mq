@@ -1,22 +1,23 @@
-package carrotmq
+package internal
 
 import (
+	"carrot-mq/config"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestWithVHosts_HappyPath(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/production",
-			exchanges: []ExchangeConfig{
+			Name: "/production",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "orders", Type: "direct", Durable: true},
 				{Name: "events", Type: "fanout", Durable: true},
 				{Name: "notifications", Type: "topic", Durable: false},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{
 					Name:    "order-processing",
 					Durable: true,
@@ -42,11 +43,11 @@ func TestWithVHosts_HappyPath(t *testing.T) {
 			},
 		},
 		{
-			name: "/staging",
-			exchanges: []ExchangeConfig{
+			Name: "/staging",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "test-exchange", Type: "direct", Durable: false},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{
 					Name:      "test-queue",
 					Durable:   false,
@@ -159,14 +160,14 @@ func TestWithVHosts_HappyPath(t *testing.T) {
 }
 
 func TestWithVHosts_DefaultVHost(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/", // Default vhost
-			exchanges: []ExchangeConfig{
+			Name: "/", // Default vhost
+			Exchanges: []config.ExchangeConfig{
 				{Name: "custom-exchange", Type: "direct", Durable: true},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{
 					Name:    "custom-queue",
 					Durable: true,
@@ -205,9 +206,9 @@ func TestWithVHosts_DefaultVHost(t *testing.T) {
 }
 
 func TestWithVHosts_EmptyConfiguration(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	// Test with empty vhost list
-	server := NewServer(WithVHosts([]VHostConfig{}))
+	server := NewServer(WithVHosts([]config.VHostConfig{}))
 
 	// Should still have default vhost
 	vhost, err := server.GetVHost("/")
@@ -223,15 +224,15 @@ func TestWithVHosts_EmptyConfiguration(t *testing.T) {
 }
 
 func TestWithVHosts_ExistingExchangesAndQueues(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/test",
-			exchanges: []ExchangeConfig{
+			Name: "/test",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "", Type: "direct", Durable: true}, // Try to recreate default exchange
 				{Name: "new-exchange", Type: "fanout", Durable: false},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{Name: "new-queue", Durable: true},
 				{Name: "duplicate-queue", Durable: false},
 				{Name: "duplicate-queue", Durable: true}, // Duplicate in config
@@ -270,14 +271,14 @@ func TestWithVHosts_ExistingExchangesAndQueues(t *testing.T) {
 }
 
 func TestWithVHosts_InvalidBindings(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/test-bindings",
-			exchanges: []ExchangeConfig{
+			Name: "/test-bindings",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "valid-exchange", Type: "direct", Durable: false},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{
 					Name: "test-queue",
 					Bindings: map[string]bool{
@@ -329,11 +330,11 @@ func TestWithVHosts_InvalidBindings(t *testing.T) {
 }
 
 func TestWithVHosts_OnlyExchanges(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/exchanges-only",
-			exchanges: []ExchangeConfig{
+			Name: "/exchanges-only",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "exchange1", Type: "direct", Durable: true},
 				{Name: "exchange2", Type: "fanout", Durable: false},
 			},
@@ -367,12 +368,12 @@ func TestWithVHosts_OnlyExchanges(t *testing.T) {
 }
 
 func TestWithVHosts_OnlyQueues(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/queues-only",
+			Name: "/queues-only",
 			// No exchanges
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{Name: "queue1", Durable: true},
 				{Name: "queue2", Durable: false, Exclusive: true},
 				{
@@ -420,17 +421,17 @@ func TestWithVHosts_OnlyQueues(t *testing.T) {
 }
 
 func TestWithVHosts_MultipleVHostsWithSameNames(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/duplicate",
-			exchanges: []ExchangeConfig{
+			Name: "/duplicate",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "exchange1", Type: "direct", Durable: true},
 			},
 		},
 		{
-			name: "/duplicate", // Same name
-			exchanges: []ExchangeConfig{
+			Name: "/duplicate", // Same name
+			Exchanges: []config.ExchangeConfig{
 				{Name: "exchange2", Type: "fanout", Durable: false},
 			},
 		},
@@ -456,11 +457,11 @@ func TestWithVHosts_MultipleVHostsWithSameNames(t *testing.T) {
 }
 
 func TestWithVHosts_CombinedWithOtherOptions(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/combined-test",
-			exchanges: []ExchangeConfig{
+			Name: "/combined-test",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "test-exchange", Type: "direct", Durable: true},
 			},
 		},
@@ -486,23 +487,23 @@ func TestWithVHosts_CombinedWithOtherOptions(t *testing.T) {
 	vhost.mu.RUnlock()
 
 	// Verify auth configuration worked
-	assert.Equal(t, AuthModePlain, server.authMode)
+	assert.Equal(t, config.AuthModePlain, server.authMode)
 	assert.Len(t, server.credentials, 1)
 	assert.Contains(t, server.credentials, "user")
 	assert.Equal(t, "pass", server.credentials["user"])
 }
 
 func TestWithVHosts_ComplexBindingScenarios(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/complex-bindings",
-			exchanges: []ExchangeConfig{
+			Name: "/complex-bindings",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "direct-ex", Type: "direct", Durable: true},
 				{Name: "topic-ex", Type: "topic", Durable: true},
 				{Name: "fanout-ex", Type: "fanout", Durable: true},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{
 					Name: "multi-bound-queue",
 					Bindings: map[string]bool{
@@ -574,18 +575,18 @@ func TestWithVHosts_ComplexBindingScenarios(t *testing.T) {
 }
 
 func TestWithVHosts_ErrorRecovery(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	// Test that errors in one vhost don't prevent processing others
-	vhosts := []VHostConfig{
+	vhosts := []config.VHostConfig{
 		{
-			name: "", // Invalid empty vhost name
-			exchanges: []ExchangeConfig{
+			Name: "", // Invalid empty vhost name
+			Exchanges: []config.ExchangeConfig{
 				{Name: "should-not-exist", Type: "direct"},
 			},
 		},
 		{
-			name: "/valid-vhost",
-			exchanges: []ExchangeConfig{
+			Name: "/valid-vhost",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "should-exist", Type: "direct"},
 			},
 		},
@@ -611,11 +612,11 @@ func TestWithVHosts_ErrorRecovery(t *testing.T) {
 }
 
 func TestWithVHosts_QueuePropertiesValidation(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/queue-props-test",
-			queues: []QueueConfig{
+			Name: "/queue-props-test",
+			Queues: []config.QueueConfig{
 				{
 					Name:       "durable-queue",
 					Durable:    true,
@@ -685,11 +686,11 @@ func TestWithVHosts_QueuePropertiesValidation(t *testing.T) {
 }
 
 func TestWithVHosts_ExchangePropertiesValidation(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/exchange-props-test",
-			exchanges: []ExchangeConfig{
+			Name: "/exchange-props-test",
+			Exchanges: []config.ExchangeConfig{
 				{
 					Name:       "durable-direct",
 					Type:       "direct",
@@ -752,14 +753,14 @@ func TestWithVHosts_ExchangePropertiesValidation(t *testing.T) {
 }
 
 func TestWithVHosts_EmptyBindingsMap(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/empty-bindings-test",
-			exchanges: []ExchangeConfig{
+			Name: "/empty-bindings-test",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "test-exchange", Type: "direct", Durable: false},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{
 					Name:     "queue-no-bindings",
 					Durable:  false,
@@ -804,11 +805,11 @@ func TestWithVHosts_EmptyBindingsMap(t *testing.T) {
 // 	// Create a large configuration
 // 	var vhosts []VHostConfig
 // 	for i := 0; i < 10; i++ {
-// 		var exchanges []ExchangeConfig
-// 		var queues []QueueConfig
+// 		var exchanges []config.ExchangeConfig
+// 		var queues []config.QueueConfig
 
 // 		for j := 0; j < 10; j++ {
-// 			exchanges = append(exchanges, ExchangeConfig{
+// 			exchanges = append(exchanges, config.ExchangeConfig{
 // 				Name:    fmt.Sprintf("exchange-%d-%d", i, j),
 // 				Type:    "direct",
 // 				Durable: true,
@@ -820,7 +821,7 @@ func TestWithVHosts_EmptyBindingsMap(t *testing.T) {
 // 			for k := 0; k < 5; k++ {
 // 				bindings[fmt.Sprintf("exchange-%d-%d:key-%d", i, k, j)] = true
 // 			}
-// 			queues = append(queues, QueueConfig{
+// 			queues = append(queues, config.QueueConfig{
 // 				Name:     fmt.Sprintf("queue-%d-%d", i, j),
 // 				Durable:  true,
 // 				Bindings: bindings,
@@ -828,7 +829,7 @@ func TestWithVHosts_EmptyBindingsMap(t *testing.T) {
 // 		}
 
 // 		vhosts = append(vhosts, VHostConfig{
-// 			name:      fmt.Sprintf("/vhost-%d", i),
+// 			Name:      fmt.Sprintf("/vhost-%d", i),
 // 			exchanges: exchanges,
 // 			queues:    queues,
 // 		})
@@ -842,16 +843,16 @@ func TestWithVHosts_EmptyBindingsMap(t *testing.T) {
 // }
 
 func TestWithVHosts_SpecialCharactersInNames(t *testing.T) {
-	isTerminal = true
-	vhosts := []VHostConfig{
+	IsTerminal = true
+	vhosts := []config.VHostConfig{
 		{
-			name: "/special-chars-test",
-			exchanges: []ExchangeConfig{
+			Name: "/special-chars-test",
+			Exchanges: []config.ExchangeConfig{
 				{Name: "exchange.with.dots", Type: "direct", Durable: false},
 				{Name: "exchange-with-dashes", Type: "fanout", Durable: false},
 				{Name: "exchange_with_underscores", Type: "topic", Durable: false},
 			},
-			queues: []QueueConfig{
+			Queues: []config.QueueConfig{
 				{
 					Name: "queue.with.dots",
 					Bindings: map[string]bool{

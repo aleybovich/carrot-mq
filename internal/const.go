@@ -1,4 +1,4 @@
-package carrotmq
+package internal
 
 import "errors"
 

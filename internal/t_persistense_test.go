@@ -1,7 +1,8 @@
-package carrotmq
+package internal
 
 import (
 	"carrot-mq/storage"
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -37,7 +38,7 @@ func createTestStorage() *TestStorageWrapper {
 }
 
 // Helper to create a test server with the given storage
-func createServerWithStorage(storage *TestStorageWrapper) *Server {
+func createServerWithStorage(storage *TestStorageWrapper) *server {
 	return NewServer(
 		WithStorageProvider(storage),
 	)
@@ -73,7 +74,7 @@ func TestVHostPersistence(t *testing.T) {
 	}
 
 	// Shutdown server (storage stays open due to wrapper)
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 
 	// Create new server with same storage
 	newServer := createServerWithStorage(storage)
@@ -102,9 +103,9 @@ func TestVHostPersistence(t *testing.T) {
 	}
 
 	// Restart again
-	newServer.Shutdown()
+	newServer.Shutdown(context.TODO())
 	finalServer := createServerWithStorage(storage)
-	defer finalServer.Shutdown()
+	defer finalServer.Shutdown(context.TODO())
 
 	// Verify deleted vhost is gone
 	_, err = finalServer.GetVHost("another-vhost")
@@ -131,7 +132,7 @@ func TestExchangePersistence(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create durable exchanges
-	durableExchange := &Exchange{
+	durableExchange := &exchange{
 		Name:       "test.durable",
 		Type:       "direct",
 		Durable:    true,
@@ -140,7 +141,7 @@ func TestExchangePersistence(t *testing.T) {
 		Bindings:   make(map[string][]string),
 	}
 
-	nonDurableExchange := &Exchange{
+	nonDurableExchange := &exchange{
 		Name:       "test.transient",
 		Type:       "fanout",
 		Durable:    false,
@@ -165,9 +166,9 @@ func TestExchangePersistence(t *testing.T) {
 	}
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	newVhost, _ := newServer.GetVHost("/")
 
@@ -209,31 +210,31 @@ func TestQueuePersistence(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create queues
-	durableQueue := &Queue{
+	durableQueue := &queue{
 		Name:       "test.durable.queue",
-		Messages:   []Message{},
+		Messages:   []message{},
 		Bindings:   make(map[string]bool),
-		Consumers:  make(map[string]*Consumer),
+		Consumers:  make(map[string]*consumer),
 		Durable:    true,
 		Exclusive:  false,
 		AutoDelete: false,
 	}
 
-	exclusiveQueue := &Queue{
+	exclusiveQueue := &queue{
 		Name:       "test.exclusive.queue",
-		Messages:   []Message{},
+		Messages:   []message{},
 		Bindings:   make(map[string]bool),
-		Consumers:  make(map[string]*Consumer),
+		Consumers:  make(map[string]*consumer),
 		Durable:    true,
 		Exclusive:  true, // Should not be recovered
 		AutoDelete: false,
 	}
 
-	transientQueue := &Queue{
+	transientQueue := &queue{
 		Name:       "test.transient.queue",
-		Messages:   []Message{},
+		Messages:   []message{},
 		Bindings:   make(map[string]bool),
-		Consumers:  make(map[string]*Consumer),
+		Consumers:  make(map[string]*consumer),
 		Durable:    false, // Should not be recovered
 		Exclusive:  false,
 		AutoDelete: false,
@@ -256,9 +257,9 @@ func TestQueuePersistence(t *testing.T) {
 	}
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	newVhost, _ := newServer.GetVHost("/")
 
@@ -299,45 +300,45 @@ func TestBindingPersistence(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create durable exchange and queue
-	exchange := &Exchange{
+	exchange := &exchange{
 		Name:     "test.exchange",
 		Type:     "topic",
 		Durable:  true,
 		Bindings: make(map[string][]string),
 	}
 
-	queue := &Queue{
+	q := &queue{
 		Name:      "test.queue",
 		Durable:   true,
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
-		Messages:  []Message{},
+		Consumers: make(map[string]*consumer),
+		Messages:  []message{},
 	}
 
-	transientQueue := &Queue{
+	transientQueue := &queue{
 		Name:      "transient.queue",
 		Durable:   false,
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
-		Messages:  []Message{},
+		Consumers: make(map[string]*consumer),
+		Messages:  []message{},
 	}
 
 	// Add entities
 	vhost.mu.Lock()
 	vhost.exchanges[exchange.Name] = exchange
-	vhost.queues[queue.Name] = queue
+	vhost.queues[q.Name] = q
 	vhost.queues[transientQueue.Name] = transientQueue
 	vhost.mu.Unlock()
 
 	// Create bindings
 	exchange.mu.Lock()
-	exchange.Bindings["test.#"] = []string{queue.Name}
+	exchange.Bindings["test.#"] = []string{q.Name}
 	exchange.Bindings["temp.#"] = []string{transientQueue.Name}
 	exchange.mu.Unlock()
 
-	queue.mu.Lock()
-	queue.Bindings["test.exchange:test.#"] = true
-	queue.mu.Unlock()
+	q.mu.Lock()
+	q.Bindings["test.exchange:test.#"] = true
+	q.mu.Unlock()
 
 	transientQueue.mu.Lock()
 	transientQueue.Bindings["test.exchange:temp.#"] = true
@@ -347,12 +348,12 @@ func TestBindingPersistence(t *testing.T) {
 	if server.persistenceManager != nil {
 		// Save exchange and durable queue
 		server.persistenceManager.SaveExchange(vhost.name, ExchangeToRecord(exchange))
-		server.persistenceManager.SaveQueue(vhost.name, QueueToRecord(queue))
+		server.persistenceManager.SaveQueue(vhost.name, QueueToRecord(q))
 
 		// Save binding between durable entities
 		binding := &BindingRecord{
 			Exchange:   exchange.Name,
-			Queue:      queue.Name,
+			Queue:      q.Name,
 			RoutingKey: "test.#",
 			CreatedAt:  time.Now(),
 		}
@@ -360,9 +361,9 @@ func TestBindingPersistence(t *testing.T) {
 	}
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	newVhost, _ := newServer.GetVHost("/")
 
@@ -413,12 +414,12 @@ func TestMessagePersistence(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create durable queue
-	queue := &Queue{
+	queue := &queue{
 		Name:      "persistent.queue",
 		Durable:   true,
-		Messages:  []Message{},
+		Messages:  []message{},
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
+		Consumers: make(map[string]*consumer),
 	}
 
 	vhost.mu.Lock()
@@ -431,10 +432,10 @@ func TestMessagePersistence(t *testing.T) {
 	}
 
 	// Create messages
-	persistentMsg := &Message{
+	persistentMsg := &message{
 		Exchange:   "",
 		RoutingKey: "persistent.queue",
-		Properties: Properties{
+		Properties: properties{
 			DeliveryMode: 2, // Persistent
 			MessageId:    "msg-001",
 			Timestamp:    uint64(time.Now().Unix()),
@@ -442,10 +443,10 @@ func TestMessagePersistence(t *testing.T) {
 		Body: []byte("This is a persistent message"),
 	}
 
-	transientMsg := &Message{
+	transientMsg := &message{
 		Exchange:   "",
 		RoutingKey: "persistent.queue",
-		Properties: Properties{
+		Properties: properties{
 			DeliveryMode: 1, // Transient
 			MessageId:    "msg-002",
 		},
@@ -465,9 +466,9 @@ func TestMessagePersistence(t *testing.T) {
 	}
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	newVhost, _ := newServer.GetVHost("/")
 
@@ -517,12 +518,12 @@ func TestMessageAcknowledgmentPersistence(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create durable queue
-	queue := &Queue{
+	queue := &queue{
 		Name:      "ack.test.queue",
 		Durable:   true,
-		Messages:  []Message{},
+		Messages:  []message{},
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
+		Consumers: make(map[string]*consumer),
 	}
 
 	vhost.mu.Lock()
@@ -536,10 +537,10 @@ func TestMessageAcknowledgmentPersistence(t *testing.T) {
 
 	// Create multiple persistent messages
 	for i := 0; i < 5; i++ {
-		msg := &Message{
+		msg := &message{
 			Exchange:   "",
 			RoutingKey: queue.Name,
-			Properties: Properties{
+			Properties: properties{
 				DeliveryMode: 2,
 				MessageId:    fmt.Sprintf("msg-%03d", i),
 			},
@@ -571,9 +572,9 @@ func TestMessageAcknowledgmentPersistence(t *testing.T) {
 	}
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	newVhost, _ := newServer.GetVHost("/")
 	newVhost.mu.RLock()
@@ -613,12 +614,12 @@ func TestTransactionMessagePersistence(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create durable queue
-	queue := &Queue{
+	queue := &queue{
 		Name:      "tx.queue",
 		Durable:   true,
-		Messages:  []Message{},
+		Messages:  []message{},
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
+		Consumers: make(map[string]*consumer),
 	}
 
 	vhost.mu.Lock()
@@ -631,10 +632,10 @@ func TestTransactionMessagePersistence(t *testing.T) {
 
 	// Simulate a transaction with messages
 	// Add messages directly (simulating committed transaction)
-	committedMsg := &Message{
+	committedMsg := &message{
 		Exchange:   "",
 		RoutingKey: queue.Name,
-		Properties: Properties{
+		Properties: properties{
 			DeliveryMode: 2,
 			MessageId:    "tx-committed",
 		},
@@ -657,9 +658,9 @@ func TestTransactionMessagePersistence(t *testing.T) {
 	// after tx.commit succeeds
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	newVhost, _ := newServer.GetVHost("/")
 	newVhost.mu.RLock()
@@ -699,14 +700,14 @@ func TestCompleteScenario(t *testing.T) {
 	vhost, _ := server.GetVHost("test-app")
 
 	// Create exchanges
-	directExchange := &Exchange{
+	directExchange := &exchange{
 		Name:     "app.direct",
 		Type:     "direct",
 		Durable:  true,
 		Bindings: make(map[string][]string),
 	}
 
-	topicExchange := &Exchange{
+	topicExchange := &exchange{
 		Name:     "app.events",
 		Type:     "topic",
 		Durable:  true,
@@ -725,20 +726,20 @@ func TestCompleteScenario(t *testing.T) {
 	}
 
 	// Create queues
-	ordersQueue := &Queue{
+	ordersQueue := &queue{
 		Name:      "orders",
 		Durable:   true,
-		Messages:  []Message{},
+		Messages:  []message{},
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
+		Consumers: make(map[string]*consumer),
 	}
 
-	eventsQueue := &Queue{
+	eventsQueue := &queue{
 		Name:      "events",
 		Durable:   true,
-		Messages:  []Message{},
+		Messages:  []message{},
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
+		Consumers: make(map[string]*consumer),
 	}
 
 	vhost.mu.Lock()
@@ -787,38 +788,38 @@ func TestCompleteScenario(t *testing.T) {
 	}
 
 	// Step 2: Publish messages
-	orderMessages := []Message{
+	orderMessages := []message{
 		{
 			Exchange:   "app.direct",
 			RoutingKey: "order.create",
-			Properties: Properties{DeliveryMode: 2, MessageId: "order-001"},
+			Properties: properties{DeliveryMode: 2, MessageId: "order-001"},
 			Body:       []byte(`{"orderId": "001", "amount": 100}`),
 		},
 		{
 			Exchange:   "app.direct",
 			RoutingKey: "order.create",
-			Properties: Properties{DeliveryMode: 2, MessageId: "order-002"},
+			Properties: properties{DeliveryMode: 2, MessageId: "order-002"},
 			Body:       []byte(`{"orderId": "002", "amount": 200}`),
 		},
 		{
 			Exchange:   "app.direct",
 			RoutingKey: "order.create",
-			Properties: Properties{DeliveryMode: 1, MessageId: "order-003"}, // Transient
+			Properties: properties{DeliveryMode: 1, MessageId: "order-003"}, // Transient
 			Body:       []byte(`{"orderId": "003", "amount": 300}`),
 		},
 	}
 
-	eventMessages := []Message{
+	eventMessages := []message{
 		{
 			Exchange:   "app.events",
 			RoutingKey: "events.user.login",
-			Properties: Properties{DeliveryMode: 2, MessageId: "event-001"},
+			Properties: properties{DeliveryMode: 2, MessageId: "event-001"},
 			Body:       []byte(`{"event": "login", "userId": "user123"}`),
 		},
 		{
 			Exchange:   "app.events",
 			RoutingKey: "events.order.placed",
-			Properties: Properties{DeliveryMode: 2, MessageId: "event-002"},
+			Properties: properties{DeliveryMode: 2, MessageId: "event-002"},
 			Body:       []byte(`{"event": "orderPlaced", "orderId": "001"}`),
 		},
 	}
@@ -853,9 +854,9 @@ func TestCompleteScenario(t *testing.T) {
 	}
 
 	// Step 4: Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	// Step 5: Verify recovery
 	newVhost, err := newServer.GetVHost("test-app")
@@ -954,7 +955,7 @@ func TestPersistenceErrorHandling(t *testing.T) {
 	server := NewServer(
 		WithStorageProvider(failingStorage),
 	)
-	defer server.Shutdown()
+	defer server.Shutdown(context.TODO())
 
 	// Operations should work even when persistence fails
 	err := server.AddVHost("test-vhost")
@@ -1052,12 +1053,12 @@ func TestSequenceCounterPersistence(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create a durable queue
-	queue := &Queue{
+	queue := &queue{
 		Name:      "seq.test.queue",
 		Durable:   true,
-		Messages:  []Message{},
+		Messages:  []message{},
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
+		Consumers: make(map[string]*consumer),
 	}
 
 	vhost.mu.Lock()
@@ -1071,10 +1072,10 @@ func TestSequenceCounterPersistence(t *testing.T) {
 	// Add messages and track sequence numbers
 	var lastSequence int64
 	for i := 0; i < 5; i++ {
-		msg := &Message{
+		msg := &message{
 			Exchange:   "",
 			RoutingKey: queue.Name,
-			Properties: Properties{
+			Properties: properties{
 				DeliveryMode: 2,
 				MessageId:    fmt.Sprintf("seq-msg-%d", i),
 			},
@@ -1097,11 +1098,11 @@ func TestSequenceCounterPersistence(t *testing.T) {
 	t.Logf("Last sequence number before restart: %d", lastSequence)
 
 	// Shutdown server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 
 	// Create new server with same storage
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	// Get the current sequence number after recovery
 	recoveredSequence := newServer.persistenceManager.messageSeq.Load()
@@ -1119,10 +1120,10 @@ func TestSequenceCounterPersistence(t *testing.T) {
 	newVhost.mu.RUnlock()
 
 	for i := 5; i < 8; i++ {
-		msg := &Message{
+		msg := &message{
 			Exchange:   "",
 			RoutingKey: queue.Name,
-			Properties: Properties{
+			Properties: properties{
 				DeliveryMode: 2,
 				MessageId:    fmt.Sprintf("seq-msg-%d", i),
 			},
@@ -1157,12 +1158,12 @@ func TestSequenceCounterInTransaction(t *testing.T) {
 	vhost, _ := server.GetVHost("/")
 
 	// Create a durable queue
-	queue := &Queue{
+	queue := &queue{
 		Name:      "tx.seq.queue",
 		Durable:   true,
-		Messages:  []Message{},
+		Messages:  []message{},
 		Bindings:  make(map[string]bool),
-		Consumers: make(map[string]*Consumer),
+		Consumers: make(map[string]*consumer),
 	}
 
 	vhost.mu.Lock()
@@ -1180,10 +1181,10 @@ func TestSequenceCounterInTransaction(t *testing.T) {
 
 		// Save multiple messages in transaction
 		for i := 0; i < 3; i++ {
-			msg := &Message{
+			msg := &message{
 				Exchange:   "",
 				RoutingKey: queue.Name,
-				Properties: Properties{
+				Properties: properties{
 					DeliveryMode: 2,
 					MessageId:    fmt.Sprintf("tx-seq-msg-%d", i),
 				},
@@ -1205,9 +1206,9 @@ func TestSequenceCounterInTransaction(t *testing.T) {
 	t.Logf("Sequence after transaction: %d", lastSequence)
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	// Verify sequence was recovered
 	recoveredSequence := newServer.persistenceManager.messageSeq.Load()
@@ -1226,12 +1227,12 @@ func TestSequenceCounterConcurrent(t *testing.T) {
 	// Create multiple queues
 	numQueues := 5
 	for i := 0; i < numQueues; i++ {
-		queue := &Queue{
+		queue := &queue{
 			Name:      fmt.Sprintf("seq.concurrent.%d", i),
 			Durable:   true,
-			Messages:  []Message{},
+			Messages:  []message{},
 			Bindings:  make(map[string]bool),
-			Consumers: make(map[string]*Consumer),
+			Consumers: make(map[string]*consumer),
 		}
 
 		vhost.mu.Lock()
@@ -1258,10 +1259,10 @@ func TestSequenceCounterConcurrent(t *testing.T) {
 			vhost.mu.RUnlock()
 
 			for j := 0; j < messagesPerQueue; j++ {
-				msg := &Message{
+				msg := &message{
 					Exchange:   "",
 					RoutingKey: queueName,
-					Properties: Properties{
+					Properties: properties{
 						DeliveryMode: 2,
 						MessageId:    fmt.Sprintf("q%d-msg%d", queueIndex, j),
 					},
@@ -1294,9 +1295,9 @@ func TestSequenceCounterConcurrent(t *testing.T) {
 	}
 
 	// Restart and verify
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	recoveredSequence := newServer.persistenceManager.messageSeq.Load()
 	if recoveredSequence != finalSequence {
@@ -1317,12 +1318,12 @@ func TestConcurrentPersistenceOperations(t *testing.T) {
 	// Create multiple queues
 	numQueues := 10
 	for i := 0; i < numQueues; i++ {
-		queue := &Queue{
+		queue := &queue{
 			Name:      fmt.Sprintf("concurrent.queue.%d", i),
 			Durable:   true,
-			Messages:  []Message{},
+			Messages:  []message{},
 			Bindings:  make(map[string]bool),
-			Consumers: make(map[string]*Consumer),
+			Consumers: make(map[string]*consumer),
 		}
 
 		vhost.mu.Lock()
@@ -1349,10 +1350,10 @@ func TestConcurrentPersistenceOperations(t *testing.T) {
 			vhost.mu.RUnlock()
 
 			for j := 0; j < messagesPerQueue; j++ {
-				msg := &Message{
+				msg := &message{
 					Exchange:   "",
 					RoutingKey: queueName,
-					Properties: Properties{
+					Properties: properties{
 						DeliveryMode: 2,
 						MessageId:    fmt.Sprintf("q%d-msg%d", queueIndex, j),
 					},
@@ -1375,9 +1376,9 @@ func TestConcurrentPersistenceOperations(t *testing.T) {
 	wg.Wait()
 
 	// Restart server
-	server.Shutdown()
+	server.Shutdown(context.TODO())
 	newServer := createServerWithStorage(storage)
-	defer newServer.Shutdown()
+	defer newServer.Shutdown(context.TODO())
 
 	newVhost, _ := newServer.GetVHost("/")
 

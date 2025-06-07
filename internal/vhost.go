@@ -1,4 +1,4 @@
-package carrotmq
+package internal
 
 import (
 	"errors"
@@ -8,23 +8,17 @@ import (
 	"time"
 )
 
-type VHost struct {
+type vHost struct {
 	name      string
-	exchanges map[string]*Exchange
-	queues    map[string]*Queue
+	exchanges map[string]*exchange
+	queues    map[string]*queue
 	mu        sync.RWMutex // Protects exchanges and queues maps within this vhost
 
 	deleting atomic.Bool // Indicates if this vhost is undergoing deletion
 }
 
-type VHostConfig struct {
-	name      string
-	exchanges []ExchangeConfig
-	queues    []QueueConfig
-}
-
 // Helper method to add vhost with optional persistence
-func (s *Server) addVHostInternal(name string, persist bool) error {
+func (s *server) addVHostInternal(name string, persist bool) error {
 	if name == "" {
 		return errors.New("vhost name cannot be empty")
 	}
@@ -36,14 +30,14 @@ func (s *Server) addVHostInternal(name string, persist bool) error {
 		return fmt.Errorf("vhost '%s' already exists", name)
 	}
 
-	newVHost := &VHost{
+	newVHost := &vHost{
 		name:      name,
-		exchanges: make(map[string]*Exchange),
-		queues:    make(map[string]*Queue),
+		exchanges: make(map[string]*exchange),
+		queues:    make(map[string]*queue),
 	}
 
 	// Create default direct exchange for this vhost
-	newVHost.exchanges[""] = &Exchange{
+	newVHost.exchanges[""] = &exchange{
 		Name:     "",
 		Type:     "direct",
 		Bindings: make(map[string][]string),
@@ -67,11 +61,11 @@ func (s *Server) addVHostInternal(name string, persist bool) error {
 }
 
 // Update public AddVHost to persist
-func (s *Server) AddVHost(name string) error {
+func (s *server) AddVHost(name string) error {
 	return s.addVHostInternal(name, true)
 }
 
-func (s *Server) DeleteVHost(name string) error {
+func (s *server) DeleteVHost(name string) error {
 	if name == "/" {
 		return errors.New("cannot delete default vhost '/'")
 	}
@@ -100,7 +94,7 @@ func (s *Server) DeleteVHost(name string) error {
 	vhostToDelete.stopAllConsumers(s) // Pass server for logging
 
 	// Step 2: Close active connections associated with this vhost.
-	var connsToClose []*Connection
+	var connsToClose []*connection
 	s.connectionsMu.RLock()
 	for conn := range s.connections {
 		conn.mu.RLock() // Lock individual connection to safely access its vhost field
@@ -117,7 +111,7 @@ func (s *Server) DeleteVHost(name string) error {
 		wg.Add(len(connsToClose))
 
 		for _, conn := range connsToClose {
-			go func(c *Connection) {
+			go func(c *connection) {
 				defer wg.Done()
 				s.Info("Sending Connection.Close to %s for vhost '%s' deletion", c.conn.RemoteAddr(), name)
 				if err := c.sendConnectionClose(320, "VHost deleted", 0, 0); err != nil {
@@ -166,7 +160,7 @@ func (s *Server) DeleteVHost(name string) error {
 }
 
 // GetVHost retrieves a virtual host by name
-func (s *Server) GetVHost(name string) (*VHost, error) {
+func (s *server) GetVHost(name string) (*vHost, error) {
 	s.mu.RLock() // RLock to access s.vhosts map
 	vhost, exists := s.vhosts[name]
 	s.mu.RUnlock()
@@ -184,15 +178,15 @@ func (s *Server) GetVHost(name string) (*VHost, error) {
 }
 
 // IsDeleting returns true if the vhost is being deleted
-func (vh *VHost) IsDeleting() bool {
+func (vh *vHost) IsDeleting() bool {
 	return vh.deleting.Load()
 }
 
 // stopAllConsumers stops all consumers in the vhost
-func (vh *VHost) stopAllConsumers(s *Server) { // s *Server is used for logging
+func (vh *vHost) stopAllConsumers(s *server) { // s *Server is used for logging
 	vh.mu.RLock() // RLock to iterate vhost's queues map
 	// Create a snapshot of queues to avoid holding lock while operating on individual queues
-	queuesSnapshot := make([]*Queue, 0, len(vh.queues))
+	queuesSnapshot := make([]*queue, 0, len(vh.queues))
 	for _, q := range vh.queues {
 		queuesSnapshot = append(queuesSnapshot, q)
 	}
@@ -213,7 +207,7 @@ func (vh *VHost) stopAllConsumers(s *Server) { // s *Server is used for logging
 }
 
 // cleanup performs final cleanup of vhost resources (queues and exchanges)
-func (vh *VHost) cleanup(s *Server) { // s *Server is used for logging
+func (vh *vHost) cleanup(s *server) { // s *Server is used for logging
 	vh.mu.Lock() // Full lock on vhost to modify its internal maps
 	defer vh.mu.Unlock()
 
@@ -232,7 +226,7 @@ func (vh *VHost) cleanup(s *Server) { // s *Server is used for logging
 		}
 		q.mu.Unlock()
 	}
-	vh.queues = make(map[string]*Queue) // Reset the map
+	vh.queues = make(map[string]*queue) // Reset the map
 
 	s.Info("VHost '%s': Cleaning up %d exchanges.", vh.name, len(vh.exchanges))
 	for exchangeName, ex := range vh.exchanges {
@@ -241,9 +235,9 @@ func (vh *VHost) cleanup(s *Server) { // s *Server is used for logging
 		ex.Bindings = make(map[string][]string) // Clear bindings
 		ex.mu.Unlock()
 	}
-	vh.exchanges = make(map[string]*Exchange) // Reset the map
+	vh.exchanges = make(map[string]*exchange) // Reset the map
 	// Re-add the default "" exchange.
-	vh.exchanges[""] = &Exchange{
+	vh.exchanges[""] = &exchange{
 		Name:     "",
 		Type:     "direct",
 		Bindings: make(map[string][]string),

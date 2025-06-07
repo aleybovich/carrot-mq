@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.0]
+
+### Changed
+- Refactored the code to extract the public api and move internal impl to ./internal
+- Separated unit and integration tests
+
 ## [0.1.0]
 
 ### Added

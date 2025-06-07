@@ -1,8 +1,9 @@
-package carrotmq
+package internal
 
 import (
 	"bytes"
 	amqpError "carrot-mq/amqperror"
+	"carrot-mq/config"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-func (c *Connection) handleMethodConnectionStartOk(reader *bytes.Reader) error {
+func (c *connection) handleMethodConnectionStartOk(reader *bytes.Reader) error {
 	c.server.Info("Processing connection.start-ok")
 	// Arguments: client-properties (table), mechanism (shortstr), response (longstr), locale (shortstr)
 	var clientProperties map[string]interface{}
@@ -48,7 +49,7 @@ func (c *Connection) handleMethodConnectionStartOk(reader *bytes.Reader) error {
 	}
 
 	// Handle authentication based on server auth mode
-	if c.server.authMode == AuthModePlain {
+	if c.server.authMode == config.AuthModePlain {
 		if mechanism != "PLAIN" {
 			c.server.Err("Unsupported authentication mechanism: %s", mechanism)
 			// During negotiation phase - pause and close socket per spec 4.10.2
@@ -107,7 +108,7 @@ func (c *Connection) handleMethodConnectionStartOk(reader *bytes.Reader) error {
 	return nil // Successfully processed
 }
 
-func (c *Connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
+func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	c.server.Info("Processing connection.tune-ok")
 	if err := binary.Read(reader, binary.BigEndian, &c.channelMax); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (channel-max)", uint16(ClassConnection), MethodConnectionTuneOk)
@@ -127,7 +128,7 @@ func (c *Connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	return nil
 }
 
-func (c *Connection) handleMethodConnectionOpen(reader *bytes.Reader) error {
+func (c *connection) handleMethodConnectionOpen(reader *bytes.Reader) error {
 	vhostName, err := readShortString(reader)
 	if err != nil {
 		c.server.Err("Error reading vhost in connection.open: %v", err)
@@ -160,7 +161,7 @@ func (c *Connection) handleMethodConnectionOpen(reader *bytes.Reader) error {
 	// AMQP 0-9-1 Connection.OpenOk has one field: known-hosts (shortstr), which "MUST be zero length".
 	writeShortString(payload, "") // known-hosts
 
-	err = c.writeFrame(&Frame{
+	err = c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: 0,
 		Payload: payload.Bytes(),
@@ -173,7 +174,7 @@ func (c *Connection) handleMethodConnectionOpen(reader *bytes.Reader) error {
 	return nil
 }
 
-func (c *Connection) handleMethodConnectionClose(reader *bytes.Reader) error {
+func (c *connection) handleMethodConnectionClose(reader *bytes.Reader) error {
 	c.server.Info("Processing connection.close (client initiated close)")
 	var replyCode uint16
 	binary.Read(reader, binary.BigEndian, &replyCode)
@@ -200,7 +201,7 @@ func (c *Connection) handleMethodConnectionClose(reader *bytes.Reader) error {
 	binary.Write(payloadCloseOk, binary.BigEndian, uint16(MethodConnectionCloseOk))
 
 	// Attempt to send CloseOk, but proceed to close connection regardless of write error
-	if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: 0, Payload: payloadCloseOk.Bytes()}); errWrite != nil {
+	if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: 0, Payload: payloadCloseOk.Bytes()}); errWrite != nil {
 		c.server.Err("Error sending connection.close-ok in response to client's close: %v", errWrite)
 	} else {
 		c.server.Info("Sent connection.close-ok")
@@ -209,7 +210,7 @@ func (c *Connection) handleMethodConnectionClose(reader *bytes.Reader) error {
 	return errConnectionClosedGracefully
 }
 
-func (c *Connection) handleMethodConnectionCloseOk(reader *bytes.Reader) error {
+func (c *connection) handleMethodConnectionCloseOk(reader *bytes.Reader) error {
 	c.server.Info("Received connection.close-ok. Client acknowledged connection closure.")
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data in client's connection.close-ok method.")
@@ -219,7 +220,7 @@ func (c *Connection) handleMethodConnectionCloseOk(reader *bytes.Reader) error {
 }
 
 // Updated handleConnectionMethod to use the new handler functions:
-func (c *Connection) handleClassConnectionMethod(methodId uint16, reader *bytes.Reader) error {
+func (c *connection) handleClassConnectionMethod(methodId uint16, reader *bytes.Reader) error {
 
 	switch methodId {
 	case MethodConnectionStartOk:
@@ -248,7 +249,7 @@ func (c *Connection) handleClassConnectionMethod(methodId uint16, reader *bytes.
 
 // ---- Channel Method Handlers ------
 
-func (c *Connection) handleMethodChannelOpen(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodChannelOpen(reader *bytes.Reader, channelId uint16) error {
 	c.server.Info("Processing channel.open for channel %d", channelId)
 	// AMQP 0-9-1: reserved-1 (shortstr), "out-of-band, MUST be zero length string"
 	// Read and discard "out-of-band" argument.
@@ -271,12 +272,12 @@ func (c *Connection) handleMethodChannelOpen(reader *bytes.Reader, channelId uin
 		return c.sendChannelClose(channelId, amqpError.ChannelError.Code(), "CHANNEL_ERROR - channel ID already in use", uint16(ClassChannel), MethodChannelOpen)
 	}
 
-	newCh := &Channel{
+	newCh := &channel{
 		id:               channelId,
 		conn:             c,
 		consumers:        make(map[string]string),
-		pendingMessages:  make([]Message, 0),
-		unackedMessages:  make(map[uint64]*UnackedMessage),
+		pendingMessages:  make([]message, 0),
+		unackedMessages:  make(map[uint64]*unackedMessage),
 		confirmMode:      false,
 		nextPublishSeqNo: 1,
 		pendingConfirms:  make(map[uint64]bool),
@@ -305,7 +306,7 @@ func (c *Connection) handleMethodChannelOpen(reader *bytes.Reader, channelId uin
 		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR", 0, 0)
 	}
 
-	if err := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadOpenOk.Bytes()}); err != nil {
+	if err := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadOpenOk.Bytes()}); err != nil {
 		c.server.Err("Error sending channel.open-ok for channel %d: %v", channelId, err)
 		c.forceRemoveChannel(channelId, "failed to send channel.open-ok")
 		return err
@@ -314,7 +315,7 @@ func (c *Connection) handleMethodChannelOpen(reader *bytes.Reader, channelId uin
 	return nil
 }
 
-func (c *Connection) handleMethodChannelClose(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodChannelClose(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	c.server.Info("Processing channel.close for channel %d (client initiated)", channelId)
 	var replyCode uint16
 	if err := binary.Read(reader, binary.BigEndian, &replyCode); err != nil {
@@ -353,7 +354,7 @@ func (c *Connection) handleMethodChannelClose(reader *bytes.Reader, channelId ui
 		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR", 0, 0)
 	}
 
-	if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadCloseOk.Bytes()}); errWrite != nil {
+	if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadCloseOk.Bytes()}); errWrite != nil {
 		c.server.Err("Error sending channel.close-ok for client-initiated close on channel %d: %v", channelId, errWrite)
 		return errWrite
 	}
@@ -361,7 +362,7 @@ func (c *Connection) handleMethodChannelClose(reader *bytes.Reader, channelId ui
 	return nil
 }
 
-func (c *Connection) handleMethodChannelCloseOk(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodChannelCloseOk(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	c.server.Info("Received channel.close-ok for channel %d.", channelId)
 	if reader.Len() > 0 {
 		c.server.Warn("Extra data in channel.close-ok payload for channel %d.", channelId)
@@ -391,7 +392,7 @@ func (c *Connection) handleMethodChannelCloseOk(reader *bytes.Reader, channelId 
 	return nil
 }
 
-func (c *Connection) handleClassChannelMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleClassChannelMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassChannel, methodId)
 
 	if methodId == MethodChannelOpen {
@@ -428,7 +429,7 @@ func (c *Connection) handleClassChannelMethod(methodId uint16, reader *bytes.Rea
 
 // ----- Exchange Method Handlers -----
 
-func (c *Connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId uint16) error {
 	// AMQP 0-9-1: ticket (short, reserved), exchange (shortstr), type (shortstr), passive (bit),
 	// durable (bit), auto-delete (bit), internal (bit), no-wait (bit), arguments (table)
 	var ticket uint16
@@ -529,7 +530,7 @@ func (c *Connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 			c.server.Info("Exchange '%s' re-declared with matching properties.", exchangeName)
 		} else { // Not passive and not exists: create it.
 
-			newExchange := &Exchange{
+			newExchange := &exchange{
 				Name:       exchangeName,
 				Type:       exchangeType,
 				Durable:    durable,
@@ -564,7 +565,7 @@ func (c *Connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 		binary.Write(payloadOk, binary.BigEndian, uint16(MethodExchangeDeclareOk))
 
 		// Attempt to send DeclareOk
-		writeErr := c.writeFrame(&Frame{
+		writeErr := c.writeFrame(&frame{
 			Type:    FrameMethod,
 			Channel: channelId,
 			Payload: payloadOk.Bytes(),
@@ -585,7 +586,7 @@ func (c *Connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 	return nil // Successfully processed Exchange.Declare
 }
 
-func (c *Connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId uint16) error {
 	// AMQP 0-9-1: ticket (short), exchange (shortstr), if-unused (bit), no-wait (bit)
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
@@ -686,7 +687,7 @@ func (c *Connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId 
 		binary.Write(payload, binary.BigEndian, uint16(ClassExchange))
 		binary.Write(payload, binary.BigEndian, uint16(MethodExchangeDeleteOk))
 
-		if err := c.writeFrame(&Frame{
+		if err := c.writeFrame(&frame{
 			Type:    FrameMethod,
 			Channel: channelId,
 			Payload: payload.Bytes(),
@@ -700,7 +701,7 @@ func (c *Connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId 
 	return nil
 }
 
-func (c *Connection) handleClassExchangeMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleClassExchangeMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassExchange, methodId)
 
 	_, channelExists, isClosing := c.getChannel(channelId)
@@ -737,7 +738,7 @@ func (c *Connection) handleClassExchangeMethod(methodId uint16, reader *bytes.Re
 
 // ----- Queue Method Handlers -----
 
-func (c *Connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId uint16) error {
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 		// Malformed frame if basic fields cannot be read.
@@ -822,6 +823,19 @@ func (c *Connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 			c.server.Warn("Passive Queue.Declare: %s. Sending Channel.Close.", replyText)
 			return c.sendChannelClose(channelId, amqpError.ResourceLocked.Code(), replyText, uint16(ClassQueue), MethodQueueDeclare)
 		}
+
+		// Check property compatibility for passive declaration
+		// According to AMQP 0-9-1 spec: "If not set and the queue exists, the server MUST check that
+		// the existing queue has the same values for durable, exclusive, auto-delete, and arguments fields"
+		if q.Durable != durable || q.Exclusive != exclusive || q.AutoDelete != autoDelete {
+			q.mu.RUnlock()
+			vhost.mu.Unlock()
+			replyText := fmt.Sprintf("PRECONDITION_FAILED - queue '%s' declared with different durable, exclusive or auto-delete values", actualQueueName)
+			c.server.Warn("Passive Queue.Declare: %s. Existing(dur:%v, excl:%v, ad:%v), Req(dur:%v, excl:%v, ad:%v). Sending Channel.Close.",
+				replyText, q.Durable, q.Exclusive, q.AutoDelete, durable, exclusive, autoDelete)
+			return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), replyText, uint16(ClassQueue), MethodQueueDeclare)
+		}
+
 		messageCount = uint32(len(q.Messages))
 		consumerCount = uint32(len(q.Consumers))
 		q.mu.RUnlock()
@@ -872,11 +886,11 @@ func (c *Connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 			consumerCount = uint32(len(q.Consumers))
 			q.mu.RUnlock()
 		} else { // Not passive and not exists: create it.
-			newQueue := &Queue{
+			newQueue := &queue{
 				Name:       actualQueueName,
-				Messages:   []Message{},
+				Messages:   []message{},
 				Bindings:   make(map[string]bool),
-				Consumers:  make(map[string]*Consumer),
+				Consumers:  make(map[string]*consumer),
 				Durable:    durable,
 				Exclusive:  exclusive,
 				AutoDelete: autoDelete,
@@ -913,7 +927,7 @@ func (c *Connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 		binary.Write(payloadOk, binary.BigEndian, messageCount)
 		binary.Write(payloadOk, binary.BigEndian, consumerCount)
 
-		if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
+		if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
 			c.server.Err("Error sending queue.declare-ok for queue '%s': %v", actualQueueName, errWrite)
 			// This is an I/O error. The queue might have been created/state changed.
 			return errWrite // Propagate I/O error
@@ -925,7 +939,7 @@ func (c *Connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 	return nil // Successfully processed queue.declare
 }
 
-func (c *Connection) handleMethodQueueBind(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodQueueBind(reader *bytes.Reader, channelId uint16) error {
 	// Parse all arguments first
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
@@ -1057,7 +1071,7 @@ func (c *Connection) handleMethodQueueBind(reader *bytes.Reader, channelId uint1
 		binary.Write(payloadBindOk, binary.BigEndian, uint16(ClassQueue))
 		binary.Write(payloadBindOk, binary.BigEndian, uint16(MethodQueueBindOk))
 
-		if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadBindOk.Bytes()}); errWrite != nil {
+		if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadBindOk.Bytes()}); errWrite != nil {
 			c.server.Err("Error sending queue.bind-ok for queue '%s': %v", queueName, errWrite)
 			return errWrite
 		}
@@ -1067,7 +1081,7 @@ func (c *Connection) handleMethodQueueBind(reader *bytes.Reader, channelId uint1
 	return nil
 }
 
-func (c *Connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uint16) error {
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed queue.delete (ticket)", uint16(ClassQueue), MethodQueueDelete)
@@ -1145,7 +1159,7 @@ func (c *Connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uin
 		queueBindings = append(queueBindings, binding)
 	}
 
-	consumersSnapshot := make(map[string]*Consumer, len(queue.Consumers))
+	consumersSnapshot := make(map[string]*consumer, len(queue.Consumers))
 	for tag, consumer := range queue.Consumers {
 		consumersSnapshot[tag] = consumer
 	}
@@ -1168,7 +1182,7 @@ func (c *Connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uin
 
 	// Clear queue state immediately
 	queue.Messages = nil
-	queue.Consumers = make(map[string]*Consumer)
+	queue.Consumers = make(map[string]*consumer)
 	queue.Bindings = make(map[string]bool)
 
 	queue.mu.Unlock()
@@ -1258,7 +1272,7 @@ func (c *Connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uin
 		binary.Write(payload, binary.BigEndian, uint16(MethodQueueDeleteOk))
 		binary.Write(payload, binary.BigEndian, deletedMessageCount)
 
-		if err := c.writeFrame(&Frame{
+		if err := c.writeFrame(&frame{
 			Type:    FrameMethod,
 			Channel: channelId,
 			Payload: payload.Bytes(),
@@ -1271,7 +1285,7 @@ func (c *Connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uin
 	return nil
 }
 
-func (c *Connection) handleMethodQueueUnbind(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodQueueUnbind(reader *bytes.Reader, channelId uint16) error {
 	// Parse all arguments first
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
@@ -1402,7 +1416,7 @@ func (c *Connection) handleMethodQueueUnbind(reader *bytes.Reader, channelId uin
 	binary.Write(payloadUnbindOk, binary.BigEndian, uint16(ClassQueue))
 	binary.Write(payloadUnbindOk, binary.BigEndian, uint16(MethodQueueUnbindOk))
 
-	if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadUnbindOk.Bytes()}); errWrite != nil {
+	if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadUnbindOk.Bytes()}); errWrite != nil {
 		c.server.Err("Error sending queue.unbind-ok for queue '%s': %v", queueName, errWrite)
 		return errWrite
 	}
@@ -1411,7 +1425,7 @@ func (c *Connection) handleMethodQueueUnbind(reader *bytes.Reader, channelId uin
 	return nil
 }
 
-func (c *Connection) handleMethodQueuePurge(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodQueuePurge(reader *bytes.Reader, channelId uint16) error {
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed queue.purge (ticket)", uint16(ClassQueue), MethodQueuePurge)
@@ -1485,7 +1499,7 @@ func (c *Connection) handleMethodQueuePurge(reader *bytes.Reader, channelId uint
 
 	// Clear all messages
 	if messageCount > 0 {
-		queue.Messages = []Message{}
+		queue.Messages = []message{}
 		c.server.Info("Purged %d messages from queue '%s'", messageCount, queueName)
 	} else {
 		c.server.Info("Queue '%s' was already empty (purge had no effect)", queueName)
@@ -1515,7 +1529,7 @@ func (c *Connection) handleMethodQueuePurge(reader *bytes.Reader, channelId uint
 	return nil
 }
 
-func (c *Connection) handleClassQueueMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleClassQueueMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassQueue, methodId)
 
 	_, channelExists, isClosing := c.getChannel(channelId)
@@ -1558,7 +1572,7 @@ func (c *Connection) handleClassQueueMethod(methodId uint16, reader *bytes.Reade
 
 // ----- Basic Method Handlers -----
 
-func (c *Connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16) error {
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.get (ticket)", uint16(ClassBasic), MethodBasicGet)
@@ -1615,7 +1629,7 @@ func (c *Connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 	if !exists {
 		// Put message back since we can't deliver it
 		queue.mu.Lock()
-		queue.Messages = append([]Message{msg}, queue.Messages...)
+		queue.Messages = append([]message{msg}, queue.Messages...)
 		queue.mu.Unlock()
 		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR - channel object nil", uint16(ClassBasic), MethodBasicGet)
 	}
@@ -1623,7 +1637,7 @@ func (c *Connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 	if isClosing {
 		// Put message back since channel is closing
 		queue.mu.Lock()
-		queue.Messages = append([]Message{msg}, queue.Messages...)
+		queue.Messages = append([]message{msg}, queue.Messages...)
 		queue.mu.Unlock()
 		c.server.Debug("Ignoring basic.get on channel %d that is being closed", channelId)
 		return nil
@@ -1635,7 +1649,7 @@ func (c *Connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 	deliveryTag := ch.deliveryTag
 
 	if !noAck {
-		unacked := &UnackedMessage{
+		unacked := &unackedMessage{
 			Message:     msg,
 			ConsumerTag: "", // No consumer tag for basic.get
 			QueueName:   queueName,
@@ -1771,7 +1785,7 @@ func (c *Connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 		c.server.Err("Error buffering basic.get-ok frame: %v", err)
 		// Put message back in queue if we failed to send
 		queue.mu.Lock()
-		queue.Messages = append([]Message{msg}, queue.Messages...)
+		queue.Messages = append([]message{msg}, queue.Messages...)
 		queue.mu.Unlock()
 		// Remove from unacked if we tracked it
 		if !noAck {
@@ -1809,7 +1823,7 @@ func (c *Connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 	return nil
 }
 
-func (c *Connection) handleMethodBasicCancel(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodBasicCancel(reader *bytes.Reader, channelId uint16) error {
 	consumerTag, err := readShortString(reader)
 	if err != nil {
 		c.server.Err("Error reading consumerTag for basic.cancel: %v", err)
@@ -1869,7 +1883,7 @@ func (c *Connection) handleMethodBasicCancel(reader *bytes.Reader, channelId uin
 		binary.Write(payload, binary.BigEndian, uint16(MethodBasicCancelOk))
 		writeShortString(payload, consumerTag)
 
-		if err := c.writeFrame(&Frame{
+		if err := c.writeFrame(&frame{
 			Type:    FrameMethod,
 			Channel: channelId,
 			Payload: payload.Bytes(),
@@ -1883,7 +1897,7 @@ func (c *Connection) handleMethodBasicCancel(reader *bytes.Reader, channelId uin
 	return nil
 }
 
-func (c *Connection) handleMethodBasicPublish(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodBasicPublish(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.publish (ticket)", uint16(ClassBasic), MethodBasicPublish)
@@ -1941,7 +1955,7 @@ func (c *Connection) handleMethodBasicPublish(reader *bytes.Reader, channelId ui
 
 	ch.mu.Lock()
 	// Add to pending messages for this channel. Header and Body frames will follow.
-	newMessage := Message{
+	newMessage := message{
 		Exchange:   exchangeName,
 		RoutingKey: routingKey,
 		Mandatory:  mandatory, // Server needs to implement Basic.Return if unroutable & mandatory
@@ -1955,7 +1969,7 @@ func (c *Connection) handleMethodBasicPublish(reader *bytes.Reader, channelId ui
 	return nil
 }
 
-func (c *Connection) handleMethodBasicConsume(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodBasicConsume(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	var ticket uint16
 	if err := binary.Read(reader, binary.BigEndian, &ticket); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.consume (ticket)", uint16(ClassBasic), MethodBasicConsume)
@@ -2057,7 +2071,7 @@ func (c *Connection) handleMethodBasicConsume(reader *bytes.Reader, channelId ui
 		return c.sendChannelClose(channelId, amqpError.NotAllowed.Code(), replyText, uint16(ClassBasic), MethodBasicConsume)
 	}
 
-	consumer := &Consumer{
+	consumer := &consumer{
 		Tag:       actualConsumerTag,
 		ChannelId: channelId,
 		NoAck:     noAck,
@@ -2073,7 +2087,7 @@ func (c *Connection) handleMethodBasicConsume(reader *bytes.Reader, channelId ui
 		binary.Write(payloadOk, binary.BigEndian, uint16(MethodBasicConsumeOk))
 		writeShortString(payloadOk, actualConsumerTag)
 
-		if errWrite := c.writeFrame(&Frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
+		if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
 			c.server.Err("Error sending basic.consume-ok for consumer '%s' on queue '%s': %v", actualConsumerTag, queueName, errWrite)
 			// Rollback consumer registration if ConsumeOk fails to send
 			ch.mu.Lock()
@@ -2095,7 +2109,7 @@ func (c *Connection) handleMethodBasicConsume(reader *bytes.Reader, channelId ui
 	return nil
 }
 
-func (c *Connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16) error {
 	var deliveryTag uint64
 	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.ack (delivery-tag)", uint16(ClassBasic), MethodBasicAck)
@@ -2244,7 +2258,7 @@ func (c *Connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 	return nil
 }
 
-func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint16) error {
 	var deliveryTag uint64
 	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.nack (delivery-tag)", uint16(ClassBasic), MethodBasicNack)
@@ -2282,7 +2296,7 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 	// Check if in transaction mode
 	if ch.txMode {
 		// Store nacks for transaction
-		nack := TransactionalNack{
+		nack := transactionalNack{
 			DeliveryTag: deliveryTag,
 			Multiple:    multiple,
 			Requeue:     requeue,
@@ -2296,7 +2310,7 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 	}
 
 	// Original non-transactional nack logic continues...
-	var messagesToProcess []*UnackedMessage
+	var messagesToProcess []*unackedMessage
 	var affectedQueues = make(map[string]bool)
 
 	if deliveryTag == 0 {
@@ -2307,7 +2321,7 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 		for _, unacked := range ch.unackedMessages {
 			messagesToProcess = append(messagesToProcess, unacked)
 		}
-		ch.unackedMessages = make(map[uint64]*UnackedMessage)
+		ch.unackedMessages = make(map[uint64]*unackedMessage)
 	} else {
 		if multiple {
 			for tag, unacked := range ch.unackedMessages {
@@ -2342,7 +2356,7 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 				unacked.Message.Redelivered = true
 
 				queue.mu.Lock()
-				queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+				queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 				c.server.Info("Requeued message to queue '%s' (original delivery tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
 				affectedQueues[unacked.QueueName] = true
 				queue.mu.Unlock()
@@ -2378,7 +2392,7 @@ func (c *Connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 	return nil
 }
 
-func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodBasicReject(reader *bytes.Reader, channelId uint16) error {
 	var deliveryTag uint64
 	if err := binary.Read(reader, binary.BigEndian, &deliveryTag); err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.reject (delivery-tag)", uint16(ClassBasic), MethodBasicReject)
@@ -2412,7 +2426,7 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 	// Check if in transaction mode
 	if ch.txMode {
 		// Store reject as nack for transaction (reject is equivalent to nack with multiple=false)
-		nack := TransactionalNack{
+		nack := transactionalNack{
 			DeliveryTag: deliveryTag,
 			Multiple:    false,
 			Requeue:     requeue,
@@ -2460,7 +2474,7 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 			unacked.Message.Redelivered = true
 
 			queue.mu.Lock()
-			queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+			queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 			c.server.Info("Requeued rejected message to queue '%s' (delivery tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
 			queue.mu.Unlock()
 		} else {
@@ -2481,7 +2495,7 @@ func (c *Connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 	return nil
 }
 
-func (c *Connection) handleMethodBasicQos(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodBasicQos(reader *bytes.Reader, channelId uint16) error {
 	var prefetchSize uint32
 	var prefetchCount uint16
 
@@ -2527,7 +2541,7 @@ func (c *Connection) handleMethodBasicQos(reader *bytes.Reader, channelId uint16
 	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
 	binary.Write(payload, binary.BigEndian, uint16(MethodBasicQosOk))
 
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
@@ -2540,7 +2554,7 @@ func (c *Connection) handleMethodBasicQos(reader *bytes.Reader, channelId uint16
 	return nil
 }
 
-func (c *Connection) handleMethodBasicRecover(reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleMethodBasicRecover(reader *bytes.Reader, channelId uint16) error {
 	bits, err := reader.ReadByte()
 	if err != nil {
 		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed basic.recover (requeue bit)", uint16(ClassBasic), MethodBasicRecover)
@@ -2566,7 +2580,7 @@ func (c *Connection) handleMethodBasicRecover(reader *bytes.Reader, channelId ui
 	ch.mu.Lock()
 
 	// Collect all unacked messages
-	var messagesToProcess []*UnackedMessage
+	var messagesToProcess []*unackedMessage
 	affectedQueues := make(map[string]bool)
 
 	for _, unacked := range ch.unackedMessages {
@@ -2575,7 +2589,7 @@ func (c *Connection) handleMethodBasicRecover(reader *bytes.Reader, channelId ui
 	}
 
 	// Clear all unacked messages from this channel
-	ch.unackedMessages = make(map[uint64]*UnackedMessage)
+	ch.unackedMessages = make(map[uint64]*unackedMessage)
 	ch.mu.Unlock()
 
 	c.server.Info("Basic.Recover: Processing %d unacked messages with requeue=%v", len(messagesToProcess), requeue)
@@ -2593,7 +2607,7 @@ func (c *Connection) handleMethodBasicRecover(reader *bytes.Reader, channelId ui
 
 				queue.mu.Lock()
 				// Prepend to queue (recovered messages go to front)
-				queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+				queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 				c.server.Info("Requeued recovered message to queue '%s' (original delivery tag %d on channel %d)",
 					unacked.QueueName, unacked.DeliveryTag, channelId)
 				queue.mu.Unlock()
@@ -2616,7 +2630,7 @@ func (c *Connection) handleMethodBasicRecover(reader *bytes.Reader, channelId ui
 	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
 	binary.Write(payload, binary.BigEndian, uint16(MethodBasicRecoverOk))
 
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
@@ -2629,7 +2643,7 @@ func (c *Connection) handleMethodBasicRecover(reader *bytes.Reader, channelId ui
 	return nil
 }
 
-func (c *Connection) handleClassBasicMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleClassBasicMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassBasic, methodId)
 
 	ch, channelExists, isClosing := c.getChannel(channelId)
@@ -2687,7 +2701,7 @@ func (c *Connection) handleClassBasicMethod(methodId uint16, reader *bytes.Reade
 
 // ------ Helper functions for Tx methods ------
 
-func (c *Connection) handleMethodTxSelect(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodTxSelect(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	c.server.Info("Processing tx.select for channel %d", channelId)
 
 	if reader.Len() > 0 {
@@ -2707,13 +2721,13 @@ func (c *Connection) handleMethodTxSelect(reader *bytes.Reader, channelId uint16
 	ch.txMode = true
 	// Initialize transaction storage if needed
 	if ch.txMessages == nil {
-		ch.txMessages = make([]TransactionalMessage, 0)
+		ch.txMessages = make([]transactionalMessage, 0)
 	}
 	if ch.txAcks == nil {
 		ch.txAcks = make([]uint64, 0)
 	}
 	if ch.txNacks == nil {
-		ch.txNacks = make([]TransactionalNack, 0)
+		ch.txNacks = make([]transactionalNack, 0)
 	}
 
 	ch.mu.Unlock()
@@ -2725,7 +2739,7 @@ func (c *Connection) handleMethodTxSelect(reader *bytes.Reader, channelId uint16
 	binary.Write(payloadOk, binary.BigEndian, uint16(ClassTx))
 	binary.Write(payloadOk, binary.BigEndian, uint16(MethodTxSelectOk))
 
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payloadOk.Bytes(),
@@ -2738,7 +2752,7 @@ func (c *Connection) handleMethodTxSelect(reader *bytes.Reader, channelId uint16
 	return nil
 }
 
-func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	c.server.Info("Processing tx.commit for channel %d", channelId)
 
 	if reader.Len() > 0 {
@@ -2754,7 +2768,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 	}
 
 	// Capture transaction data and clear it
-	messagesToPublish := make([]TransactionalMessage, len(ch.txMessages))
+	messagesToPublish := make([]transactionalMessage, len(ch.txMessages))
 	copy(messagesToPublish, ch.txMessages)
 	ch.txMessages = ch.txMessages[:0] // Clear but keep capacity
 
@@ -2762,7 +2776,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 	copy(acksToProcess, ch.txAcks)
 	ch.txAcks = ch.txAcks[:0]
 
-	nacksToProcess := make([]TransactionalNack, len(ch.txNacks))
+	nacksToProcess := make([]transactionalNack, len(ch.txNacks))
 	copy(nacksToProcess, ch.txNacks)
 	ch.txNacks = ch.txNacks[:0]
 
@@ -2806,7 +2820,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 
 	// Collect messages that need to be requeued from nacks
 	var messagesToRequeue []struct {
-		Message   Message
+		Message   message
 		QueueName string
 	}
 
@@ -2818,7 +2832,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 				if tag <= nack.DeliveryTag {
 					if nack.Requeue {
 						messagesToRequeue = append(messagesToRequeue, struct {
-							Message   Message
+							Message   message
 							QueueName string
 						}{
 							Message:   unacked.Message,
@@ -2841,7 +2855,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 			if unacked, exists := ch.unackedMessages[nack.DeliveryTag]; exists {
 				if nack.Requeue {
 					messagesToRequeue = append(messagesToRequeue, struct {
-						Message   Message
+						Message   message
 						QueueName string
 					}{
 						Message:   unacked.Message,
@@ -2874,7 +2888,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 			if exists && queue != nil {
 				item.Message.Redelivered = true
 				queue.mu.Lock()
-				queue.Messages = append([]Message{item.Message}, queue.Messages...)
+				queue.Messages = append([]message{item.Message}, queue.Messages...)
 				queue.mu.Unlock()
 				c.server.Debug("Requeued message to queue '%s' via transaction commit", item.QueueName)
 			}
@@ -2896,7 +2910,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 	binary.Write(payloadOk, binary.BigEndian, uint16(ClassTx))
 	binary.Write(payloadOk, binary.BigEndian, uint16(MethodTxCommitOk))
 
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payloadOk.Bytes(),
@@ -2909,7 +2923,7 @@ func (c *Connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 	return nil
 }
 
-func (c *Connection) handleMethodTxRollback(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodTxRollback(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	c.server.Info("Processing tx.rollback for channel %d", channelId)
 
 	if reader.Len() > 0 {
@@ -2943,7 +2957,7 @@ func (c *Connection) handleMethodTxRollback(reader *bytes.Reader, channelId uint
 	binary.Write(payloadOk, binary.BigEndian, uint16(ClassTx))
 	binary.Write(payloadOk, binary.BigEndian, uint16(MethodTxRollbackOk))
 
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payloadOk.Bytes(),
@@ -2956,7 +2970,7 @@ func (c *Connection) handleMethodTxRollback(reader *bytes.Reader, channelId uint
 	return nil
 }
 
-func (c *Connection) handleClassTxMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleClassTxMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassTx, methodId)
 
 	ch, channelExists, isClosing := c.getChannel(channelId)

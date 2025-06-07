@@ -1,9 +1,13 @@
-package carrotmq
+package internal
 
 import (
 	"bufio"
 	"bytes"
 	amqpError "carrot-mq/amqperror"
+	"carrot-mq/config"
+	"carrot-mq/logger"
+	"carrot-mq/storage"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,8 +23,6 @@ import (
 	"time"
 )
 
-const VERSION = "0.1.0"
-
 // How log to wait until cleanup if channel Close Ok not received from client
 // TODO: make server config value
 const channelCloseOkTimeout = 100 * time.Millisecond
@@ -33,32 +35,32 @@ const (
 const failedAuthThrottle = 1 * time.Second // Throttle failed auth attempts to prevent abuse
 
 // Flag to determine if we're logging to a terminal (with colors) or a file
-var isTerminal bool
+var IsTerminal bool
 
 func init() {
 	// Check if stdout is a terminal
 	fileInfo, _ := os.Stdout.Stat()
-	isTerminal = (fileInfo.Mode() & os.ModeCharDevice) != 0
+	IsTerminal = (fileInfo.Mode() & os.ModeCharDevice) != 0
 }
 
-type Frame struct {
+type Server interface {
+	Start(addr string) error
+	Shutdown(ctx context.Context) error
+	Logger() logger.Logger
+}
+
+type frame struct {
 	Type     byte
 	Channel  uint16
 	Payload  []byte
 	FrameEnd byte
 }
 
-type Method struct {
-	ClassId  uint16
-	MethodId uint16
-	Args     interface{}
-}
-
-type Channel struct {
+type channel struct {
 	id                            uint16
-	conn                          *Connection
+	conn                          *connection
 	consumers                     map[string]string // consumerTag -> queueName
-	pendingMessages               []Message         // For assembling messages from Publish -> Header -> Body
+	pendingMessages               []message         // For assembling messages from Publish -> Header -> Body
 	deliveryTag                   uint64
 	mu                            sync.Mutex
 	closingByServer               bool        // True if server sent Channel.Close and is waiting for CloseOk
@@ -66,7 +68,7 @@ type Channel struct {
 	serverInitiatedCloseReplyCode uint16      // Store the reply code for logging if CloseOk times out
 	serverInitiatedCloseReplyText string      // Store the reply text for logging if CloseOk times out
 
-	unackedMessages map[uint64]*UnackedMessage // deliveryTag -> UnackedMessage
+	unackedMessages map[uint64]*unackedMessage // deliveryTag -> UnackedMessage
 
 	// Publisher confirms fields
 	confirmMode      bool            // Whether confirm mode is enabled
@@ -75,9 +77,9 @@ type Channel struct {
 
 	// Transaction fields
 	txMode     bool                   // Whether transaction mode is enabled
-	txMessages []TransactionalMessage // Messages published within current transaction
+	txMessages []transactionalMessage // Messages published within current transaction
 	txAcks     []uint64               // Delivery tags acknowledged within current transaction
-	txNacks    []TransactionalNack    // Delivery tags rejected within current transaction
+	txNacks    []transactionalNack    // Delivery tags rejected within current transaction
 
 	// QoS settings
 	prefetchCount uint16 // 0 means unlimited
@@ -85,21 +87,21 @@ type Channel struct {
 	qosGlobal     bool   // ignored for simplicity
 }
 
-type TransactionalMessage struct {
-	Message    *Message
+type transactionalMessage struct {
+	Message    *message
 	RoutingKey string
 	Exchange   string
 	Mandatory  bool
 	Immediate  bool
 }
 
-type TransactionalNack struct {
+type transactionalNack struct {
 	DeliveryTag uint64
 	Multiple    bool
 	Requeue     bool
 }
 
-type Properties struct {
+type properties struct {
 	ContentType     string
 	ContentEncoding string
 	Headers         map[string]interface{}
@@ -116,23 +118,23 @@ type Properties struct {
 	ClusterId       string
 }
 
-type Message struct {
+type message struct {
 	Exchange    string
 	RoutingKey  string
 	Mandatory   bool
 	Immediate   bool
-	Properties  Properties
+	Properties  properties
 	Body        []byte
 	Redelivered bool
 }
 
-func (m *Message) DeepCopy() *Message {
+func (m *message) DeepCopy() *message {
 	if m == nil {
 		return nil
 	}
 
 	// Deep copy properties
-	propsCopy := Properties{
+	propsCopy := properties{
 		ContentType:     m.Properties.ContentType,
 		ContentEncoding: m.Properties.ContentEncoding,
 		DeliveryMode:    m.Properties.DeliveryMode,
@@ -162,7 +164,7 @@ func (m *Message) DeepCopy() *Message {
 		copy(bodyCopy, m.Body)
 	}
 
-	return &Message{
+	return &message{
 		Exchange:    m.Exchange,
 		RoutingKey:  m.RoutingKey,
 		Mandatory:   m.Mandatory,
@@ -173,11 +175,11 @@ func (m *Message) DeepCopy() *Message {
 	}
 }
 
-type Queue struct {
+type queue struct {
 	Name       string
-	Messages   []Message
+	Messages   []message
 	Bindings   map[string]bool
-	Consumers  map[string]*Consumer
+	Consumers  map[string]*consumer
 	Durable    bool
 	Exclusive  bool
 	AutoDelete bool
@@ -186,15 +188,7 @@ type Queue struct {
 	deleting atomic.Bool
 }
 
-type QueueConfig struct {
-	Name       string
-	Durable    bool
-	Exclusive  bool
-	AutoDelete bool
-	Bindings   map[string]bool // Exchange bindings for the queue
-}
-
-type Exchange struct {
+type exchange struct {
 	Name       string
 	Type       string
 	Durable    bool
@@ -206,29 +200,21 @@ type Exchange struct {
 	deleted atomic.Bool
 }
 
-type ExchangeConfig struct {
-	Name       string
-	Type       string
-	Durable    bool
-	AutoDelete bool
-	Internal   bool
-}
-
-type UnackedMessage struct {
-	Message     Message
+type unackedMessage struct {
+	Message     message
 	ConsumerTag string
 	QueueName   string
 	DeliveryTag uint64
 	Delivered   time.Time
 }
 
-type Connection struct {
+type connection struct {
 	conn     net.Conn
 	reader   *bufio.Reader
 	writer   *bufio.Writer
-	channels map[uint16]*Channel
-	server   *Server
-	vhost    *VHost
+	channels map[uint16]*channel
+	server   *server
+	vhost    *vHost
 	mu       sync.RWMutex
 	writeMu  sync.Mutex
 
@@ -240,64 +226,57 @@ type Connection struct {
 	username string // Store authenticated username
 }
 
-type Consumer struct {
+type consumer struct {
 	Tag       string
 	ChannelId uint16
 	NoAck     bool
-	Queue     *Queue
+	Queue     *queue
 	stopCh    chan struct{} // Signal to stop this consumer
 }
 
-type AuthMode int
-
-const (
-	AuthModeNone AuthMode = iota
-	AuthModePlain
-)
-
-type Credentials struct {
+type credentials struct {
 	Username string
 	Password string
 }
 
-type Server struct {
+type server struct {
 	listener       net.Listener
-	vhosts         map[string]*VHost
-	internalLogger *log.Logger // Internal logger for formatting output
-	customLogger   Logger      // External logger interface, if provided
+	vhosts         map[string]*vHost
+	internalLogger *log.Logger   // Internal logger for formatting output
+	customLogger   logger.Logger // External logger interface, if provided
 	mu             sync.RWMutex
 
 	// Authentication fields
-	authMode    AuthMode
+	authMode    config.AuthMode
 	credentials map[string]string // username -> password
 
 	// track active connections
-	connections   map[*Connection]struct{}
+	connections   map[*connection]struct{}
 	connectionsMu sync.RWMutex
 
 	// Persistence fields
 	persistenceManager *PersistenceManager
 }
 
-type AmqpDecimal struct {
+type amqpDecimal struct {
 	Scale uint8
 	Value int32
 }
 
 // ServerOption defines functional options for configuring the AMQP server
-type ServerOption func(*Server)
+type ServerOption func(*server)
 
 // WithLogger sets a custom logger that implements the Logger interface
-func WithLogger(logger Logger) ServerOption {
-	return func(s *Server) {
+func WithLogger(logger logger.Logger) ServerOption {
+	return func(s *server) {
 		s.customLogger = logger
 	}
 }
 
 func WithAuth(credentials map[string]string) ServerOption {
-	return func(s *Server) {
+	return func(s *server) {
 		if len(credentials) > 0 {
-			s.authMode = AuthModePlain
+			s.authMode = config.AuthModePlain
 			s.credentials = make(map[string]string)
 			for user, pass := range credentials {
 				s.credentials[user] = pass
@@ -307,34 +286,34 @@ func WithAuth(credentials map[string]string) ServerOption {
 	}
 }
 
-func WithVHosts(vhosts []VHostConfig) ServerOption {
-	return func(s *Server) {
+func WithVHosts(vhosts []config.VHostConfig) ServerOption {
+	return func(s *server) {
 		for _, vhostConfig := range vhosts {
 			// Create vhost if it doesn't exist (skip default "/" if already created)
-			if vhostConfig.name != "/" {
-				if err := s.AddVHost(vhostConfig.name); err != nil {
-					s.Warn("Failed to create vhost '%s': %v", vhostConfig.name, err)
+			if vhostConfig.Name != "/" {
+				if err := s.AddVHost(vhostConfig.Name); err != nil {
+					s.Warn("Failed to create vhost '%s': %v", vhostConfig.Name, err)
 					continue
 				}
 			}
 
 			// Get the vhost
-			vhost, err := s.GetVHost(vhostConfig.name)
+			vhost, err := s.GetVHost(vhostConfig.Name)
 			if err != nil {
-				s.Warn("Failed to get vhost '%s': %v", vhostConfig.name, err)
+				s.Warn("Failed to get vhost '%s': %v", vhostConfig.Name, err)
 				continue
 			}
 
 			// Add exchanges to vhost
 			vhost.mu.Lock()
-			for _, exchConfig := range vhostConfig.exchanges {
+			for _, exchConfig := range vhostConfig.Exchanges {
 				// Skip if exchange already exists (like default "" exchange)
 				if _, exists := vhost.exchanges[exchConfig.Name]; exists {
-					s.Info("Exchange '%s' already exists in vhost '%s', skipping", exchConfig.Name, vhostConfig.name)
+					s.Info("Exchange '%s' already exists in vhost '%s', skipping", exchConfig.Name, vhostConfig.Name)
 					continue
 				}
 
-				vhost.exchanges[exchConfig.Name] = &Exchange{
+				vhost.exchanges[exchConfig.Name] = &exchange{
 					Name:       exchConfig.Name,
 					Type:       exchConfig.Type,
 					Durable:    exchConfig.Durable,
@@ -342,29 +321,29 @@ func WithVHosts(vhosts []VHostConfig) ServerOption {
 					Internal:   exchConfig.Internal,
 					Bindings:   make(map[string][]string),
 				}
-				s.Info("Created exchange '%s' (type: %s) in vhost '%s'", exchConfig.Name, exchConfig.Type, vhostConfig.name)
+				s.Info("Created exchange '%s' (type: %s) in vhost '%s'", exchConfig.Name, exchConfig.Type, vhostConfig.Name)
 			}
 
 			// Add queues to vhost
-			for _, queueConfig := range vhostConfig.queues {
+			for _, queueConfig := range vhostConfig.Queues {
 				// Skip if queue already exists
 				if _, exists := vhost.queues[queueConfig.Name]; exists {
-					s.Info("Queue '%s' already exists in vhost '%s', skipping", queueConfig.Name, vhostConfig.name)
+					s.Info("Queue '%s' already exists in vhost '%s', skipping", queueConfig.Name, vhostConfig.Name)
 					continue
 				}
 
 				// Create the queue
-				vhost.queues[queueConfig.Name] = &Queue{
+				vhost.queues[queueConfig.Name] = &queue{
 					Name:       queueConfig.Name,
-					Messages:   []Message{},
+					Messages:   []message{},
 					Bindings:   make(map[string]bool),
-					Consumers:  make(map[string]*Consumer),
+					Consumers:  make(map[string]*consumer),
 					Durable:    queueConfig.Durable,
 					Exclusive:  queueConfig.Exclusive,
 					AutoDelete: queueConfig.AutoDelete,
 				}
 				s.Info("Created queue '%s' in vhost '%s' (durable: %v, exclusive: %v)",
-					queueConfig.Name, vhostConfig.name, queueConfig.Durable, queueConfig.Exclusive)
+					queueConfig.Name, vhostConfig.Name, queueConfig.Durable, queueConfig.Exclusive)
 
 				// Handle queue bindings
 				for bindingKey := range queueConfig.Bindings {
@@ -396,7 +375,7 @@ func WithVHosts(vhosts []VHostConfig) ServerOption {
 					vhost.queues[queueConfig.Name].Bindings[bindingKey] = true
 
 					s.Info("Bound queue '%s' to exchange '%s' with routing key '%s' in vhost '%s'",
-						queueConfig.Name, exchangeName, routingKey, vhostConfig.name)
+						queueConfig.Name, exchangeName, routingKey, vhostConfig.Name)
 				}
 			}
 			vhost.mu.Unlock()
@@ -404,13 +383,88 @@ func WithVHosts(vhosts []VHostConfig) ServerOption {
 	}
 }
 
-// Logger interface definition
-type Logger interface {
-	Fatal(format string, a ...any)
-	Err(format string, a ...any)
-	Warn(format string, a ...any)
-	Info(format string, a ...any)
-	Debug(format string, a ...any)
+// WithStorage configures the storage provider for the server
+func WithStorage(cfg config.StorageConfig) ServerOption {
+	return func(s *server) {
+		// Validate config
+		if err := cfg.Validate(); err != nil {
+			s.Warn("Invalid storage config: %v, persistence disabled", err)
+			return
+		}
+
+		var provider storage.StorageProvider
+
+		switch cfg.Type {
+		case config.StorageTypeNone:
+			// No persistence
+			s.Info("Persistence disabled")
+			return
+
+		case config.StorageTypeMemory:
+			provider = storage.NewBuntDBProvider(":memory:")
+			s.Info("Using in-memory storage (BuntDB)")
+
+		case config.StorageTypeBuntDB:
+			path := cfg.BuntDB.Path
+			if path == "" {
+				path = ":memory:"
+			}
+			provider = storage.NewBuntDBProvider(path)
+			if path == ":memory:" {
+				s.Info("Using in-memory BuntDB storage")
+			} else {
+				s.Info("Using persistent BuntDB storage at: %s", path)
+			}
+
+			// Future providers
+			// case StorageTypeBoltDB:
+			//     provider = storage.NewBoltDBProvider(config.BoltDB)
+			//     s.Info("Using BoltDB storage at: %s", config.BoltDB.Path)
+			//
+			// case StorageTypeRedis:
+			//     provider = storage.NewRedisProvider(config.Redis)
+			//     s.Info("Using Redis storage at: %s", config.Redis.Address)
+		}
+
+		if provider != nil {
+			s.persistenceManager = NewPersistenceManager(provider, s)
+		}
+	}
+}
+
+// Convenience functions for common configurations
+
+// WithInMemoryStorage configures in-memory storage using BuntDB
+func WithInMemoryStorage() ServerOption {
+	return WithStorage(config.StorageConfig{
+		Type: config.StorageTypeMemory,
+	})
+}
+
+// WithBuntDBStorage configures persistent BuntDB storage
+func WithBuntDBStorage(path string) ServerOption {
+	return WithStorage(config.StorageConfig{
+		Type: config.StorageTypeBuntDB,
+		BuntDB: &config.BuntDBConfig{
+			Path: path,
+		},
+	})
+}
+
+// Optional WithNoStorage explicitly disables persistence
+func WithNoStorage() ServerOption {
+	return WithStorage(config.StorageConfig{
+		Type: config.StorageTypeNone,
+	})
+}
+
+// Using  custom storage provider directly
+func WithStorageProvider(provider storage.StorageProvider) ServerOption {
+	return func(s *server) {
+		if provider != nil {
+			s.persistenceManager = NewPersistenceManager(provider, s)
+		}
+	}
 }
 
 // Get caller function name for logging
@@ -422,7 +476,7 @@ func getCallerName() string {
 }
 
 // Fatal logs a message with Fatal level and exits with code 1
-func (s *Server) Fatal(format string, args ...interface{}) {
+func (s *server) Fatal(format string, args ...interface{}) {
 	// If using a custom logger, delegate to it
 	if s.customLogger != nil && s.customLogger != s {
 		s.customLogger.Fatal(format, args...)
@@ -431,7 +485,7 @@ func (s *Server) Fatal(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if isTerminal {
+	if IsTerminal {
 		prefix := fmt.Sprintf("%s[FATAL]%s %s%s%s: ", colorBoldRed, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -442,7 +496,7 @@ func (s *Server) Fatal(format string, args ...interface{}) {
 }
 
 // Err logs a message with Error level
-func (s *Server) Err(format string, args ...interface{}) {
+func (s *server) Err(format string, args ...interface{}) {
 	// If using a custom logger, delegate to it
 	if s.customLogger != nil && s.customLogger != s {
 		s.customLogger.Err(format, args...)
@@ -451,7 +505,7 @@ func (s *Server) Err(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if isTerminal {
+	if IsTerminal {
 		prefix := fmt.Sprintf("%s[ERROR]%s %s%s%s: ", colorBoldRed, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -460,7 +514,7 @@ func (s *Server) Err(format string, args ...interface{}) {
 }
 
 // Warn logs a message with Warning level
-func (s *Server) Warn(format string, args ...interface{}) {
+func (s *server) Warn(format string, args ...interface{}) {
 	// If using a custom logger, delegate to it
 	if s.customLogger != nil && s.customLogger != s {
 		s.customLogger.Warn(format, args...)
@@ -469,7 +523,7 @@ func (s *Server) Warn(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if isTerminal {
+	if IsTerminal {
 		prefix := fmt.Sprintf("%s[WARN]%s %s%s%s: ", colorYellow, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -478,7 +532,7 @@ func (s *Server) Warn(format string, args ...interface{}) {
 }
 
 // Info logs a message with Info level
-func (s *Server) Info(format string, args ...interface{}) {
+func (s *server) Info(format string, args ...interface{}) {
 	// If using a custom logger, delegate to it
 	if s.customLogger != nil && s.customLogger != s {
 		s.customLogger.Info(format, args...)
@@ -487,7 +541,7 @@ func (s *Server) Info(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if isTerminal {
+	if IsTerminal {
 		prefix := fmt.Sprintf("%s[INFO]%s %s%s%s: ", colorGreen, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -496,7 +550,7 @@ func (s *Server) Info(format string, args ...interface{}) {
 }
 
 // Debug logs a message with Debug level
-func (s *Server) Debug(format string, args ...interface{}) {
+func (s *server) Debug(format string, args ...interface{}) {
 	// If using a custom logger, delegate to it
 	if s.customLogger != nil && s.customLogger != s {
 		s.customLogger.Debug(format, args...)
@@ -510,7 +564,7 @@ func (s *Server) Debug(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if isTerminal {
+	if IsTerminal {
 		prefix := fmt.Sprintf("%s[DEBUG]%s %s%s%s: ", colorPurple, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -518,18 +572,27 @@ func (s *Server) Debug(format string, args ...interface{}) {
 	}
 }
 
-func NewServer(opts ...ServerOption) *Server {
+func (s *server) Logger() logger.Logger {
+	// If using a custom logger, return it
+	if s.customLogger != nil {
+		return s.customLogger
+	}
+	// Otherwise return the internal logger (server itself implements Logger interface)
+	return s
+}
+
+func NewServer(opts ...ServerOption) *server {
 	var logPrefix string
-	if isTerminal {
+	if IsTerminal {
 		logPrefix = fmt.Sprintf("%s[AMQP]%s ", colorBlue, colorReset)
 	} else {
 		logPrefix = "[AMQP] "
 	}
 
-	s := &Server{
-		vhosts:         make(map[string]*VHost),
+	s := &server{
+		vhosts:         make(map[string]*vHost),
 		internalLogger: log.New(os.Stdout, logPrefix, log.LstdFlags|log.Lmicroseconds),
-		connections:    make(map[*Connection]struct{}),
+		connections:    make(map[*connection]struct{}),
 	}
 
 	// Create default vhost
@@ -565,7 +628,7 @@ func NewServer(opts ...ServerOption) *Server {
 	return s
 }
 
-func (s *Server) Start(addr string) error {
+func (s *server) Start(addr string) error {
 	var err error
 	s.Info("Starting AMQP server on %s", addr)
 	s.listener, err = net.Listen("tcp", addr)
@@ -591,37 +654,69 @@ func (s *Server) Start(addr string) error {
 	}
 }
 
-func (s *Server) Shutdown() error {
-	s.Info("Shutting down AMQP server")
+func (s *server) Shutdown(ctx context.Context) error {
+	s.Info("Shutting down AMQP server...")
 
-	// Close all connections
-	s.connectionsMu.RLock()
-	conns := make([]*Connection, 0, len(s.connections))
-	for conn := range s.connections {
-		conns = append(conns, conn)
-	}
-	s.connectionsMu.RUnlock()
-
-	for _, conn := range conns {
-		conn.conn.Close()
-	}
-
-	// Close listener
+	// 1. Stop accepting new connections
 	if s.listener != nil {
-		s.listener.Close()
-	}
-
-	// Close persistence
-	if s.persistenceManager != nil {
-		if err := s.persistenceManager.Close(); err != nil {
-			s.Err("Error closing persistence: %v", err)
+		if err := s.listener.Close(); err != nil {
+			s.Warn("Error closing network listener: %v", err)
 		}
 	}
 
+	// 2. Initiate graceful close on all active connections
+	var wg sync.WaitGroup
+	s.connectionsMu.RLock()
+	s.Info("Closing %d active connections...", len(s.connections))
+	for conn := range s.connections {
+		wg.Add(1)
+		go func(c *connection) {
+			defer wg.Done()
+			// Send Connection.Close to the client to initiate graceful shutdown
+			// This is a normal shutdown, not an error state.
+			err := c.sendConnectionClose(amqpError.ConnectionForced.Code(), "server shutdown", 0, 0)
+			if err != nil {
+				s.Warn("Failed to send Connection.Close to %s, closing connection forcefully: %v", c.conn.RemoteAddr(), err)
+				c.conn.Close() // Force close if sending fails
+			}
+			// The connection's read loop will eventually detect the close and clean up resources.
+		}(conn)
+	}
+	s.connectionsMu.RUnlock()
+
+	// 3. Wait for all connections to close or for the context to be done
+	shutdownComplete := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(shutdownComplete)
+	}()
+
+	select {
+	case <-shutdownComplete:
+		s.Info("All active connections notified.")
+	case <-ctx.Done():
+		s.Warn("Shutdown context canceled. Some connections may not have closed gracefully: %v", ctx.Err())
+		// Force close any remaining connections
+		s.connectionsMu.RLock()
+		for conn := range s.connections {
+			conn.conn.Close()
+		}
+		s.connectionsMu.RUnlock()
+	}
+
+	// 4. Close persistence layer
+	if s.persistenceManager != nil {
+		if err := s.persistenceManager.Close(); err != nil {
+			s.Err("Error closing persistence manager: %v", err)
+			return err // Return this error as it might indicate data loss
+		}
+	}
+
+	s.Info("Server shutdown complete.")
 	return nil
 }
 
-func (s *Server) recoverPersistedState() error {
+func (s *server) recoverPersistedState() error {
 	s.Info("Starting state recovery from persistence")
 
 	// Recover vhosts
@@ -658,7 +753,7 @@ func (s *Server) recoverPersistedState() error {
 }
 
 // Recover all entities within a vhost
-func (s *Server) recoverVHostEntities(vhostName string) error {
+func (s *server) recoverVHostEntities(vhostName string) error {
 	vhost, err := s.GetVHost(vhostName)
 	if err != nil {
 		return err
@@ -769,7 +864,7 @@ func (s *Server) recoverVHostEntities(vhostName string) error {
 }
 
 // Add new connection to the active server connections map
-func (s *Server) addConnection(c *Connection) {
+func (s *server) addConnection(c *connection) {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
 	s.connections[c] = struct{}{}
@@ -777,7 +872,7 @@ func (s *Server) addConnection(c *Connection) {
 }
 
 // Remove a connection from the active server connections map.
-func (s *Server) removeConnection(c *Connection) {
+func (s *server) removeConnection(c *connection) {
 	s.connectionsMu.Lock()
 	defer s.connectionsMu.Unlock()
 	if _, ok := s.connections[c]; ok {
@@ -788,15 +883,15 @@ func (s *Server) removeConnection(c *Connection) {
 	}
 }
 
-func (s *Server) handleConnection(conn net.Conn) {
+func (s *server) handleConnection(conn net.Conn) {
 
 	s.Info("Handling connection from %s", conn.RemoteAddr())
 
-	c := &Connection{
+	c := &connection{
 		conn:     conn,
 		reader:   bufio.NewReader(conn),
 		writer:   bufio.NewWriter(conn),
-		channels: make(map[uint16]*Channel),
+		channels: make(map[uint16]*channel),
 		server:   s,
 	}
 
@@ -900,14 +995,14 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
-func (c *Connection) readFrame() (*Frame, error) {
+func (c *connection) readFrame() (*frame, error) {
 	header := make([]byte, 7)
 	_, err := io.ReadFull(c.reader, header)
 	if err != nil {
 		return nil, fmt.Errorf("error reading frame header: %w", err)
 	}
 
-	frame := &Frame{
+	frame := &frame{
 		Type:    header[0],
 		Channel: binary.BigEndian.Uint16(header[1:3]),
 	}
@@ -948,7 +1043,7 @@ func (c *Connection) readFrame() (*Frame, error) {
 // It does NOT acquire a lock and does NOT flush the writer.
 // This is intended to be used when multiple frames need to be written
 // atomically under an external lock, followed by a single flush.
-func (c *Connection) writeFrameInternal(frameType byte, channelID uint16, payload []byte) error {
+func (c *connection) writeFrameInternal(frameType byte, channelID uint16, payload []byte) error {
 	header := make([]byte, 7)
 	header[0] = frameType
 	binary.BigEndian.PutUint16(header[1:3], channelID)
@@ -974,7 +1069,7 @@ func (c *Connection) writeFrameInternal(frameType byte, channelID uint16, payloa
 
 // writeFrame writes a single frame to the connection.
 // It acquires a lock and flushes the writer, suitable for individual frame transmissions.
-func (c *Connection) writeFrame(frame *Frame) error {
+func (c *connection) writeFrame(frame *frame) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
@@ -998,7 +1093,7 @@ func (c *Connection) writeFrame(frame *Frame) error {
 	return c.writer.Flush()
 }
 
-func (c *Connection) sendConnectionStart() error { // MODIFIED: to return error
+func (c *connection) sendConnectionStart() error { // MODIFIED: to return error
 	payload := &bytes.Buffer{}
 	// Protocol Class ID and Method ID for connection.start
 	if err := binary.Write(payload, binary.BigEndian, uint16(ClassConnection)); err != nil {
@@ -1053,7 +1148,7 @@ func (c *Connection) sendConnectionStart() error { // MODIFIED: to return error
 	payload.Write(binary.BigEndian.AppendUint32(nil, uint32(len(locales))))
 	payload.WriteString(locales)
 
-	err := c.writeFrame(&Frame{
+	err := c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: 0, // Connection methods are on channel 0
 		Payload: payload.Bytes(),
@@ -1066,7 +1161,7 @@ func (c *Connection) sendConnectionStart() error { // MODIFIED: to return error
 	return nil
 }
 
-func (c *Connection) handleMethod(frame *Frame) error { // Return type error
+func (c *connection) handleMethod(frame *frame) error { // Return type error
 	reader := bytes.NewReader(frame.Payload)
 	var classId, methodId uint16
 	binary.Read(reader, binary.BigEndian, &classId)
@@ -1113,7 +1208,7 @@ func (c *Connection) handleMethod(frame *Frame) error { // Return type error
 	return nil // Success
 }
 
-func (c *Connection) handleClassConfirmMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
+func (c *connection) handleClassConfirmMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
 	methodName := getMethodName(ClassConfirm, methodId)
 
 	ch, channelExists, isClosing := c.getChannel(channelId)
@@ -1151,7 +1246,7 @@ func (c *Connection) handleClassConfirmMethod(methodId uint16, reader *bytes.Rea
 	}
 }
 
-func (c *Connection) sendConnectionTune() error {
+func (c *connection) sendConnectionTune() error {
 	payload := &bytes.Buffer{}
 	binary.Write(payload, binary.BigEndian, uint16(ClassConnection))
 	binary.Write(payload, binary.BigEndian, uint16(MethodConnectionTune))
@@ -1165,7 +1260,7 @@ func (c *Connection) sendConnectionTune() error {
 	// heartbeat: suggested heartbeat interval in seconds
 	binary.Write(payload, binary.BigEndian, uint16(suggestedHeartbeatInterval))
 
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: 0,
 		Payload: payload.Bytes(),
@@ -1177,20 +1272,20 @@ func (c *Connection) sendConnectionTune() error {
 	return nil
 }
 
-func (c *Connection) sendBasicGetEmpty(channelId uint16) error {
+func (c *connection) sendBasicGetEmpty(channelId uint16) error {
 	payload := &bytes.Buffer{}
 	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
 	binary.Write(payload, binary.BigEndian, uint16(MethodBasicGetEmpty))
 	writeShortString(payload, "") // cluster-id (reserved, must be empty)
 
-	return c.writeFrame(&Frame{
+	return c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
 	})
 }
 
-func (c *Connection) handleHeader(frame *Frame) error {
+func (c *connection) handleHeader(frame *frame) error {
 	if frame.Channel == 0 {
 		c.server.Err("Received content header frame on channel 0")
 		return c.sendConnectionClose(amqpError.ChannelError.Code(), "channel error - content frames cannot use channel 0", 0, 0)
@@ -1348,7 +1443,7 @@ func (c *Connection) handleHeader(frame *Frame) error {
 	return nil // Successfully processed header
 }
 
-func (c *Connection) handleMethodConfirmSelect(reader *bytes.Reader, channelId uint16, ch *Channel) error {
+func (c *connection) handleMethodConfirmSelect(reader *bytes.Reader, channelId uint16, ch *channel) error {
 	c.server.Info("Processing confirm.%select for channel %d", channelId)
 
 	// Read nowait bit
@@ -1377,7 +1472,7 @@ func (c *Connection) handleMethodConfirmSelect(reader *bytes.Reader, channelId u
 		binary.Write(payloadOk, binary.BigEndian, uint16(ClassConfirm))
 		binary.Write(payloadOk, binary.BigEndian, uint16(MethodConfirmSelectOk))
 
-		if err := c.writeFrame(&Frame{
+		if err := c.writeFrame(&frame{
 			Type:    FrameMethod,
 			Channel: channelId,
 			Payload: payloadOk.Bytes(),
@@ -1391,7 +1486,7 @@ func (c *Connection) handleMethodConfirmSelect(reader *bytes.Reader, channelId u
 	return nil
 }
 
-func (c *Connection) handleBody(frame *Frame) {
+func (c *connection) handleBody(frame *frame) {
 	if frame.Channel == 0 {
 		c.server.Err("Received content body frame on channel 0")
 		// For body frames, we might already be in an inconsistent state
@@ -1423,7 +1518,7 @@ func (c *Connection) handleBody(frame *Frame) {
 			frame.Channel, len(frame.Payload), pendingMessage.Exchange, pendingMessage.RoutingKey)
 
 		// Create a DEEP copy of Properties
-		propertiesCopy := Properties{
+		propertiesCopy := properties{
 			ContentType:     pendingMessage.Properties.ContentType,
 			ContentEncoding: pendingMessage.Properties.ContentEncoding,
 			DeliveryMode:    pendingMessage.Properties.DeliveryMode,
@@ -1448,7 +1543,7 @@ func (c *Connection) handleBody(frame *Frame) {
 		}
 
 		// Create the complete message with deep-copied properties
-		messageToDeliver := Message{
+		messageToDeliver := message{
 			Exchange:   pendingMessage.Exchange,
 			RoutingKey: pendingMessage.RoutingKey,
 			Mandatory:  pendingMessage.Mandatory,
@@ -1469,7 +1564,7 @@ func (c *Connection) handleBody(frame *Frame) {
 }
 
 // RouteMessage handles all exchange type routing logic
-func (c *Connection) routeMessage(msg *Message) ([]string, error) {
+func (c *connection) routeMessage(msg *message) ([]string, error) {
 	vhost := c.vhost
 
 	if msg.Exchange == "" { // Default exchange routes directly to queue by name
@@ -1508,12 +1603,12 @@ func (c *Connection) routeMessage(msg *Message) ([]string, error) {
 }
 
 // routeDirect returns queues bound with exact routing key match
-func (c *Connection) routeDirect(exchange *Exchange, routingKey string) []string {
+func (c *connection) routeDirect(exchange *exchange, routingKey string) []string {
 	return exchange.Bindings[routingKey]
 }
 
 // routeFanout returns all queues bound to the exchange
-func (c *Connection) routeFanout(exchange *Exchange) []string {
+func (c *connection) routeFanout(exchange *exchange) []string {
 	queues := make([]string, 0)
 	queueSet := make(map[string]bool)
 
@@ -1530,7 +1625,7 @@ func (c *Connection) routeFanout(exchange *Exchange) []string {
 }
 
 // routeTopic returns queues with topic pattern matching
-func (c *Connection) routeTopic(exchange *Exchange, routingKey string) []string {
+func (c *connection) routeTopic(exchange *exchange, routingKey string) []string {
 	queues := make([]string, 0)
 	queueSet := make(map[string]bool)
 
@@ -1548,11 +1643,11 @@ func (c *Connection) routeTopic(exchange *Exchange, routingKey string) []string 
 	return queues
 }
 
-func (c *Connection) deliverMessage(msg *Message, channelId uint16) {
+func (c *connection) deliverMessage(msg *message, channelId uint16) {
 	c.deliverMessageInternal(msg, channelId, false)
 }
 
-func (c *Connection) deliverMessageInternal(msg *Message, channelId uint16, isCommit bool) {
+func (c *connection) deliverMessageInternal(msg *message, channelId uint16, isCommit bool) {
 	// Check if channel is in transaction mode (but skip this check during commit)
 	if !isCommit {
 		ch, exists, _ := c.getChannel(channelId)
@@ -1560,7 +1655,7 @@ func (c *Connection) deliverMessageInternal(msg *Message, channelId uint16, isCo
 			ch.mu.Lock()
 			if ch.txMode {
 				// Store message in transaction instead of delivering immediately
-				txMsg := TransactionalMessage{
+				txMsg := transactionalMessage{
 					Message:    msg.DeepCopy(),
 					RoutingKey: msg.RoutingKey,
 					Exchange:   msg.Exchange,
@@ -1641,7 +1736,7 @@ func (c *Connection) deliverMessageInternal(msg *Message, channelId uint16, isCo
 	}
 }
 
-func (c *Connection) sendBasicAck(channelId uint16, deliveryTag uint64, multiple bool) error {
+func (c *connection) sendBasicAck(channelId uint16, deliveryTag uint64, multiple bool) error {
 	ch, exists, _ := c.getChannel(channelId)
 	if !exists || ch == nil {
 		return fmt.Errorf("channel %d not found for sending basic.ack", channelId)
@@ -1679,14 +1774,14 @@ func (c *Connection) sendBasicAck(channelId uint16, deliveryTag uint64, multiple
 		payload.WriteByte(0)
 	}
 
-	return c.writeFrame(&Frame{
+	return c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
 	})
 }
 
-func (c *Connection) sendBasicNack(channelId uint16, deliveryTag uint64, multiple bool, requeue bool) error {
+func (c *connection) sendBasicNack(channelId uint16, deliveryTag uint64, multiple bool, requeue bool) error {
 	ch, exists, _ := c.getChannel(channelId)
 	if !exists || ch == nil {
 		return fmt.Errorf("channel %d not found for sending basic.nack", channelId)
@@ -1727,7 +1822,7 @@ func (c *Connection) sendBasicNack(channelId uint16, deliveryTag uint64, multipl
 	}
 	payload.WriteByte(bits)
 
-	return c.writeFrame(&Frame{
+	return c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
@@ -1735,7 +1830,7 @@ func (c *Connection) sendBasicNack(channelId uint16, deliveryTag uint64, multipl
 }
 
 // Helper method to send the returned message's header and body
-func (c *Connection) sendReturnedMessage(channelId uint16, msg *Message) {
+func (c *connection) sendReturnedMessage(channelId uint16, msg *message) {
 	// Send header frame
 	headerPayload := &bytes.Buffer{}
 	binary.Write(headerPayload, binary.BigEndian, uint16(ClassBasic))
@@ -1834,7 +1929,7 @@ func (c *Connection) sendReturnedMessage(channelId uint16, msg *Message) {
 	}
 
 	// Send header frame
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameHeader,
 		Channel: channelId,
 		Payload: headerPayload.Bytes(),
@@ -1844,7 +1939,7 @@ func (c *Connection) sendReturnedMessage(channelId uint16, msg *Message) {
 	}
 
 	// Send body frame
-	if err := c.writeFrame(&Frame{
+	if err := c.writeFrame(&frame{
 		Type:    FrameBody,
 		Channel: channelId,
 		Payload: msg.Body,
@@ -1855,7 +1950,7 @@ func (c *Connection) sendReturnedMessage(channelId uint16, msg *Message) {
 
 // sendBasicCancelFromServer sends a Basic.Cancel method frame to the client.
 // This informs the client that a consumer has been cancelled by the server.
-func (c *Connection) sendBasicCancelFromServer(channelId uint16, consumerTag string) error {
+func (c *connection) sendBasicCancelFromServer(channelId uint16, consumerTag string) error {
 	c.server.Debug("Sending Basic.Cancel to client for consumer '%s' on channel %d", consumerTag, channelId)
 
 	payload := &bytes.Buffer{}
@@ -1872,7 +1967,7 @@ func (c *Connection) sendBasicCancelFromServer(channelId uint16, consumerTag str
 	return c.writer.Flush()
 }
 
-func (c *Connection) sendBasicCancelToConsumers(consumers map[string]*Consumer, queueName string) {
+func (c *connection) sendBasicCancelToConsumers(consumers map[string]*consumer, queueName string) {
 	c.server.Info("Sending Basic.Cancel for %d consumers on queue '%s'", len(consumers), queueName)
 	for _, consumer := range consumers {
 		if err := c.sendBasicCancelFromServer(consumer.ChannelId, consumer.Tag); err != nil {
@@ -1885,13 +1980,13 @@ func (c *Connection) sendBasicCancelToConsumers(consumers map[string]*Consumer, 
 	}
 }
 
-func (c *Connection) sendPurgeOk(channelId uint16, messageCount uint32) error {
+func (c *connection) sendPurgeOk(channelId uint16, messageCount uint32) error {
 	payload := &bytes.Buffer{}
 	binary.Write(payload, binary.BigEndian, uint16(ClassQueue))
 	binary.Write(payload, binary.BigEndian, uint16(MethodQueuePurgeOk))
 	binary.Write(payload, binary.BigEndian, messageCount)
 
-	return c.writeFrame(&Frame{
+	return c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
@@ -1899,7 +1994,7 @@ func (c *Connection) sendPurgeOk(channelId uint16, messageCount uint32) error {
 }
 
 // deliverToQueue handles delivery to a single queue
-func (c *Connection) deliverToQueue(queueName string, msg *Message) error {
+func (c *connection) deliverToQueue(queueName string, msg *message) error {
 	vhost := c.vhost
 	if vhost == nil || vhost.IsDeleting() {
 		return fmt.Errorf("vhost is nil or being deleted")
@@ -1958,7 +2053,7 @@ func (c *Connection) deliverToQueue(queueName string, msg *Message) error {
 	return nil
 }
 
-func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consumer *Consumer) {
+func (c *connection) deliverMessages(channelId uint16, consumerTag string, consumer *consumer) {
 	queue := consumer.Queue
 	noAck := consumer.NoAck
 
@@ -2075,7 +2170,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 		if c.vhost != nil && c.vhost.IsDeleting() {
 			// Put message back at front of queue
 			queue.mu.Lock()
-			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.Messages = append([]message{msg}, queue.Messages...)
 			queue.mu.Unlock()
 			c.server.Info("VHost deletion detected, stopping delivery for consumer %s", consumerTag)
 			return
@@ -2086,7 +2181,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 		if !exists || isClosing {
 			// Put message back at front of queue
 			queue.mu.Lock()
-			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.Messages = append([]message{msg}, queue.Messages...)
 			queue.mu.Unlock()
 			c.server.Info("Channel %d no longer valid, stopping delivery for consumer %s", channelId, consumerTag)
 			return
@@ -2098,7 +2193,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 		deliveryTag := ch.deliveryTag
 
 		if !noAck {
-			unacked := &UnackedMessage{
+			unacked := &unackedMessage{
 				Message:     msg,
 				ConsumerTag: consumerTag,
 				QueueName:   queue.Name,
@@ -2238,7 +2333,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 
 			// Put message back and clean up unacked tracking
 			queue.mu.Lock()
-			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.Messages = append([]message{msg}, queue.Messages...)
 			queue.mu.Unlock()
 
 			if !noAck {
@@ -2287,7 +2382,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 
 			// Put message back and clean up unacked tracking
 			queue.mu.Lock()
-			queue.Messages = append([]Message{msg}, queue.Messages...)
+			queue.Messages = append([]message{msg}, queue.Messages...)
 			queue.mu.Unlock()
 
 			if !noAck {
@@ -2299,7 +2394,7 @@ func (c *Connection) deliverMessages(channelId uint16, consumerTag string, consu
 	}
 }
 
-func (c *Connection) cleanupConnectionResources() {
+func (c *connection) cleanupConnectionResources() {
 	vhost := c.vhost
 
 	c.server.Info("Cleaning up resources for connection %s", c.conn.RemoteAddr())
@@ -2325,7 +2420,7 @@ func (c *Connection) cleanupConnectionResources() {
 
 					queue.mu.Lock() // Lock the specific queue
 					// Prepend to queue (requeued messages go to front)
-					queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+					queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 					c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'", deliveryTag, chanId, unacked.QueueName)
 					affectedQueuesForDispatch[unacked.QueueName] = true // Mark queue for dispatch
 					queue.mu.Unlock()                                   // Unlock queue
@@ -2334,7 +2429,7 @@ func (c *Connection) cleanupConnectionResources() {
 				}
 			}
 			// Clear unacked messages for the channel
-			ch.unackedMessages = make(map[uint64]*UnackedMessage)
+			ch.unackedMessages = make(map[uint64]*unackedMessage)
 		}
 
 		// Clean up consumers associated with this channel
@@ -2362,7 +2457,7 @@ func (c *Connection) cleanupConnectionResources() {
 		}
 		ch.mu.Unlock() // Unlock the channel
 	}
-	c.channels = map[uint16]*Channel{} // Clear the channels map on the connection
+	c.channels = map[uint16]*channel{} // Clear the channels map on the connection
 	c.mu.Unlock()                      // Unlock the connection
 
 	c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
@@ -2370,7 +2465,7 @@ func (c *Connection) cleanupConnectionResources() {
 }
 
 // Helper method to clean up queue bindings when an exchange is deleted
-func (c *Connection) cleanupQueueBindingsForExchange(vhost *VHost, exchangeName string) {
+func (c *connection) cleanupQueueBindingsForExchange(vhost *vHost, exchangeName string) {
 	vhost.mu.RLock()
 	// Make a copy of queue names to avoid holding the lock too long
 	queueNames := make([]string, 0, len(vhost.queues))
@@ -2402,7 +2497,7 @@ func (c *Connection) cleanupQueueBindingsForExchange(vhost *VHost, exchangeName 
 }
 
 // sendChannelClose sends a Channel.Close method to the client and cleans up the channel.
-func (c *Connection) sendChannelClose(channelId uint16, replyCode uint16, replyText string, offendingClassId uint16, offendingMethodId uint16) error {
+func (c *connection) sendChannelClose(channelId uint16, replyCode uint16, replyText string, offendingClassId uint16, offendingMethodId uint16) error {
 	c.server.Warn("Sending Channel.Close on channel %d: code=%d, text='%s', class=%d, method=%d",
 		channelId, replyCode, replyText, offendingClassId, offendingMethodId)
 
@@ -2432,7 +2527,7 @@ func (c *Connection) sendChannelClose(channelId uint16, replyCode uint16, replyT
 		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR", 0, 0)
 	}
 
-	frame := &Frame{
+	frame := &frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
@@ -2510,7 +2605,7 @@ func (c *Connection) sendChannelClose(channelId uint16, replyCode uint16, replyT
 
 // forceRemoveChannel is an internal helper to clean up a channel from the connection
 // typically called after a timeout, unrecoverable error, or when client initiates close.
-func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
+func (c *connection) forceRemoveChannel(channelId uint16, reason string) {
 	c.server.Info("Forcibly removing channel %d from connection %s. Reason: %s", channelId, c.conn.RemoteAddr(), reason)
 
 	vhost := c.vhost
@@ -2573,7 +2668,7 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 			if qExists && queue != nil {
 				unacked.Message.Redelivered = true
 				queue.mu.Lock()
-				queue.Messages = append([]Message{unacked.Message}, queue.Messages...)
+				queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 				c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'",
 					deliveryTag, channelId, unacked.QueueName)
 				affectedQueuesForDispatch[unacked.QueueName] = true
@@ -2583,7 +2678,7 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 					unacked.QueueName, deliveryTag, channelId)
 			}
 		}
-		ch.unackedMessages = make(map[uint64]*UnackedMessage)
+		ch.unackedMessages = make(map[uint64]*unackedMessage)
 	}
 
 	if len(ch.pendingConfirms) > 0 {
@@ -2631,7 +2726,7 @@ func (c *Connection) forceRemoveChannel(channelId uint16, reason string) {
 // sendConnectionClose sends a Connection.Close method to the client.
 // It does NOT close the underlying net.Conn immediately.
 // The server should then expect a Connection.CloseOk from the client.
-func (c *Connection) sendConnectionClose(replyCode uint16, replyText string, offendingClassId uint16, offendingMethodId uint16) error {
+func (c *connection) sendConnectionClose(replyCode uint16, replyText string, offendingClassId uint16, offendingMethodId uint16) error {
 	c.server.Warn("Sending Connection.Close: code=%d, text='%s', class=%d, method=%d",
 		replyCode, replyText, offendingClassId, offendingMethodId)
 
@@ -2643,7 +2738,7 @@ func (c *Connection) sendConnectionClose(replyCode uint16, replyText string, off
 	binary.Write(payload, binary.BigEndian, offendingClassId)
 	binary.Write(payload, binary.BigEndian, offendingMethodId)
 
-	frame := &Frame{
+	frame := &frame{
 		Type:    FrameMethod,
 		Channel: 0, // Connection.Close is always on channel 0
 		Payload: payload.Bytes(),
@@ -2659,7 +2754,7 @@ func (c *Connection) sendConnectionClose(replyCode uint16, replyText string, off
 	return errConnectionCloseSentByServer
 }
 
-func (c *Connection) sendBasicReturn(channelId uint16, replyCode uint16, replyText string, exchange string, routingKey string) error {
+func (c *connection) sendBasicReturn(channelId uint16, replyCode uint16, replyText string, exchange string, routingKey string) error {
 	c.server.Info("Sending basic.return on channel %d: code=%d, text='%s', exchange='%s', routingKey='%s'",
 		channelId, replyCode, replyText, exchange, routingKey)
 
@@ -2685,7 +2780,7 @@ func (c *Connection) sendBasicReturn(channelId uint16, replyCode uint16, replyTe
 	// Write routing-key
 	writeShortString(payload, routingKey)
 
-	return c.writeFrame(&Frame{
+	return c.writeFrame(&frame{
 		Type:    FrameMethod,
 		Channel: channelId,
 		Payload: payload.Bytes(),
@@ -2693,7 +2788,7 @@ func (c *Connection) sendBasicReturn(channelId uint16, replyCode uint16, replyTe
 }
 
 // Helper method to clean up exchange bindings
-func (c *Connection) cleanupExchangeBindings(queueName string, bindings []string) {
+func (c *connection) cleanupExchangeBindings(queueName string, bindings []string) {
 	if len(bindings) == 0 {
 		return
 	}
@@ -2744,7 +2839,7 @@ func (c *Connection) cleanupExchangeBindings(queueName string, bindings []string
 
 // getChannel safely retrieves a channel and checks if it's closing
 // Returns (channel, exists, isClosing)
-func (c *Connection) getChannel(channelId uint16) (*Channel, bool, bool) {
+func (c *connection) getChannel(channelId uint16) (*channel, bool, bool) {
 	c.mu.RLock()
 	ch, exists := c.channels[channelId]
 	c.mu.RUnlock()
@@ -2759,13 +2854,4 @@ func (c *Connection) getChannel(channelId uint16) (*Channel, bool, bool) {
 	ch.mu.Unlock()
 
 	return ch, true, isClosing
-}
-
-func main() {
-	server := NewServer()
-	server.Info("Starting AMQP server")
-	if err := server.Start(":5672"); err != nil {
-		server.Err("Failed to start server: %v", err)
-		os.Exit(1)
-	}
 }

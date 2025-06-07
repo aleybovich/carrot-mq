@@ -214,7 +214,6 @@ func TestQueueUnbind_MultipleBindings(t *testing.T) {
 	}
 }
 
-// -------- RACE CONDITION TESTS --------
 func TestQueueBind_RaceWithQueueDelete_Protected(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -446,57 +445,6 @@ func TestQueueBind_ConcurrentSameBinding_Protected(t *testing.T) {
 		// Good - no duplicates
 	}
 }
-
-// func TestQueueBindUnbind_RaceWithExchangeDelete(t *testing.T) {
-// 	addr, cleanup := setupTestServer(t)
-// 	defer cleanup()
-
-// 	conn, err := amqp.Dial("amqp://" + addr)
-// 	require.NoError(t, err)
-// 	defer conn.Close()
-
-// 	ch1, err := conn.Channel()
-// 	require.NoError(t, err)
-// 	defer ch1.Close()
-
-// 	ch2, err := conn.Channel()
-// 	require.NoError(t, err)
-// 	defer ch2.Close()
-
-// 	// Note: Exchange deletion is not implemented in the server yet,
-// 	// but this test structure shows what would be tested
-// 	t.Skip("Exchange deletion not implemented yet")
-
-// 	exchangeName := "delete-race-ex"
-// 	queueName := "delete-race-q"
-
-// 	err = ch1.ExchangeDeclare(exchangeName, "direct", false, false, false, false, nil)
-// 	require.NoError(t, err)
-
-// 	_, err = ch1.QueueDeclare(queueName, false, false, false, false, nil)
-// 	require.NoError(t, err)
-
-// 	var wg sync.WaitGroup
-// 	var bindErr, deleteErr error
-
-// 	wg.Add(2)
-
-// 	go func() {
-// 		defer wg.Done()
-// 		bindErr = ch1.QueueBind(queueName, "key", exchangeName, false, nil)
-// 	}()
-
-// 	go func() {
-// 		defer wg.Done()
-// 		time.Sleep(5 * time.Millisecond)
-// 		// deleteErr = ch2.ExchangeDelete(exchangeName, false, false)
-// 		// When implemented, should return proper error codes
-// 	}()
-
-// 	wg.Wait()
-
-// 	// Similar assertions as queue delete test
-// }
 
 func TestQueueBind_StressTest_NoDeadlock(t *testing.T) {
 	if testing.Short() {

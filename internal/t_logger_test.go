@@ -1,4 +1,4 @@
-package carrotmq
+package internal
 
 import (
 	"fmt"
@@ -110,12 +110,12 @@ func TestCustomLogger(t *testing.T) {
 	// Create a mock logger
 	mockLogger := NewMockLogger(t)
 
-	// Create a server with the custom logger
-	server := NewServer(WithLogger(mockLogger))
+	// Create a s with the custom logger
+	s := NewServer(WithLogger(mockLogger))
 
 	// Verify that the server uses our custom logger
-	if server.customLogger != mockLogger {
-		t.Errorf("Server did not set custom logger correctly, got %T, want %T", server.customLogger, mockLogger)
+	if s.customLogger != mockLogger {
+		t.Errorf("Server did not set custom logger correctly, got %T, want %T", s.customLogger, mockLogger)
 	}
 
 	// Test that basic logging works
@@ -124,10 +124,10 @@ func TestCustomLogger(t *testing.T) {
 		prevCount := mockLogger.TotalCount()
 
 		// Call each log method
-		server.Info("Test info message: %d", 123)
-		server.Warn("Test warn message: %s", "warning")
-		server.Err("Test error message: %v", fmt.Errorf("test error"))
-		server.Debug("Test debug message")
+		s.Info("Test info message: %d", 123)
+		s.Warn("Test warn message: %s", "warning")
+		s.Err("Test error message: %v", fmt.Errorf("test error"))
+		s.Debug("Test debug message")
 
 		// Check if logs were recorded correctly
 		newCount := mockLogger.TotalCount() - prevCount
@@ -160,11 +160,11 @@ func TestCustomLogger(t *testing.T) {
 	t.Run("Test Fatal without exiting", func(t *testing.T) {
 		// Create a custom server wrapper that overrides Fatal to prevent exit
 		type TestServer struct {
-			*Server
+			*server
 		}
 
 		// Override Fatal to not call os.Exit
-		testServer := &TestServer{Server: NewServer(WithLogger(mockLogger))}
+		testServer := &TestServer{server: NewServer(WithLogger(mockLogger))}
 
 		// The real Fatal method would call os.Exit(1), but our mock logger just records it
 		testServer.Fatal("Test fatal message: %s", "critical error")

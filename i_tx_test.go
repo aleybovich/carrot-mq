@@ -189,7 +189,6 @@ func TestTxPublishRollback(t *testing.T) {
 }
 
 // TestTxAckCommit tests acknowledging messages within a transaction
-// TestTxAckCommit tests acknowledging messages within a transaction
 func TestTxAckCommit(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
 	defer cleanup()

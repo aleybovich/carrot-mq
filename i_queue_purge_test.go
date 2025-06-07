@@ -94,8 +94,6 @@ func TestQueuePurge_NonExistent(t *testing.T) {
 	assert.Contains(t, amqpErr.Reason, "no queue")
 }
 
-// --- No-Wait Tests ---
-
 func TestQueuePurge_NoWait(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -136,8 +134,6 @@ func TestQueuePurge_NoWait(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, q2.Messages, "Queue should be empty after no-wait purge")
 }
-
-// --- Exclusive Queue Tests ---
 
 func TestQueuePurge_ExclusiveQueue_SameConnection(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
@@ -215,8 +211,6 @@ func TestQueuePurge_ExclusiveQueue_DifferentConnection(t *testing.T) {
 		}
 	}
 }
-
-// --- Concurrent Operations Tests ---
 
 func TestQueuePurge_ConcurrentWithPublish(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
@@ -426,8 +420,6 @@ func TestQueuePurge_ConcurrentMultiplePurges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, q2.Messages)
 }
-
-// --- Purge During Queue/VHost Deletion Tests ---
 
 func TestQueuePurge_DuringQueueDeletion(t *testing.T) {
 	addr, cleanup := setupTestServer(t)

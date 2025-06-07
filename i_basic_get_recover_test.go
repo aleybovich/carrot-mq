@@ -12,8 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// --- Basic.Get Tests ---
-
 func TestBasicGet_Success(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
 	defer cleanup()
@@ -319,8 +317,6 @@ func TestBasicGet_MultipleChannels(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "msg3", string(msg4.Body))
 }
-
-// --- Basic.Recover Tests (now using Basic.Nack) ---
 
 func TestBasicRecover_SimpleRequeue(t *testing.T) {
 	addr, cleanup := setupTestServer(t)

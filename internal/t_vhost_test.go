@@ -1,4 +1,4 @@
-package carrotmq
+package internal
 
 import (
 	"fmt"
@@ -45,7 +45,7 @@ func TestVHost_Add_DefaultExists(t *testing.T) {
 }
 
 func TestVHost_Add_Named(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	vhostName := "test-vhost-add"
 	err := server.AddVHost(vhostName)
@@ -66,7 +66,7 @@ func TestVHost_Add_Named(t *testing.T) {
 }
 
 func TestVHost_Add_ExistingNamed(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	vhostName := "test-vhost-existing"
 	err := server.AddVHost(vhostName)
@@ -78,7 +78,7 @@ func TestVHost_Add_ExistingNamed(t *testing.T) {
 }
 
 func TestVHost_Add_EmptyName(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	err := server.AddVHost("")
 	require.Error(t, err, "Adding a vhost with an empty name should fail")
@@ -86,7 +86,7 @@ func TestVHost_Add_EmptyName(t *testing.T) {
 }
 
 func TestVHost_Get_Existing(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	vhostName := "test-vhost-get"
 	err := server.AddVHost(vhostName)
@@ -99,7 +99,7 @@ func TestVHost_Get_Existing(t *testing.T) {
 }
 
 func TestVHost_Get_NonExistent(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	_, err := server.GetVHost("non-existent-vhost")
 	require.Error(t, err, "Should fail to retrieve non-existent vhost")
@@ -107,7 +107,7 @@ func TestVHost_Get_NonExistent(t *testing.T) {
 }
 
 func TestVHost_Delete_Named_NoResources(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server, _, serverCleanup := setupAndReturnTestServer(t)
 	defer serverCleanup()
 
@@ -130,7 +130,7 @@ func TestVHost_Delete_Named_NoResources(t *testing.T) {
 }
 
 func TestVHost_Delete_Default(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	err := server.DeleteVHost("/")
 	require.Error(t, err, "Should fail to delete the default vhost '/'")
@@ -138,7 +138,7 @@ func TestVHost_Delete_Default(t *testing.T) {
 }
 
 func TestVHost_Delete_NonExistent(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	err := server.DeleteVHost("non-existent-vhost-for-delete")
 	require.Error(t, err, "Should fail to delete a non-existent vhost")
@@ -146,7 +146,7 @@ func TestVHost_Delete_NonExistent(t *testing.T) {
 }
 
 func TestVHost_Delete_AlreadyDeleting(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	vhostName := "test-vhost-delete-twice"
 	err := server.AddVHost(vhostName)
@@ -209,7 +209,7 @@ func TestVHost_Delete_AlreadyDeleting(t *testing.T) {
 }
 
 func TestVHost_Delete_WithConnections(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server, serverAddr, serverCleanup := setupAndReturnTestServer(t)
 	defer serverCleanup()
 
@@ -246,7 +246,7 @@ func TestVHost_Delete_WithConnections(t *testing.T) {
 }
 
 func TestVHost_Delete_WithQueuesAndConsumers(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server, serverAddr, serverCleanup := setupAndReturnTestServer(t)
 	defer serverCleanup()
 
@@ -313,7 +313,7 @@ func TestVHost_Delete_WithQueuesAndConsumers(t *testing.T) {
 }
 
 func TestVHost_Isolation_Resources(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server, serverAddr, serverCleanup := setupAndReturnTestServer(t)
 	defer serverCleanup()
 
@@ -383,7 +383,7 @@ func TestVHost_Isolation_Resources(t *testing.T) {
 }
 
 func TestVHost_Get_WhileDeleting(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 	vhostName := "vhost-get-while-deleting"
 	err := server.AddVHost(vhostName)
@@ -427,7 +427,7 @@ func TestVHost_Get_WhileDeleting(t *testing.T) {
 }
 
 func TestVHost_DefaultExchange_PerVHost(t *testing.T) {
-	isTerminal = true
+	IsTerminal = true
 	server := NewServer()
 
 	// Check default vhost

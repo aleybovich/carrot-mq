@@ -1,6 +1,7 @@
 package carrotmq
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"carrot-mq/internal"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
@@ -33,22 +36,16 @@ func uniqueName(prefix string) string {
 }
 
 func setupTestServer(t *testing.T, opts ...ServerOption) (addr string, cleanup func()) {
-	_, addr, cleanup = setupAndReturnTestServer(t, opts...)
-	return addr, cleanup
-}
-
-// Helper to start a server and return its address and a cleanup function
-func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (server *Server, addr string, cleanup func()) {
-	isTerminal = true // Force colorized output for server logs during tests
+	internal.IsTerminal = true // Force colorized output for server logs during tests
 	addr = getNextTestPort()
-	server = NewServer(opts...) // Uses default internal logger
+	s := NewServer(opts...) // Uses default internal logger
 
 	// Channel to signal when server goroutine exits
 	serverDone := make(chan struct{})
 
 	go func() {
 		defer close(serverDone)
-		if err := server.Start(addr); err != nil {
+		if err := s.Start(addr); err != nil {
 			// Only log if it's not the expected closed listener error
 			if !errors.Is(err, net.ErrClosed) {
 				t.Logf("Test server failed to start on %s: %v", addr, err)
@@ -60,11 +57,9 @@ func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (server *Serve
 	time.Sleep(200 * time.Millisecond)
 
 	cleanup = func() {
-		if server.listener != nil {
-			err := server.listener.Close()
-			if err != nil {
-				t.Logf("Error closing test server listener on %s: %v", addr, err)
-			}
+		err := s.Shutdown(context.TODO())
+		if err != nil {
+			t.Logf("Error shutting down test server on %s: %v", addr, err)
 		}
 
 		// Wait for server goroutine to exit with timeout
@@ -76,7 +71,7 @@ func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (server *Serve
 		}
 	}
 
-	return server, addr, cleanup
+	return addr, cleanup
 }
 
 // t_publishMessage publishes a single message.

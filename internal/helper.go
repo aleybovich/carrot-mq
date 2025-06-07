@@ -1,4 +1,4 @@
-package carrotmq
+package internal
 
 import (
 	"bytes"
@@ -11,7 +11,7 @@ import (
 
 // colorize adds ANSI color to a string if the output is a terminal
 func colorize(s string, color string) string {
-	if isTerminal {
+	if IsTerminal {
 		return fmt.Sprintf("%s%s%s", color, s, colorReset)
 	}
 	return s
@@ -303,7 +303,7 @@ func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
 		if err := binary.Read(reader, binary.BigEndian, &val); err != nil {
 			return nil, fmt.Errorf("reading decimal value: %w", err)
 		}
-		return AmqpDecimal{Scale: scale, Value: val}, nil // AmqpDecimal must be defined or imported
+		return amqpDecimal{Scale: scale, Value: val}, nil // AmqpDecimal must be defined or imported
 	case 'S': // long-string
 		strVal, err := readLongString(reader)
 		if err != nil {
@@ -420,7 +420,7 @@ func writeFieldValue(writer *bytes.Buffer, value interface{}) error {
 	case float64:
 		writer.WriteByte('d')
 		binary.Write(writer, binary.BigEndian, v)
-	case AmqpDecimal:
+	case amqpDecimal:
 		writer.WriteByte('D')
 		binary.Write(writer, binary.BigEndian, v.Scale)
 		binary.Write(writer, binary.BigEndian, v.Value)
@@ -639,7 +639,7 @@ func writeTable(writer *bytes.Buffer, table map[string]interface{}) error {
 	return nil
 }
 
-func FindMessageInQueueNonLocking(msgIdentifier string, queue *Queue) (int, bool) {
+func FindMessageInQueueNonLocking(msgIdentifier string, queue *queue) (int, bool) {
 	for i, msg := range queue.Messages {
 		if GetMessageIdentifier(&msg) == msgIdentifier {
 			return i, true
@@ -650,7 +650,7 @@ func FindMessageInQueueNonLocking(msgIdentifier string, queue *Queue) (int, bool
 
 // GetMessageIdentifier creates a unique hash for a message based on its key properties
 // Note: For production code, consider adding "crypto/sha256" to your imports
-func GetMessageIdentifier(msg *Message) string {
+func GetMessageIdentifier(msg *message) string {
 	if msg == nil {
 		return ""
 	}

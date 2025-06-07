@@ -10,8 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Add these tests to t_server_test.go
-
 func TestExchangeDelete_Success(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
 	defer cleanup()

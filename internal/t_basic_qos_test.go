@@ -1,4 +1,4 @@
-package carrotmq
+package internal
 
 import (
 	"bufio"
@@ -45,20 +45,20 @@ func TestBasicQosMethod(t *testing.T) {
 		writeBuffer: bytes.NewBuffer([]byte{}),
 	}
 
-	conn := &Connection{
+	conn := &connection{
 		conn:     mockNetConn,
 		reader:   bufio.NewReader(mockNetConn),
 		writer:   bufio.NewWriter(mockNetConn),
 		server:   server,
-		channels: make(map[uint16]*Channel),
-		vhost:    &VHost{name: "/"},
+		channels: make(map[uint16]*channel),
+		vhost:    &vHost{name: "/"},
 	}
 
 	// Create a test channel
-	ch := &Channel{
+	ch := &channel{
 		id:              1,
 		conn:            conn,
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		consumers:       make(map[string]string),
 	}
 	conn.channels[1] = ch
@@ -149,27 +149,27 @@ func TestBasicQosMethod(t *testing.T) {
 // TestQosPrefetchLimit tests that deliverMessages respects prefetch limits
 func TestQosPrefetchLimit(t *testing.T) {
 	server := NewServer()
-	vhost := &VHost{
+	vhost := &vHost{
 		name:      "/",
-		queues:    make(map[string]*Queue),
-		exchanges: make(map[string]*Exchange),
+		queues:    make(map[string]*queue),
+		exchanges: make(map[string]*exchange),
 	}
 	server.vhosts["/"] = vhost
 
 	// Create a queue with messages
-	queue := &Queue{
+	queue := &queue{
 		Name:      "test-queue",
-		Messages:  []Message{},
-		Consumers: make(map[string]*Consumer),
+		Messages:  []message{},
+		Consumers: make(map[string]*consumer),
 		Bindings:  make(map[string]bool),
 	}
 
 	// Add 10 messages to the queue
 	for i := 0; i < 10; i++ {
-		queue.Messages = append(queue.Messages, Message{
+		queue.Messages = append(queue.Messages, message{
 			Body:       []byte("test message"),
 			RoutingKey: "test",
-			Properties: Properties{},
+			Properties: properties{},
 		})
 	}
 	vhost.queues["test-queue"] = queue
@@ -181,26 +181,26 @@ func TestQosPrefetchLimit(t *testing.T) {
 	}
 
 	// Create connection and channel
-	conn := &Connection{
+	conn := &connection{
 		conn:     mockNetConn,
 		reader:   bufio.NewReader(mockNetConn),
 		writer:   bufio.NewWriter(mockNetConn),
 		server:   server,
-		channels: make(map[uint16]*Channel),
+		channels: make(map[uint16]*channel),
 		vhost:    vhost,
 	}
 
-	ch := &Channel{
+	ch := &channel{
 		id:              1,
 		conn:            conn,
 		consumers:       make(map[string]string),
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		prefetchCount:   2, // Set prefetch limit to 2
 	}
 	conn.channels[1] = ch
 
 	// Create consumer
-	consumer := &Consumer{
+	consumer := &consumer{
 		Tag:       "test-consumer",
 		ChannelId: 1,
 		NoAck:     false, // Important: noAck must be false for QoS to apply
@@ -253,27 +253,27 @@ func TestQosPrefetchLimit(t *testing.T) {
 // TestQosWithAck tests that acknowledging messages allows more to be delivered
 func TestQosWithAck(t *testing.T) {
 	server := NewServer()
-	vhost := &VHost{
+	vhost := &vHost{
 		name:      "/",
-		queues:    make(map[string]*Queue),
-		exchanges: make(map[string]*Exchange),
+		queues:    make(map[string]*queue),
+		exchanges: make(map[string]*exchange),
 	}
 	server.vhosts["/"] = vhost
 
 	// Create a queue with messages
-	queue := &Queue{
+	queue := &queue{
 		Name:      "test-queue",
-		Messages:  []Message{},
-		Consumers: make(map[string]*Consumer),
+		Messages:  []message{},
+		Consumers: make(map[string]*consumer),
 		Bindings:  make(map[string]bool),
 	}
 
 	// Add 5 messages
 	for i := 0; i < 5; i++ {
-		queue.Messages = append(queue.Messages, Message{
+		queue.Messages = append(queue.Messages, message{
 			Body:       []byte("test message"),
 			RoutingKey: "test",
-			Properties: Properties{},
+			Properties: properties{},
 		})
 	}
 	vhost.queues["test-queue"] = queue
@@ -285,27 +285,27 @@ func TestQosWithAck(t *testing.T) {
 	}
 
 	// Create connection and channel
-	conn := &Connection{
+	conn := &connection{
 		conn:     mockNetConn,
 		reader:   bufio.NewReader(mockNetConn),
 		writer:   bufio.NewWriter(mockNetConn),
 		server:   server,
-		channels: make(map[uint16]*Channel),
+		channels: make(map[uint16]*channel),
 		vhost:    vhost,
 	}
 
-	ch := &Channel{
+	ch := &channel{
 		id:              1,
 		conn:            conn,
 		consumers:       make(map[string]string),
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		prefetchCount:   1, // Prefetch limit of 1
 		deliveryTag:     0,
 	}
 	conn.channels[1] = ch
 
 	// Create consumer
-	consumer := &Consumer{
+	consumer := &consumer{
 		Tag:       "test-consumer",
 		ChannelId: 1,
 		NoAck:     false,
@@ -380,27 +380,27 @@ func TestQosWithAck(t *testing.T) {
 // TestQosNoAckMode tests that QoS doesn't apply when noAck is true
 func TestQosNoAckMode(t *testing.T) {
 	server := NewServer()
-	vhost := &VHost{
+	vhost := &vHost{
 		name:      "/",
-		queues:    make(map[string]*Queue),
-		exchanges: make(map[string]*Exchange),
+		queues:    make(map[string]*queue),
+		exchanges: make(map[string]*exchange),
 	}
 	server.vhosts["/"] = vhost
 
 	// Create a queue with messages
-	queue := &Queue{
+	queue := &queue{
 		Name:      "test-queue",
-		Messages:  []Message{},
-		Consumers: make(map[string]*Consumer),
+		Messages:  []message{},
+		Consumers: make(map[string]*consumer),
 		Bindings:  make(map[string]bool),
 	}
 
 	// Add 5 messages
 	for i := 0; i < 5; i++ {
-		queue.Messages = append(queue.Messages, Message{
+		queue.Messages = append(queue.Messages, message{
 			Body:       []byte("test message"),
 			RoutingKey: "test",
-			Properties: Properties{},
+			Properties: properties{},
 		})
 	}
 	vhost.queues["test-queue"] = queue
@@ -412,26 +412,26 @@ func TestQosNoAckMode(t *testing.T) {
 	}
 
 	// Create connection and channel
-	conn := &Connection{
+	conn := &connection{
 		conn:     mockNetConn,
 		reader:   bufio.NewReader(mockNetConn),
 		writer:   bufio.NewWriter(mockNetConn),
 		server:   server,
-		channels: make(map[uint16]*Channel),
+		channels: make(map[uint16]*channel),
 		vhost:    vhost,
 	}
 
-	ch := &Channel{
+	ch := &channel{
 		id:              1,
 		conn:            conn,
 		consumers:       make(map[string]string),
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		prefetchCount:   1, // This should be ignored for noAck
 	}
 	conn.channels[1] = ch
 
 	// Create consumer with noAck = true
-	consumer := &Consumer{
+	consumer := &consumer{
 		Tag:       "test-consumer",
 		ChannelId: 1,
 		NoAck:     true, // QoS should not apply
@@ -485,26 +485,26 @@ func TestQosPerChannel(t *testing.T) {
 		writeBuffer: bytes.NewBuffer([]byte{}),
 	}
 
-	conn := &Connection{
+	conn := &connection{
 		conn:     mockNetConn,
 		reader:   bufio.NewReader(mockNetConn),
 		writer:   bufio.NewWriter(mockNetConn),
 		server:   server,
-		channels: make(map[uint16]*Channel),
-		vhost:    &VHost{name: "/"},
+		channels: make(map[uint16]*channel),
+		vhost:    &vHost{name: "/"},
 	}
 
 	// Create two channels with different QoS settings
-	ch1 := &Channel{
+	ch1 := &channel{
 		id:              1,
 		conn:            conn,
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		consumers:       make(map[string]string),
 	}
-	ch2 := &Channel{
+	ch2 := &channel{
 		id:              2,
 		conn:            conn,
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		consumers:       make(map[string]string),
 	}
 
@@ -556,41 +556,41 @@ func TestQosPerChannel(t *testing.T) {
 // TestQosPrefetchSize tests that deliverMessages respects prefetch size limits
 func TestQosPrefetchSize(t *testing.T) {
 	server := NewServer()
-	vhost := &VHost{
+	vhost := &vHost{
 		name:      "/",
-		queues:    make(map[string]*Queue),
-		exchanges: make(map[string]*Exchange),
+		queues:    make(map[string]*queue),
+		exchanges: make(map[string]*exchange),
 	}
 	server.vhosts["/"] = vhost
 
 	// Create a queue with messages of different sizes
-	queue := &Queue{
+	queue := &queue{
 		Name:      "test-queue",
-		Messages:  []Message{},
-		Consumers: make(map[string]*Consumer),
+		Messages:  []message{},
+		Consumers: make(map[string]*consumer),
 		Bindings:  make(map[string]bool),
 	}
 
 	// Add messages with different sizes
 	// Small message (100 bytes)
-	queue.Messages = append(queue.Messages, Message{
+	queue.Messages = append(queue.Messages, message{
 		Body:       make([]byte, 100),
 		RoutingKey: "test",
-		Properties: Properties{},
+		Properties: properties{},
 	})
 
 	// Medium message (500 bytes)
-	queue.Messages = append(queue.Messages, Message{
+	queue.Messages = append(queue.Messages, message{
 		Body:       make([]byte, 500),
 		RoutingKey: "test",
-		Properties: Properties{},
+		Properties: properties{},
 	})
 
 	// Large message (1000 bytes)
-	queue.Messages = append(queue.Messages, Message{
+	queue.Messages = append(queue.Messages, message{
 		Body:       make([]byte, 1000),
 		RoutingKey: "test",
-		Properties: Properties{},
+		Properties: properties{},
 	})
 
 	vhost.queues["test-queue"] = queue
@@ -602,27 +602,27 @@ func TestQosPrefetchSize(t *testing.T) {
 	}
 
 	// Create connection and channel
-	conn := &Connection{
+	conn := &connection{
 		conn:     mockNetConn,
 		reader:   bufio.NewReader(mockNetConn),
 		writer:   bufio.NewWriter(mockNetConn),
 		server:   server,
-		channels: make(map[uint16]*Channel),
+		channels: make(map[uint16]*channel),
 		vhost:    vhost,
 	}
 
-	ch := &Channel{
+	ch := &channel{
 		id:              1,
 		conn:            conn,
 		consumers:       make(map[string]string),
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		prefetchSize:    1024, // Set size limit to ~1KB (accounting for overhead)
 		prefetchCount:   0,    // No count limit
 	}
 	conn.channels[1] = ch
 
 	// Create consumer
-	consumer := &Consumer{
+	consumer := &consumer{
 		Tag:       "test-consumer",
 		ChannelId: 1,
 		NoAck:     false,
@@ -682,27 +682,27 @@ func TestQosPrefetchSize(t *testing.T) {
 // TestQosSizeAndCount tests that both size and count limits are respected
 func TestQosSizeAndCount(t *testing.T) {
 	server := NewServer()
-	vhost := &VHost{
+	vhost := &vHost{
 		name:      "/",
-		queues:    make(map[string]*Queue),
-		exchanges: make(map[string]*Exchange),
+		queues:    make(map[string]*queue),
+		exchanges: make(map[string]*exchange),
 	}
 	server.vhosts["/"] = vhost
 
 	// Create a queue with small messages
-	queue := &Queue{
+	queue := &queue{
 		Name:      "test-queue",
-		Messages:  []Message{},
-		Consumers: make(map[string]*Consumer),
+		Messages:  []message{},
+		Consumers: make(map[string]*consumer),
 		Bindings:  make(map[string]bool),
 	}
 
 	// Add 10 small messages (50 bytes each)
 	for i := 0; i < 10; i++ {
-		queue.Messages = append(queue.Messages, Message{
+		queue.Messages = append(queue.Messages, message{
 			Body:       make([]byte, 50),
 			RoutingKey: "test",
-			Properties: Properties{},
+			Properties: properties{},
 		})
 	}
 
@@ -715,27 +715,27 @@ func TestQosSizeAndCount(t *testing.T) {
 	}
 
 	// Create connection and channel
-	conn := &Connection{
+	conn := &connection{
 		conn:     mockNetConn,
 		reader:   bufio.NewReader(mockNetConn),
 		writer:   bufio.NewWriter(mockNetConn),
 		server:   server,
-		channels: make(map[uint16]*Channel),
+		channels: make(map[uint16]*channel),
 		vhost:    vhost,
 	}
 
-	ch := &Channel{
+	ch := &channel{
 		id:              1,
 		conn:            conn,
 		consumers:       make(map[string]string),
-		unackedMessages: make(map[uint64]*UnackedMessage),
+		unackedMessages: make(map[uint64]*unackedMessage),
 		prefetchSize:    2048, // Size limit that would allow ~6-7 messages
 		prefetchCount:   3,    // But count limit is only 3
 	}
 	conn.channels[1] = ch
 
 	// Create consumer
-	consumer := &Consumer{
+	consumer := &consumer{
 		Tag:       "test-consumer",
 		ChannelId: 1,
 		NoAck:     false,

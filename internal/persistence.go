@@ -1,6 +1,7 @@
-package carrotmq
+package internal
 
 import (
+	"carrot-mq/logger"
 	"carrot-mq/storage"
 	"encoding/json"
 	"errors"
@@ -114,7 +115,7 @@ type MessageIndex struct {
 
 // Conversion helpers to map between domain objects and storage records
 
-func ExchangeToRecord(e *Exchange) *ExchangeRecord {
+func ExchangeToRecord(e *exchange) *ExchangeRecord {
 	return &ExchangeRecord{
 		Name:       e.Name,
 		Type:       e.Type,
@@ -126,8 +127,8 @@ func ExchangeToRecord(e *Exchange) *ExchangeRecord {
 	}
 }
 
-func RecordToExchange(r *ExchangeRecord) *Exchange {
-	return &Exchange{
+func RecordToExchange(r *ExchangeRecord) *exchange {
+	return &exchange{
 		Name:       r.Name,
 		Type:       r.Type,
 		Durable:    r.Durable,
@@ -137,7 +138,7 @@ func RecordToExchange(r *ExchangeRecord) *Exchange {
 	}
 }
 
-func QueueToRecord(q *Queue) *QueueRecord {
+func QueueToRecord(q *queue) *QueueRecord {
 	return &QueueRecord{
 		Name:       q.Name,
 		Durable:    q.Durable,
@@ -148,19 +149,19 @@ func QueueToRecord(q *Queue) *QueueRecord {
 	}
 }
 
-func RecordToQueue(r *QueueRecord) *Queue {
-	return &Queue{
+func RecordToQueue(r *QueueRecord) *queue {
+	return &queue{
 		Name:       r.Name,
-		Messages:   []Message{},
+		Messages:   []message{},
 		Bindings:   make(map[string]bool),
-		Consumers:  make(map[string]*Consumer),
+		Consumers:  make(map[string]*consumer),
 		Durable:    r.Durable,
 		Exclusive:  r.Exclusive,
 		AutoDelete: r.AutoDelete,
 	}
 }
 
-func MessageToRecord(m *Message, id string, sequence int64) *MessageRecord {
+func MessageToRecord(m *message, id string, sequence int64) *MessageRecord {
 	return &MessageRecord{
 		ID:         id,
 		Exchange:   m.Exchange,
@@ -190,13 +191,13 @@ func MessageToRecord(m *Message, id string, sequence int64) *MessageRecord {
 	}
 }
 
-func RecordToMessage(r *MessageRecord) *Message {
-	return &Message{
+func RecordToMessage(r *MessageRecord) *message {
+	return &message{
 		Exchange:   r.Exchange,
 		RoutingKey: r.RoutingKey,
 		Mandatory:  r.Mandatory,
 		Immediate:  r.Immediate,
-		Properties: Properties{
+		Properties: properties{
 			ContentType:     r.Properties.ContentType,
 			ContentEncoding: r.Properties.ContentEncoding,
 			Headers:         r.Headers,
@@ -224,14 +225,14 @@ func RecordToMessage(r *MessageRecord) *Message {
 // but has no knowledge of the Server or business logic
 type PersistenceManager struct {
 	storage    storage.StorageProvider
-	logger     Logger
+	logger     logger.Logger
 	messageSeq atomic.Int64 // Global message sequence counter
 
 	// per-queue mutexes for message operations
 	queueMutexes sync.Map // map[string]*sync.Mutex where key is "vhost:queue"
 }
 
-func NewPersistenceManager(storage storage.StorageProvider, logger Logger) *PersistenceManager {
+func NewPersistenceManager(storage storage.StorageProvider, logger logger.Logger) *PersistenceManager {
 	return &PersistenceManager{
 		storage: storage,
 		logger:  logger,
