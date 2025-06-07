@@ -3,11 +3,12 @@
 package carrotmq
 
 import (
-	"carrot-mq/config"
-	"carrot-mq/internal"
-	"carrot-mq/logger"
-	"carrot-mq/storage"
 	"context"
+
+	"github.com/aleybovich/carrot-mq/config"
+	"github.com/aleybovich/carrot-mq/internal"
+	"github.com/aleybovich/carrot-mq/logger"
+	"github.com/aleybovich/carrot-mq/storage"
 )
 
 // Server represents a CarrotMQ server instance.

@@ -1,8 +1,6 @@
 package internal
 
 import (
-	"carrot-mq/logger"
-	"carrot-mq/storage"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +8,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/aleybovich/carrot-mq/logger"
+	"github.com/aleybovich/carrot-mq/storage"
 )
 
 // Helper functions to construct storage keys

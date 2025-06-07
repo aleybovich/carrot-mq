@@ -2,8 +2,6 @@ package internal
 
 import (
 	"bytes"
-	amqpError "carrot-mq/amqperror"
-	"carrot-mq/config"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -11,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	amqpError "github.com/aleybovich/carrot-mq/amqperror"
+	"github.com/aleybovich/carrot-mq/config"
 )
 
 func (c *connection) handleMethodConnectionStartOk(reader *bytes.Reader) error {

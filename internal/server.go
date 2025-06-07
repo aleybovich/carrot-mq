@@ -3,10 +3,6 @@ package internal
 import (
 	"bufio"
 	"bytes"
-	amqpError "carrot-mq/amqperror"
-	"carrot-mq/config"
-	"carrot-mq/logger"
-	"carrot-mq/storage"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -21,6 +17,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	amqpError "github.com/aleybovich/carrot-mq/amqperror"
+	"github.com/aleybovich/carrot-mq/config"
+	"github.com/aleybovich/carrot-mq/logger"
+	"github.com/aleybovich/carrot-mq/storage"
 )
 
 // How log to wait until cleanup if channel Close Ok not received from client

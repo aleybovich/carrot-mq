@@ -1,8 +1,9 @@
 package main
 
 import (
-	"carrot-mq/internal"
 	"os"
+
+	"github.com/aleybovich/carrot-mq/internal"
 )
 
 func main() {

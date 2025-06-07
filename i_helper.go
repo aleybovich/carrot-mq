@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"carrot-mq/internal"
+	"github.com/aleybovich/carrot-mq/internal"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"

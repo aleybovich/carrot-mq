@@ -1,8 +1,9 @@
 package internal
 
 import (
-	"carrot-mq/config"
 	"testing"
+
+	"github.com/aleybovich/carrot-mq/config"
 
 	"github.com/stretchr/testify/assert"
 )

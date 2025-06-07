@@ -1,12 +1,13 @@
 package internal
 
 import (
-	"carrot-mq/storage"
 	"context"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aleybovich/carrot-mq/storage"
 
 	"github.com/stretchr/testify/require"
 )
@@ -49,6 +50,7 @@ func createServerWithStorage(storage *TestStorageWrapper) *server {
 // =============================================================================
 
 func TestVHostPersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	// Create a single storage instance that will be reused
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close() // Clean up at the end
@@ -125,6 +127,7 @@ func TestVHostPersistence(t *testing.T) {
 // =============================================================================
 
 func TestExchangePersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -203,6 +206,7 @@ func TestExchangePersistence(t *testing.T) {
 // =============================================================================
 
 func TestQueuePersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -293,6 +297,7 @@ func TestQueuePersistence(t *testing.T) {
 // =============================================================================
 
 func TestBindingPersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -407,6 +412,7 @@ func TestBindingPersistence(t *testing.T) {
 // =============================================================================
 
 func TestMessagePersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -511,6 +517,7 @@ func TestMessagePersistence(t *testing.T) {
 // =============================================================================
 
 func TestMessageAcknowledgmentPersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -607,6 +614,7 @@ func TestMessageAcknowledgmentPersistence(t *testing.T) {
 // =============================================================================
 
 func TestTransactionMessagePersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -683,6 +691,7 @@ func TestTransactionMessagePersistence(t *testing.T) {
 // =============================================================================
 
 func TestCompleteScenario(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	// This test simulates a complete scenario:
 	// 1. Create vhost, exchanges, queues, bindings
 	// 2. Publish messages
@@ -944,6 +953,7 @@ func TestCompleteScenario(t *testing.T) {
 // =============================================================================
 
 func TestPersistenceErrorHandling(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	// Test that server continues to work even if persistence fails
 
 	// Create a storage provider that fails
@@ -1045,6 +1055,7 @@ func (f *FailingStorageProvider) BeginTx() (storage.StorageTransaction, error) {
 // =============================================================================
 
 func TestSequenceCounterPersistence(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -1151,6 +1162,7 @@ func TestSequenceCounterPersistence(t *testing.T) {
 }
 
 func TestSequenceCounterInTransaction(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -1218,6 +1230,7 @@ func TestSequenceCounterInTransaction(t *testing.T) {
 }
 
 func TestSequenceCounterConcurrent(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
@@ -1309,6 +1322,7 @@ func TestSequenceCounterConcurrent(t *testing.T) {
 // Concurrent Persistence Operations
 // =============================================================================
 func TestConcurrentPersistenceOperations(t *testing.T) {
+	IsTerminal = true // Force colorized output for server logs during tests
 	storage := createTestStorage()
 	defer storage.StorageProvider.Close()
 
