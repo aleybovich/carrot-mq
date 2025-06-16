@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.1]
+
+### Added
+- `IsReady()` method to Server interface and public API for checking if server is ready to accept connections
+
 ## [0.2.0]
 
 ### Changed

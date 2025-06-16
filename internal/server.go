@@ -48,6 +48,7 @@ type Server interface {
 	Start(addr string) error
 	Shutdown(ctx context.Context) error
 	Logger() logger.Logger
+	IsReady() bool
 }
 
 type frame struct {
@@ -246,6 +247,7 @@ type server struct {
 	internalLogger *log.Logger   // Internal logger for formatting output
 	customLogger   logger.Logger // External logger interface, if provided
 	mu             sync.RWMutex
+	isReady        atomic.Bool   // Track if server is ready to accept connections
 
 	// Authentication fields
 	authMode    config.AuthMode
@@ -582,6 +584,10 @@ func (s *server) Logger() logger.Logger {
 	return s
 }
 
+func (s *server) IsReady() bool {
+	return s.isReady.Load()
+}
+
 func NewServer(opts ...ServerOption) *server {
 	var logPrefix string
 	if IsTerminal {
@@ -638,6 +644,12 @@ func (s *server) Start(addr string) error {
 		return err
 	}
 	s.Info("Server listening on %s", addr)
+	
+	// Mark server as ready after listener is successfully created
+	s.isReady.Store(true)
+	
+	// Ensure isReady is set to false when Start exits
+	defer s.isReady.Store(false)
 
 	for {
 		conn, err := s.listener.Accept()
@@ -657,6 +669,9 @@ func (s *server) Start(addr string) error {
 
 func (s *server) Shutdown(ctx context.Context) error {
 	s.Info("Shutting down AMQP server...")
+	
+	// Mark server as not ready
+	s.isReady.Store(false)
 
 	// 1. Stop accepting new connections
 	if s.listener != nil {

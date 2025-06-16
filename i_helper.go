@@ -53,8 +53,23 @@ func setupTestServer(t *testing.T, opts ...ServerOption) (addr string, cleanup f
 		}
 	}()
 
-	// Wait a bit for server to start
-	time.Sleep(200 * time.Millisecond)
+	// Wait for server to be ready using IsReady instead of hardcoded sleep
+	readyTimeout := time.After(1 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	
+	ready := false
+	for !ready {
+		select {
+		case <-readyTimeout:
+			t.Fatalf("Timeout waiting for test server to be ready on %s", addr)
+		case <-ticker.C:
+			if s.IsReady() {
+				// Server is ready
+				ready = true
+			}
+		}
+	}
 
 	cleanup = func() {
 		err := s.Shutdown(context.TODO())

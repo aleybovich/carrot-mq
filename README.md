@@ -41,17 +41,79 @@ This project implements core functionality of the AMQP 0-9-1 protocol (the proto
 package main
 
 import (
+    "context"
     "log"
     "os"
+    "time"
     // If NewServer and other types are in a different package, adjust imports.
     // For this example, assume they are in the 'main' package or accessible.
 )
 
 func main() {
     server := NewServer() // Or NewServer(options...)
-    if err := server.Start(":5672"); err != nil {
-        log.Fatalf("Failed to start server: %v", err)
-        os.Exit(1)
+    
+    // Start server in a goroutine
+    go func() {
+        if err := server.Start(":5672"); err != nil {
+            log.Fatalf("Failed to start server: %v", err)
+        }
+    }()
+    
+    // Wait for server to be ready with timeout
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    ticker := time.NewTicker(10 * time.Millisecond)
+    defer ticker.Stop()
+    
+    ready := false
+    for !ready {
+        select {
+        case <-ctx.Done():
+            log.Fatal("Timeout waiting for server to start")
+        case <-ticker.C:
+            if server.IsReady() {
+                log.Println("Server is ready to accept connections")
+                ready = true
+            }
+        }
+    }
+    
+    // Server is now running...
+    // Add signal handling for graceful shutdown as needed
+}
+```
+
+### Checking Server Readiness
+
+The server provides an `IsReady()` method that returns `true` when the server has started and is ready to accept connections. This is useful for:
+- Health checks in containerized environments
+- Ensuring the server is fully initialized before running tests
+- Coordinating startup in multi-service applications
+
+```go
+// Simple check if server is ready
+if server.IsReady() {
+    // Server is accepting connections
+}
+
+// Wait for server readiness with timeout
+func waitForServerReady(server *Server, timeout time.Duration) error {
+    ctx, cancel := context.WithTimeout(context.Background(), timeout)
+    defer cancel()
+    
+    ticker := time.NewTicker(10 * time.Millisecond)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return fmt.Errorf("server did not become ready: %w", ctx.Err())
+        case <-ticker.C:
+            if server.IsReady() {
+                return nil // Server is ready
+            }
+        }
     }
 }
 ```

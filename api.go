@@ -57,6 +57,13 @@ func (s *Server) Logger() logger.Logger {
 	return s.srv.Logger()
 }
 
+// IsReady returns true when the server has started and is ready to accept connections.
+// This can be useful for health checks or ensuring the server is fully initialized
+// before attempting to connect clients.
+func (s *Server) IsReady() bool {
+	return s.srv.IsReady()
+}
+
 // NewServer creates a new CarrotMQ server with the provided options.
 func NewServer(opts ...ServerOption) *Server {
 	options := &serverOptions{}

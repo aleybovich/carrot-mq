@@ -1,6 +1,7 @@
 package carrotmq
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -22,6 +23,62 @@ func TestServerConnection(t *testing.T) {
 	ch, err := conn.Channel()
 	require.NoError(t, err, "Should open channel successfully")
 	defer ch.Close()
+}
+
+func TestServerIsReady(t *testing.T) {
+	// Create server but don't start it yet
+	s := NewServer()
+	
+	// Before starting, IsReady should return false
+	assert.False(t, s.IsReady(), "Server should not be ready before Start is called")
+	
+	// Get a test port
+	addr := getNextTestPort()
+	
+	// Start server in a goroutine
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- s.Start(addr)
+	}()
+	
+	// Wait for server to be ready with timeout
+	readyTimeout := time.After(1 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	
+	ready := false
+	for !ready {
+		select {
+		case <-readyTimeout:
+			t.Fatal("Timeout waiting for server to be ready")
+		case <-ticker.C:
+			if s.IsReady() {
+				// Server is ready, verify it accepts connections
+				conn, err := amqp.Dial("amqp://" + addr)
+				require.NoError(t, err, "Should connect to ready server")
+				conn.Close()
+				ready = true
+			}
+		}
+	}
+	// Shutdown the server
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	err := s.Shutdown(ctx)
+	require.NoError(t, err, "Server shutdown should succeed")
+	
+	// After shutdown, IsReady should return false
+	assert.False(t, s.IsReady(), "Server should not be ready after Shutdown is called")
+	
+	// Wait for server goroutine to exit
+	select {
+	case err := <-serverDone:
+		// Server should exit cleanly (nil error expected)
+		assert.NoError(t, err, "Server Start should return without error after shutdown")
+	case <-time.After(1 * time.Second):
+		t.Fatal("Timeout waiting for server goroutine to exit")
+	}
 }
 
 func TestConnection_ClientInitiatedClose(t *testing.T) {
