@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2]
+
+### Fixed
+- Server now properly sends heartbeats to clients, preventing connection timeouts during idle periods
+- Implemented bidirectional heartbeat mechanism as required by AMQP 0-9-1 specification
+
+### Added
+- Comprehensive heartbeat integration tests demonstrating the necessity of server-side heartbeats
+
 ## [0.2.1]
 
 ### Added

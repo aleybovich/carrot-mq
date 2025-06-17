@@ -226,6 +226,9 @@ type connection struct {
 	heartbeatInterval uint16
 
 	username string // Store authenticated username
+	
+	// heartbeat management
+	heartbeatStop chan struct{}
 }
 
 type consumer struct {
@@ -1107,6 +1110,42 @@ func (c *connection) writeFrame(frame *frame) error {
 		return err
 	}
 	return c.writer.Flush()
+}
+
+// sendHeartbeat sends a heartbeat frame to the client
+func (c *connection) sendHeartbeat() error {
+	return c.writeFrame(&frame{
+		Type:    FrameHeartbeat,
+		Channel: 0,
+		Payload: []byte{},
+	})
+}
+
+// startHeartbeat starts sending heartbeats at the negotiated interval
+func (c *connection) startHeartbeat() {
+	c.heartbeatStop = make(chan struct{})
+	
+	// Calculate heartbeat interval - send at half the negotiated interval
+	// as per AMQP spec recommendation
+	interval := time.Duration(c.heartbeatInterval) * time.Second / 2
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	
+	c.server.Info("Started heartbeat sender for %s with interval %v", c.conn.RemoteAddr(), interval)
+	
+	for {
+		select {
+		case <-ticker.C:
+			if err := c.sendHeartbeat(); err != nil {
+				c.server.Err("Error sending heartbeat to %s: %v", c.conn.RemoteAddr(), err)
+				return
+			}
+			c.server.Debug("Sent heartbeat to %s", c.conn.RemoteAddr())
+		case <-c.heartbeatStop:
+			c.server.Info("Stopped heartbeat sender for %s", c.conn.RemoteAddr())
+			return
+		}
+	}
 }
 
 func (c *connection) sendConnectionStart() error { // MODIFIED: to return error
@@ -2414,6 +2453,12 @@ func (c *connection) cleanupConnectionResources() {
 	vhost := c.vhost
 
 	c.server.Info("Cleaning up resources for connection %s", c.conn.RemoteAddr())
+	
+	// Stop heartbeat sender if running
+	if c.heartbeatStop != nil {
+		close(c.heartbeatStop)
+	}
+	
 	c.mu.Lock() // Lock the connection to safely iterate over channels
 
 	// NEW: Collect queue names that will need dispatch attempts

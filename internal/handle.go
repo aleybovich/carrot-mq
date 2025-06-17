@@ -126,6 +126,12 @@ func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 
 	c.server.Info("Connection parameters negotiated: channelMax=%d, frameMax=%d, heartbeat=%d",
 		c.channelMax, c.frameMax, c.heartbeatInterval)
+
+	// Start heartbeat sender if heartbeat is enabled
+	if c.heartbeatInterval > 0 {
+		go c.startHeartbeat()
+	}
+
 	return nil
 }
 
