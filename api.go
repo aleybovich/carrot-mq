@@ -85,7 +85,7 @@ func NewServer(opts ...ServerOption) *Server {
 // If not used, a default logger that writes to stdout will be used.
 func WithLogger(l logger.Logger) ServerOption {
 	return func(opts *serverOptions) {
-		opts.internalOpts = append(opts.internalOpts, internal.WithLogger(l))
+		opts.internalOpts = append(opts.internalOpts, internal.WithLoggingConfig(config.LoggingConfig{CustomLogger: l}))
 	}
 }
 

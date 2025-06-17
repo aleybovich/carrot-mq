@@ -491,17 +491,59 @@ if err != nil {
 // err = channel.TxRollback()
 ```
 
-## Custom Logging Integration
+## Logging Configuration
 
-The server supports pluggable logging through the `Logger` interface:
+The server provides comprehensive logging configuration through the `LoggingConfig` struct:
 
 ```go
-// Create a server with custom logger
+// Configure logging options
+server := NewServer(
+    WithLoggingConfig(config.LoggingConfig{
+        HeartbeatLogging: true,        // Enable heartbeat message logging (default: false)
+        DisableLogging: false,         // Disable all logging (default: false)
+        CustomLogger: myCustomLogger,  // Use custom logger implementation (optional)
+    }),
+)
+```
+
+### Configuration Options
+
+- **HeartbeatLogging**: Controls whether heartbeat messages are logged. Default is `false` to reduce log noise in production.
+- **DisableLogging**: Completely disables all logging when set to `true`. Uses a no-op logger internally.
+- **CustomLogger**: Allows providing a custom logger that implements the `Logger` interface (see below).
+
+**Note**: `CustomLogger` and `DisableLogging` cannot be used together as they conflict.
+
+### Examples
+
+```go
+// Enable heartbeat logging only
+server := NewServer(
+    WithLoggingConfig(config.LoggingConfig{
+        HeartbeatLogging: true,
+    }),
+)
+
+// Disable all logging
+server := NewServer(
+    WithLoggingConfig(config.LoggingConfig{
+        DisableLogging: true,
+    }),
+)
+
+// Use custom logger with heartbeat logging
 myLogger := NewCustomLogger() // You need to implement the Logger interface
-server := NewServer(WithLogger(myLogger))
+server := NewServer(
+    WithLoggingConfig(config.LoggingConfig{
+        CustomLogger: myLogger,
+        HeartbeatLogging: true,
+    }),
+)
 ```
 
 ### Logger Interface
+
+To implement a custom logger, implement this interface:
 
 ```go
 type Logger interface {

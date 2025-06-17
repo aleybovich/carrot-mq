@@ -226,7 +226,7 @@ type connection struct {
 	heartbeatInterval uint16
 
 	username string // Store authenticated username
-	
+
 	// heartbeat management
 	heartbeatStop chan struct{}
 }
@@ -239,18 +239,13 @@ type consumer struct {
 	stopCh    chan struct{} // Signal to stop this consumer
 }
 
-type credentials struct {
-	Username string
-	Password string
-}
-
 type server struct {
 	listener       net.Listener
 	vhosts         map[string]*vHost
 	internalLogger *log.Logger   // Internal logger for formatting output
 	customLogger   logger.Logger // External logger interface, if provided
 	mu             sync.RWMutex
-	isReady        atomic.Bool   // Track if server is ready to accept connections
+	isReady        atomic.Bool // Track if server is ready to accept connections
 
 	// Authentication fields
 	authMode    config.AuthMode
@@ -262,6 +257,9 @@ type server struct {
 
 	// Persistence fields
 	persistenceManager *PersistenceManager
+
+	// Logging configuration
+	loggingConfig config.LoggingConfig
 }
 
 type amqpDecimal struct {
@@ -271,13 +269,6 @@ type amqpDecimal struct {
 
 // ServerOption defines functional options for configuring the AMQP server
 type ServerOption func(*server)
-
-// WithLogger sets a custom logger that implements the Logger interface
-func WithLogger(logger logger.Logger) ServerOption {
-	return func(s *server) {
-		s.customLogger = logger
-	}
-}
 
 func WithAuth(credentials map[string]string) ServerOption {
 	return func(s *server) {
@@ -473,6 +464,26 @@ func WithStorageProvider(provider storage.StorageProvider) ServerOption {
 	}
 }
 
+// WithLoggingConfig sets the logging configuration for the server
+func WithLoggingConfig(cfg config.LoggingConfig) ServerOption {
+	return func(s *server) {
+		// Validate that CustomLogger and DisableLogging are not both set
+		if cfg.CustomLogger != nil && cfg.DisableLogging {
+			panic("LoggingConfig: cannot set both CustomLogger and DisableLogging")
+		}
+
+		s.loggingConfig = cfg
+
+		// Apply custom logger if provided
+		if cfg.CustomLogger != nil {
+			s.customLogger = cfg.CustomLogger
+		} else if cfg.DisableLogging {
+			// If logging is disabled, use NilLogger
+			s.customLogger = &logger.NilLogger{}
+		}
+	}
+}
+
 // Get caller function name for logging
 func getCallerName() string {
 	pc, _, _, _ := runtime.Caller(2) // Use depth 2 to get the actual caller, not the logging function
@@ -614,7 +625,8 @@ func NewServer(opts ...ServerOption) *server {
 	}
 
 	// If no custom logger is provided, use the server itself as the logger
-	if s.customLogger == nil {
+	// unless logging is disabled
+	if s.customLogger == nil && !s.loggingConfig.DisableLogging {
 		s.customLogger = s
 	}
 
@@ -647,10 +659,10 @@ func (s *server) Start(addr string) error {
 		return err
 	}
 	s.Info("Server listening on %s", addr)
-	
+
 	// Mark server as ready after listener is successfully created
 	s.isReady.Store(true)
-	
+
 	// Ensure isReady is set to false when Start exits
 	defer s.isReady.Store(false)
 
@@ -672,7 +684,7 @@ func (s *server) Start(addr string) error {
 
 func (s *server) Shutdown(ctx context.Context) error {
 	s.Info("Shutting down AMQP server...")
-	
+
 	// Mark server as not ready
 	s.isReady.Store(false)
 
@@ -1124,15 +1136,17 @@ func (c *connection) sendHeartbeat() error {
 // startHeartbeat starts sending heartbeats at the negotiated interval
 func (c *connection) startHeartbeat() {
 	c.heartbeatStop = make(chan struct{})
-	
+
 	// Calculate heartbeat interval - send at half the negotiated interval
 	// as per AMQP spec recommendation
 	interval := time.Duration(c.heartbeatInterval) * time.Second / 2
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	
-	c.server.Info("Started heartbeat sender for %s with interval %v", c.conn.RemoteAddr(), interval)
-	
+
+	if c.server.loggingConfig.HeartbeatLogging {
+		c.server.Info("Started heartbeat sender for %s with interval %v", c.conn.RemoteAddr(), interval)
+	}
+
 	for {
 		select {
 		case <-ticker.C:
@@ -1140,9 +1154,13 @@ func (c *connection) startHeartbeat() {
 				c.server.Err("Error sending heartbeat to %s: %v", c.conn.RemoteAddr(), err)
 				return
 			}
-			c.server.Debug("Sent heartbeat to %s", c.conn.RemoteAddr())
+			if c.server.loggingConfig.HeartbeatLogging {
+				c.server.Debug("Sent heartbeat to %s", c.conn.RemoteAddr())
+			}
 		case <-c.heartbeatStop:
-			c.server.Info("Stopped heartbeat sender for %s", c.conn.RemoteAddr())
+			if c.server.loggingConfig.HeartbeatLogging {
+				c.server.Info("Stopped heartbeat sender for %s", c.conn.RemoteAddr())
+			}
 			return
 		}
 	}
@@ -2453,12 +2471,12 @@ func (c *connection) cleanupConnectionResources() {
 	vhost := c.vhost
 
 	c.server.Info("Cleaning up resources for connection %s", c.conn.RemoteAddr())
-	
+
 	// Stop heartbeat sender if running
 	if c.heartbeatStop != nil {
 		close(c.heartbeatStop)
 	}
-	
+
 	c.mu.Lock() // Lock the connection to safely iterate over channels
 
 	// NEW: Collect queue names that will need dispatch attempts

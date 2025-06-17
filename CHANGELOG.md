@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.3]
+
+### Added
+- Configurable logging with `LoggingConfig` struct via `WithLoggingConfig` server option
+- Ability to disable all logging with `DisableLogging` flag
+- Ability to provide custom logger implementations via `CustomLogger` field
+- Control over heartbeat message logging with `HeartbeatLogging` flag (disabled by default)
+
+### Changed
+- Consolidated all logging configuration into a single `WithLoggingConfig` option
+- Removed separate `WithLogger` function in favor of unified configuration approach
+
 ## [0.2.2]
 
 ### Fixed

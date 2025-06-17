@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/aleybovich/carrot-mq/config"
 )
 
 // MockLogger implements the Logger interface for testing
@@ -111,7 +113,7 @@ func TestCustomLogger(t *testing.T) {
 	mockLogger := NewMockLogger(t)
 
 	// Create a s with the custom logger
-	s := NewServer(WithLogger(mockLogger))
+	s := NewServer(WithLoggingConfig(config.LoggingConfig{CustomLogger: mockLogger}))
 
 	// Verify that the server uses our custom logger
 	if s.customLogger != mockLogger {
@@ -164,7 +166,7 @@ func TestCustomLogger(t *testing.T) {
 		}
 
 		// Override Fatal to not call os.Exit
-		testServer := &TestServer{server: NewServer(WithLogger(mockLogger))}
+		testServer := &TestServer{server: NewServer(WithLoggingConfig(config.LoggingConfig{CustomLogger: mockLogger}))}
 
 		// The real Fatal method would call os.Exit(1), but our mock logger just records it
 		testServer.Fatal("Test fatal message: %s", "critical error")
