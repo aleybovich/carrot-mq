@@ -1,6 +1,8 @@
 package carrotmq
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -183,4 +185,126 @@ func TestHeartbeatWithActiveTraffic(t *testing.T) {
 	// Stop publishing
 	close(stopPublishing)
 	publishWg.Wait()
+}
+
+// TestConfigurableHeartbeatInterval verifies that the server can be configured with a custom heartbeat interval
+func TestConfigurableHeartbeatInterval(t *testing.T) {
+	// Test with different heartbeat intervals
+	testCases := []struct {
+		name               string
+		serverHeartbeat    uint16
+		clientHeartbeat    time.Duration
+		expectedNegotiated uint16
+	}{
+		{
+			name:               "Server suggests 30s, client requests 30s",
+			serverHeartbeat:    30,
+			clientHeartbeat:    30 * time.Second,
+			expectedNegotiated: 30,
+		},
+		{
+			name:               "Server suggests 10s, client requests 20s",
+			serverHeartbeat:    10,
+			clientHeartbeat:    20 * time.Second,
+			expectedNegotiated: 10, // Should use the smaller value
+		},
+		{
+			name:               "Server suggests 120s, client requests 60s",
+			serverHeartbeat:    120,
+			clientHeartbeat:    60 * time.Second,
+			expectedNegotiated: 60, // Should use the smaller value
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a mock logger to capture server logs
+			mockLogger := &mockLogger{
+				logs: make([]string, 0),
+				mu:   sync.Mutex{},
+			}
+
+			// Setup server with custom heartbeat interval and mock logger
+			addr, cleanup := setupTestServer(t,
+				WithInMemoryStorage(),
+				WithHeartbeatInterval(tc.serverHeartbeat),
+				WithLogger(mockLogger),
+			)
+			defer cleanup()
+
+			// Connect with client-requested heartbeat
+			config := amqp.Config{
+				Heartbeat: tc.clientHeartbeat,
+			}
+
+			conn, err := amqp.DialConfig("amqp://"+addr, config)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			// Give a moment for connection negotiation to complete
+			time.Sleep(100 * time.Millisecond)
+
+			// Check the logs for the negotiated heartbeat value
+			mockLogger.mu.Lock()
+			logs := mockLogger.logs
+			mockLogger.mu.Unlock()
+
+			// Look for the log entry that contains the negotiated heartbeat
+			foundNegotiated := false
+			for _, log := range logs {
+				// Look for log entries that mention connection parameters negotiated
+				if strings.Contains(log, "Connection parameters negotiated:") {
+					// Extract the heartbeat value from the log
+					// Format: "Connection parameters negotiated: channelMax=%d, frameMax=%d, heartbeat=%d"
+					var channelMax, heartbeat uint16
+					var frameMax uint32
+					_, err := fmt.Sscanf(log, "Connection parameters negotiated: channelMax=%d, frameMax=%d, heartbeat=%d",
+						&channelMax, &frameMax, &heartbeat)
+					if err == nil {
+						require.Equal(t, tc.expectedNegotiated, heartbeat,
+							"Negotiated heartbeat should match expected value")
+						foundNegotiated = true
+						t.Logf("✓ Found negotiated heartbeat: %d seconds", heartbeat)
+						break
+					}
+				}
+			}
+
+			require.True(t, foundNegotiated, "Should find negotiated heartbeat in logs")
+		})
+	}
+}
+
+// mockLogger implements logger.Logger interface for testing
+type mockLogger struct {
+	logs []string
+	mu   sync.Mutex
+}
+
+func (m *mockLogger) log(_, format string, a ...any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	msg := fmt.Sprintf(format, a...)
+	m.logs = append(m.logs, msg)
+}
+
+func (m *mockLogger) Fatal(format string, a ...any) {
+	m.log("FATAL", format, a...)
+	panic(fmt.Sprintf(format, a...))
+}
+
+func (m *mockLogger) Err(format string, a ...any) {
+	m.log("ERROR", format, a...)
+}
+
+func (m *mockLogger) Warn(format string, a ...any) {
+	m.log("WARN", format, a...)
+}
+
+func (m *mockLogger) Info(format string, a ...any) {
+	m.log("INFO", format, a...)
+}
+
+func (m *mockLogger) Debug(format string, a ...any) {
+	m.log("DEBUG", format, a...)
 }

@@ -154,3 +154,12 @@ func WithStorageProvider(provider storage.StorageProvider) ServerOption {
 		opts.internalOpts = append(opts.internalOpts, internal.WithStorageProvider(provider))
 	}
 }
+
+// WithHeartbeatInterval configures the suggested heartbeat interval in seconds.
+// The default is 60 seconds if not specified. The client and server will negotiate
+// the actual heartbeat interval during connection establishment.
+func WithHeartbeatInterval(interval uint16) ServerOption {
+	return func(opts *serverOptions) {
+		opts.internalOpts = append(opts.internalOpts, internal.WithHeartbeatInterval(interval))
+	}
+}

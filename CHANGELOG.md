@@ -9,11 +9,13 @@
 - Ability to provide custom logger implementations via `CustomLogger` field
 - Control over heartbeat message logging with `HeartbeatLogging` flag (disabled by default)
 - Implemented connection closure on client heartbeat timeout as per amqp091 protocol specification
+- Configurable heartbeat interval via `WithHeartbeatInterval` server option (default: 60 seconds)
 
 ### Changed
 - Consolidated all logging configuration into a single `WithLoggingConfig` option
 - Removed separate `WithLogger` function in favor of unified configuration approach
 - Refactored exclusive consumer validation to perform all checks before modifying state
+- Heartbeat interval is now configurable instead of hardcoded constant
 
 ### Fixed
 - Test for exclusive consumer access now properly uses channel error notifications instead of expecting immediate errors

@@ -264,6 +264,9 @@ type server struct {
 
 	// Logging configuration
 	loggingConfig config.LoggingConfig
+
+	// AMQP configuration
+	heartbeatInterval uint16 // Heartbeat interval in seconds
 }
 
 type amqpDecimal struct {
@@ -488,6 +491,15 @@ func WithLoggingConfig(cfg config.LoggingConfig) ServerOption {
 	}
 }
 
+// WithHeartbeatInterval configures the suggested heartbeat interval in seconds.
+// The default is 60 seconds if not specified.
+func WithHeartbeatInterval(interval uint16) ServerOption {
+	return func(s *server) {
+		s.heartbeatInterval = interval
+		s.Info("Heartbeat interval configured to %d seconds", interval)
+	}
+}
+
 // Get caller function name for logging
 func getCallerName() string {
 	pc, _, _, _ := runtime.Caller(2) // Use depth 2 to get the actual caller, not the logging function
@@ -615,9 +627,10 @@ func NewServer(opts ...ServerOption) *server {
 	}
 
 	s := &server{
-		vhosts:         make(map[string]*vHost),
-		internalLogger: log.New(os.Stdout, logPrefix, log.LstdFlags|log.Lmicroseconds),
-		connections:    make(map[*connection]struct{}),
+		vhosts:            make(map[string]*vHost),
+		internalLogger:    log.New(os.Stdout, logPrefix, log.LstdFlags|log.Lmicroseconds),
+		connections:       make(map[*connection]struct{}),
+		heartbeatInterval: suggestedHeartbeatInterval, // Default to 60 seconds
 	}
 
 	// Create default vhost
@@ -1401,8 +1414,8 @@ func (c *connection) sendConnectionTune() error {
 	// frameMax: suggested max frame size (including header and end byte)
 	binary.Write(payload, binary.BigEndian, uint32(suggestedFrameMaxSize))
 
-	// heartbeat: suggested heartbeat interval in seconds
-	binary.Write(payload, binary.BigEndian, uint16(suggestedHeartbeatInterval))
+	// heartbeat: suggested heartbeat interval in seconds (use server's configured value)
+	binary.Write(payload, binary.BigEndian, uint16(c.server.heartbeatInterval))
 
 	if err := c.writeFrame(&frame{
 		Type:    FrameMethod,
