@@ -219,10 +219,7 @@ func TestConsumerExclusiveConflict(t *testing.T) {
 	ch2, err := conn2.Channel()
 	require.NoError(t, err)
 
-	// Set up channel error notification
-	chErrors := ch2.NotifyClose(make(chan *amqp.Error, 1))
-
-	// This should trigger a channel close due to exclusive consumer
+	// This should trigger an error due to exclusive consumer
 	_, err = ch2.Consume(
 		qName,            // queue
 		"test-consumer2", // consumer
@@ -232,17 +229,13 @@ func TestConsumerExclusiveConflict(t *testing.T) {
 		false,            // no-wait
 		nil,              // args
 	)
-	require.NoError(t, err)
+	require.Error(t, err, "Consume should fail when queue already has exclusive consumer")
 
-	// The Consume call might succeed, but the channel should close with ACCESS_REFUSED
-	select {
-	case chErr := <-chErrors:
-		require.NotNil(t, chErr)
-		require.Equal(t, 403, chErr.Code) // ACCESS_REFUSED
-		require.Contains(t, chErr.Reason, "already has an exclusive consumer")
-	case <-time.After(1 * time.Second):
-		t.Fatal("Expected channel to close with ACCESS_REFUSED error")
-	}
+	// Verify it's the correct error
+	amqpErr, ok := err.(*amqp.Error)
+	require.True(t, ok, "Error should be an AMQP error")
+	require.Equal(t, amqp.AccessRefused, amqpErr.Code, "Error code should be ACCESS_REFUSED (403)")
+	require.Contains(t, amqpErr.Reason, "already has an exclusive consumer")
 
 	// Verify first consumer is still active
 	time.Sleep(100 * time.Millisecond)
