@@ -235,6 +235,7 @@ type consumer struct {
 	Tag       string
 	ChannelId uint16
 	NoAck     bool
+	Exclusive bool
 	Queue     *queue
 	stopCh    chan struct{} // Signal to stop this consumer
 }

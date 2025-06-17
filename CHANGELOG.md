@@ -3,6 +3,7 @@
 ## [0.2.3]
 
 ### Added
+- Add exclusive consumer checks
 - Configurable logging with `LoggingConfig` struct via `WithLoggingConfig` server option
 - Ability to disable all logging with `DisableLogging` flag
 - Ability to provide custom logger implementations via `CustomLogger` field
@@ -11,6 +12,10 @@
 ### Changed
 - Consolidated all logging configuration into a single `WithLoggingConfig` option
 - Removed separate `WithLogger` function in favor of unified configuration approach
+- Refactored exclusive consumer validation to perform all checks before modifying state
+
+### Fixed
+- Test for exclusive consumer access now properly uses channel error notifications instead of expecting immediate errors
 
 ## [0.2.2]
 

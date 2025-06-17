@@ -1250,6 +1250,44 @@ func TestBasicConsume_Exclusive_ResourceLocked(t *testing.T) {
 	assert.Equal(t, amqp.ResourceLocked, amqpErr.Code, "AMQP error code should be 405 (RESOURCE_LOCKED)")
 }
 
+func TestBasicConsume_ExclusiveConsumer_AccessRefused(t *testing.T) {
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	conn1, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn1.Close()
+	ch1, err := conn1.Channel()
+	require.NoError(t, err)
+	defer ch1.Close()
+
+	queueName := "q-exclusive-consumer-artest"
+	q, err := ch1.QueueDeclare(queueName, false, false, false, false, nil)
+	require.NoError(t, err, "Queue declaration on conn1/ch1 failed")
+
+	// First consumer (exclusive)
+	_, err = ch1.Consume(q.Name, "consumer1-exclusive", true, true, false, false, nil)
+	//                                                    ^^^^ ^^^^ - autoAck=true, exclusive=true
+	require.NoError(t, err, "First consumer (exclusive) failed")
+
+	conn2, err := amqp.Dial("amqp://" + addr)
+	require.NoError(t, err)
+	defer conn2.Close()
+	ch2, err := conn2.Channel()
+	require.NoError(t, err)
+	defer ch2.Close()
+
+	// Second consumer trying to consume from queue with exclusive consumer
+	// Parameters: queue, consumer, autoAck, exclusive, noLocal, noWait, args
+	_, err = ch2.Consume(q.Name, "consumer2-nonexclusive", false, false, false, false, nil)
+	//                                                      ^^^^^ ^^^^^ - autoAck=false, exclusive=false
+	require.Error(t, err, "Non-exclusive consume on queue with existing exclusive consumer should fail")
+
+	amqpErr, ok := err.(*amqp.Error)
+	require.True(t, ok)
+	assert.Equal(t, amqp.AccessRefused, amqpErr.Code, "AMQP error code should be 403 (ACCESS_REFUSED)")
+}
+
 func TestBasicConsume_NoWait(t *testing.T) {
 	addr, cleanup := setupTestServer(t)
 	defer cleanup()

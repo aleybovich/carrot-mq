@@ -2034,12 +2034,11 @@ func (c *connection) handleMethodBasicConsume(reader *bytes.Reader, channelId ui
 	if !qExists {
 		replyText := fmt.Sprintf("no queue '%s' in vhost '/'", queueName)
 		c.server.Warn("Basic.Consume: %s. Sending Channel.Close.", replyText)
-		// AMQP code 404 (NOT_FOUND)
 		return c.sendChannelClose(channelId, amqpError.NotFound.Code(), replyText, uint16(ClassBasic), MethodBasicConsume)
 	}
 
-	// Add consumer to channel and queue
-	ch.mu.Lock() // Lock channel to modify its consumers map
+	// Validate consumer tag is not already in use on this channel
+	ch.mu.Lock()
 	if _, tagExistsOnChannel := ch.consumers[actualConsumerTag]; tagExistsOnChannel {
 		ch.mu.Unlock()
 		replyText := fmt.Sprintf("consumer tag '%s' already in use on channel %d", actualConsumerTag, channelId)
@@ -2047,46 +2046,55 @@ func (c *connection) handleMethodBasicConsume(reader *bytes.Reader, channelId ui
 		// AMQP code 530 (NOT_ALLOWED) - AMQP spec says "consumer tag already in use on this channel"
 		return c.sendChannelClose(channelId, amqpError.NotAllowed.Code(), replyText, uint16(ClassBasic), MethodBasicConsume)
 	}
-	ch.consumers[actualConsumerTag] = queueName // Store mapping of consumer tag to queue name on this channel
 	ch.mu.Unlock()
 
-	q.mu.Lock() // Lock queue to modify its consumers map
-	if exclusive {
-		if len(q.Consumers) > 0 {
+	// Validate exclusive consumer access on the queue
+	q.mu.Lock()
+
+	// Check if any existing consumer has exclusive access
+	for _, existingConsumer := range q.Consumers {
+		if existingConsumer.Exclusive {
 			q.mu.Unlock()
-			// Rollback channel's consumer addition because queue is exclusively locked by another consumer
-			ch.mu.Lock()
-			delete(ch.consumers, actualConsumerTag)
-			ch.mu.Unlock()
-			replyText := fmt.Sprintf("queue '%s' is exclusive and already has consumer(s)", queueName)
+			replyText := fmt.Sprintf("ACCESS_REFUSED - queue '%s' already has an exclusive consumer", queueName)
 			c.server.Warn("Basic.Consume: %s. Sending Channel.Close.", replyText)
-			return c.sendChannelClose(channelId, amqpError.ResourceLocked.Code(), replyText, uint16(ClassBasic), MethodBasicConsume)
+			return c.sendChannelClose(channelId, amqpError.AccessRefused.Code(), replyText, uint16(ClassBasic), MethodBasicConsume)
 		}
-		// If exclusive and no consumers, this consumer gets exclusive access.
-		// Your Queue struct has an `Exclusive` field set at Queue.Declare.
-		// This `exclusive` bit in Basic.Consume refers to this consumer wanting exclusive access.
 	}
+
+	// Check if this consumer wants exclusive access but there are already consumers
+	if exclusive && len(q.Consumers) > 0 {
+		q.mu.Unlock()
+		replyText := fmt.Sprintf("queue '%s' is exclusive and already has consumer(s)", queueName)
+		c.server.Warn("Basic.Consume: %s. Sending Channel.Close.", replyText)
+		return c.sendChannelClose(channelId, amqpError.ResourceLocked.Code(), replyText, uint16(ClassBasic), MethodBasicConsume)
+	}
+
 	// Check if consumerTag is already in use on the queue (globally for the queue, across all channels)
 	if _, consumerExistsOnQueue := q.Consumers[actualConsumerTag]; consumerExistsOnQueue {
 		q.mu.Unlock()
-		ch.mu.Lock()
-		delete(ch.consumers, actualConsumerTag) // Rollback channel's consumer addition
-		ch.mu.Unlock()
 		replyText := fmt.Sprintf("consumer tag '%s' is already active on queue '%s'", actualConsumerTag, queueName)
 		c.server.Err("Basic.Consume: %s. Sending Channel.Close.", replyText)
 		// AMQP code 530 (NOT_ALLOWED) - "consumer tag not unique"
 		return c.sendChannelClose(channelId, amqpError.NotAllowed.Code(), replyText, uint16(ClassBasic), MethodBasicConsume)
 	}
 
+	// All validations passed - now add consumer to channel and queue
+
 	consumer := &consumer{
 		Tag:       actualConsumerTag,
 		ChannelId: channelId,
 		NoAck:     noAck,
+		Exclusive: exclusive,
 		Queue:     q,
 		stopCh:    make(chan struct{}),
 	}
 	q.Consumers[actualConsumerTag] = consumer
 	q.mu.Unlock()
+
+	// Add to channel's consumer map
+	ch.mu.Lock()
+	ch.consumers[actualConsumerTag] = queueName
+	ch.mu.Unlock()
 
 	if !noWait {
 		payloadOk := &bytes.Buffer{}
