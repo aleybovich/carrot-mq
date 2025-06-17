@@ -8,6 +8,7 @@
 - Ability to disable all logging with `DisableLogging` flag
 - Ability to provide custom logger implementations via `CustomLogger` field
 - Control over heartbeat message logging with `HeartbeatLogging` flag (disabled by default)
+- Implemented connection closure on client heartbeat timeout as per amqp091 protocol specification
 
 ### Changed
 - Consolidated all logging configuration into a single `WithLoggingConfig` option
@@ -16,6 +17,7 @@
 
 ### Fixed
 - Test for exclusive consumer access now properly uses channel error notifications instead of expecting immediate errors
+
 
 ## [0.2.2]
 

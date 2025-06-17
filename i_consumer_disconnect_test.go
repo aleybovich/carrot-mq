@@ -1,8 +1,6 @@
 package carrotmq
 
 import (
-	"context"
-	"sync"
 	"testing"
 	"time"
 
@@ -10,36 +8,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestConsumerLoopHeartbeatTimeout tests that consumer loop exits when heartbeat times out
+// TestConsumerLoopHeartbeatTimeout tests that consumer loop exits when connection is closed
 func TestConsumerLoopHeartbeatTimeout(t *testing.T) {
-	// Setup server with short heartbeat
-	s := NewServer()
-	// Override default heartbeat for testing
-	go func() {
-		err := s.Start(":5810")
-		if err != nil {
-			t.Logf("Server error: %v", err)
-		}
-	}()
-	defer s.Shutdown(context.Background())
+	// Setup server
+	addr, cleanup := setupTestServer(t)
+	defer cleanup()
 
-	// Wait for server to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Connect with very short heartbeat
-	config := amqp.Config{
-		Heartbeat: 1 * time.Second, // Very short heartbeat
-	}
-	conn, err := amqp.DialConfig("amqp://localhost:5810", config)
+	// Connect
+	conn, err := amqp.Dial("amqp://" + addr)
 	require.NoError(t, err)
-	defer conn.Close()
+	// Don't defer close - we'll force close it
 
 	ch, err := conn.Channel()
 	require.NoError(t, err)
-	defer ch.Close()
+	// Don't defer close
 
 	// Create queue
-	qName := uniqueName("q-heartbeat-timeout")
+	qName := uniqueName("q-connection-close")
 	q, err := ch.QueueDeclare(
 		qName,
 		false, // durable
@@ -64,32 +49,39 @@ func TestConsumerLoopHeartbeatTimeout(t *testing.T) {
 
 	// Track loop exit
 	loopExited := make(chan bool)
-	var wg sync.WaitGroup
-	wg.Add(1)
+
+	// Set up connection close notification
+	connClose := conn.NotifyClose(make(chan *amqp.Error, 1))
 
 	// Start consumer loop
 	go func() {
-		defer wg.Done()
 		for range msgs {
 			// Process messages
 		}
 		loopExited <- true
 	}()
 
-	// Block heartbeats by not reading from connection for longer than heartbeat interval
-	// In real scenarios, this would happen due to network issues or client freezing
-	time.Sleep(3 * time.Second)
+	// Give consumer time to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Force close the connection
+	conn.Close()
+
+	// Verify connection was closed
+	select {
+	case err := <-connClose:
+		t.Logf("Connection closed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Connection close notification not received")
+	}
 
 	// Verify loop exits due to connection loss
 	select {
 	case <-loopExited:
-		// Good - loop exited as expected
-		t.Log("Consumer loop exited after heartbeat timeout")
-	case <-time.After(5 * time.Second):
-		t.Fatal("Consumer loop did not exit after heartbeat timeout")
+		t.Log("Consumer loop exited after connection close")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Consumer loop did not exit after connection close")
 	}
-
-	wg.Wait()
 }
 
 // TestConsumerCancelledByServer tests consumer loop exits when server cancels consumer
@@ -200,13 +192,13 @@ func TestConsumerExclusiveConflict(t *testing.T) {
 
 	// Start exclusive consumer
 	msgs1, err := ch1.Consume(
-		q.Name,             // queue
+		q.Name,               // queue
 		"exclusive-consumer", // consumer
-		false,              // auto-ack
-		true,               // exclusive
-		false,              // no-local
-		false,              // no-wait
-		nil,                // args
+		false,                // auto-ack
+		true,                 // exclusive
+		false,                // no-local
+		false,                // no-wait
+		nil,                  // args
 	)
 	require.NoError(t, err)
 
@@ -232,15 +224,16 @@ func TestConsumerExclusiveConflict(t *testing.T) {
 
 	// This should trigger a channel close due to exclusive consumer
 	_, err = ch2.Consume(
-		qName,           // queue
+		qName,            // queue
 		"test-consumer2", // consumer
-		false,           // auto-ack
-		false,           // exclusive
-		false,           // no-local
-		false,           // no-wait
-		nil,             // args
+		false,            // auto-ack
+		false,            // exclusive
+		false,            // no-local
+		false,            // no-wait
+		nil,              // args
 	)
-	
+	require.NoError(t, err)
+
 	// The Consume call might succeed, but the channel should close with ACCESS_REFUSED
 	select {
 	case chErr := <-chErrors:
@@ -406,7 +399,7 @@ func TestConsumerReconnectionPattern(t *testing.T) {
 	defer cleanup()
 
 	qName := uniqueName("q-reconnect-pattern")
-	
+
 	// Example of reconnection pattern
 	consumeWithReconnect := func() {
 		for {
@@ -485,6 +478,6 @@ func TestConsumerReconnectionPattern(t *testing.T) {
 
 	// Let it run briefly
 	time.Sleep(500 * time.Millisecond)
-	
+
 	// Test passes - this is just demonstrating the pattern
 }

@@ -228,7 +228,10 @@ type connection struct {
 	username string // Store authenticated username
 
 	// heartbeat management
-	heartbeatStop chan struct{}
+	heartbeatStop    chan struct{}
+	heartbeatTimeout chan struct{} // Signal from heartbeat goroutine to main loop
+	lastHeartbeat    time.Time
+	heartbeatMutex   sync.Mutex
 }
 
 type consumer struct {
@@ -920,11 +923,12 @@ func (s *server) handleConnection(conn net.Conn) {
 	s.Info("Handling connection from %s", conn.RemoteAddr())
 
 	c := &connection{
-		conn:     conn,
-		reader:   bufio.NewReader(conn),
-		writer:   bufio.NewWriter(conn),
-		channels: make(map[uint16]*channel),
-		server:   s,
+		conn:             conn,
+		reader:           bufio.NewReader(conn),
+		writer:           bufio.NewWriter(conn),
+		channels:         make(map[uint16]*channel),
+		server:           s,
+		heartbeatTimeout: make(chan struct{}, 1), // Buffered to avoid blocking
 	}
 
 	protocol := make([]byte, 8)
@@ -953,9 +957,85 @@ func (s *server) handleConnection(conn net.Conn) {
 
 	s.addConnection(c) // add new active connection to server connection map
 
+	// Create a channel to receive frames asynchronously
+	frameChan := make(chan *frame)
+	frameErrChan := make(chan error)
+
+	// Start a goroutine to read frames
+	go func() {
+		for {
+			frame, err := c.readFrame()
+			if err != nil {
+				frameErrChan <- err
+				return
+			}
+			frameChan <- frame
+		}
+	}()
+
 	for {
-		frame, err := c.readFrame()
-		if err != nil {
+		select {
+		case frame := <-frameChan:
+			// Process the frame as before
+			var handlerError error
+			switch frame.Type {
+			case FrameMethod:
+				handlerError = c.handleMethod(frame)
+			case FrameHeader:
+				handlerError = c.handleHeader(frame)
+			case FrameBody:
+				c.handleBody(frame)
+			case FrameHeartbeat:
+				// Heartbeats are typically high-volume and low importance for logging
+				// Only log them at detailed level or in debug mode
+				s.Debug("Received %s from %s on channel %d",
+					colorize("HEARTBEAT", colorGray),
+					colorize(conn.RemoteAddr().String(), colorCyan),
+					frame.Channel)
+			default:
+				s.Warn("Received unhandled frame type %d from %s on channel %d", frame.Type, conn.RemoteAddr(), frame.Channel)
+				handlerError = c.sendConnectionClose(amqpError.UnexpectedFrame.Code(), fmt.Sprintf("unhandled frame type %d", frame.Type), 0, 0)
+			}
+
+			// Update last heartbeat time for any frame received (per AMQP spec)
+			if c.heartbeatInterval > 0 {
+				c.heartbeatMutex.Lock()
+				c.lastHeartbeat = time.Now()
+				c.heartbeatMutex.Unlock()
+			}
+
+			if handlerError != nil {
+				if errors.Is(handlerError, errConnectionClosedGracefully) {
+					s.Info("AMQP connection gracefully closed with %s.", conn.RemoteAddr())
+					// Connection is already closed by handleConnectionMethod.
+					// Resources should be cleaned by cleanupConnectionResources, which is called
+					// when readFrame eventually fails due to the closed connection, or we can call it here too.
+					// Since conn.Close() was called in the handler, the next readFrame() will fail and trigger cleanup.
+					// For explicitness, we can ensure cleanup and return.
+					c.cleanupConnectionResources()
+					s.removeConnection(c)
+					// conn.Close() was already called by the method handler that returned errConnectionClosedGracefully
+					return // Exit the loop and goroutine
+				}
+
+				if errors.Is(handlerError, errConnectionCloseSentByServer) {
+					s.Info("Server initiated Connection.Close with %s. Waiting for CloseOk or client disconnect.", conn.RemoteAddr())
+					// Continue read loop to get CloseOk or detect disconnect.
+					// TODO: A timeout for CloseOk could be implemented here.
+				} else if errors.Is(handlerError, errChannelClosedByServer) {
+					s.Info("AMQP Channel.Close was sent successfully for channel %d due to protocol error. Connection remains active.", frame.Channel)
+					// Channel specific error handled, connection continues.
+				} else {
+					// For any other error (I/O, unhandled AMQP issues that didn't send a specific close frame).
+					s.Err("Critical error from handler for %s: %v. Closing connection.", conn.RemoteAddr(), handlerError)
+					c.cleanupConnectionResources()
+					conn.Close()
+					s.removeConnection(c)
+					return
+				}
+			}
+
+		case err := <-frameErrChan:
 			// Enhanced error checking for readFrame
 			errMsg := err.Error()
 			isNetClosedError := errors.Is(err, io.EOF) ||
@@ -972,57 +1052,21 @@ func (s *server) handleConnection(conn net.Conn) {
 			conn.Close()                   // Ensure underlying connection is closed
 			s.removeConnection(c)
 			return // Exit handleConnection goroutine
-		}
 
-		var handlerError error
-		switch frame.Type {
-		case FrameMethod:
-			handlerError = c.handleMethod(frame)
-		case FrameHeader:
-			handlerError = c.handleHeader(frame)
-		case FrameBody:
-			c.handleBody(frame)
-		case FrameHeartbeat:
-			// Heartbeats are typically high-volume and low importance for logging
-			// Only log them at detailed level or in debug mode
-			s.Debug("Received %s from %s on channel %d",
-				colorize("HEARTBEAT", colorGray),
-				colorize(conn.RemoteAddr().String(), colorCyan),
-				frame.Channel)
-		default:
-			s.Warn("Received unhandled frame type %d from %s on channel %d", frame.Type, conn.RemoteAddr(), frame.Channel)
-			handlerError = c.sendConnectionClose(amqpError.UnexpectedFrame.Code(), fmt.Sprintf("unhandled frame type %d", frame.Type), 0, 0)
-		}
-
-		if handlerError != nil {
-			if errors.Is(handlerError, errConnectionClosedGracefully) {
-				s.Info("AMQP connection gracefully closed with %s.", conn.RemoteAddr())
-				// Connection is already closed by handleConnectionMethod.
-				// Resources should be cleaned by cleanupConnectionResources, which is called
-				// when readFrame eventually fails due to the closed connection, or we can call it here too.
-				// Since conn.Close() was called in the handler, the next readFrame() will fail and trigger cleanup.
-				// For explicitness, we can ensure cleanup and return.
-				c.cleanupConnectionResources()
-				s.removeConnection(c)
-				// conn.Close() was already called by the method handler that returned errConnectionClosedGracefully
-				return // Exit the loop and goroutine
-			}
-
-			if errors.Is(handlerError, errConnectionCloseSentByServer) {
-				s.Info("Server initiated Connection.Close with %s. Waiting for CloseOk or client disconnect.", conn.RemoteAddr())
-				// Continue read loop to get CloseOk or detect disconnect.
-				// TODO: A timeout for CloseOk could be implemented here.
-			} else if errors.Is(handlerError, errChannelClosedByServer) {
-				s.Info("AMQP Channel.Close was sent successfully for channel %d due to protocol error. Connection remains active.", frame.Channel)
-				// Channel specific error handled, connection continues.
-			} else {
-				// For any other error (I/O, unhandled AMQP issues that didn't send a specific close frame).
-				s.Err("Critical error from handler for %s: %v. Closing connection.", conn.RemoteAddr(), handlerError)
+		case <-c.heartbeatTimeout:
+			// Heartbeat timeout detected by heartbeat goroutine
+			s.Info("Processing heartbeat timeout for %s", conn.RemoteAddr())
+			// Send connection.close with ConnectionForced error code as per AMQP spec
+			if err := c.sendConnectionClose(amqpError.ConnectionForced.Code(), "heartbeat timeout", 0, 0); err != nil {
+				s.Err("Failed to send connection.close for heartbeat timeout: %v", err)
+				// If we can't send the close frame, forcefully close the connection
 				c.cleanupConnectionResources()
 				conn.Close()
 				s.removeConnection(c)
 				return
 			}
+			// Connection.close sent successfully, continue the loop to wait for close-ok
+			// The errConnectionCloseSentByServer handling above will take care of the rest
 		}
 	}
 }
@@ -1138,19 +1182,45 @@ func (c *connection) sendHeartbeat() error {
 func (c *connection) startHeartbeat() {
 	c.heartbeatStop = make(chan struct{})
 
+	// Initialize last heartbeat time
+	c.heartbeatMutex.Lock()
+	c.lastHeartbeat = time.Now()
+	c.heartbeatMutex.Unlock()
+
 	// Calculate heartbeat interval - send at half the negotiated interval
 	// as per AMQP spec recommendation
 	interval := time.Duration(c.heartbeatInterval) * time.Second / 2
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Heartbeat timeout is 2x the negotiated interval (AMQP spec recommendation)
+	timeout := time.Duration(c.heartbeatInterval) * time.Second * 2
+
 	if c.server.loggingConfig.HeartbeatLogging {
-		c.server.Info("Started heartbeat sender for %s with interval %v", c.conn.RemoteAddr(), interval)
+		c.server.Info("Started heartbeat sender for %s with interval %v, timeout %v", c.conn.RemoteAddr(), interval, timeout)
 	}
 
 	for {
 		select {
 		case <-ticker.C:
+			// Check if we've received a heartbeat recently
+			c.heartbeatMutex.Lock()
+			lastReceived := c.lastHeartbeat
+			c.heartbeatMutex.Unlock()
+
+			if time.Since(lastReceived) > timeout {
+				c.server.Err("Heartbeat timeout for %s - no heartbeat received for %v", c.conn.RemoteAddr(), time.Since(lastReceived))
+				// Signal the main connection loop about the timeout
+				select {
+				case c.heartbeatTimeout <- struct{}{}:
+					// Successfully signaled
+				default:
+					// Channel already has a signal, don't block
+				}
+				return
+			}
+
+			// Send our heartbeat
 			if err := c.sendHeartbeat(); err != nil {
 				c.server.Err("Error sending heartbeat to %s: %v", c.conn.RemoteAddr(), err)
 				return
