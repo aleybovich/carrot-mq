@@ -128,6 +128,7 @@ type message struct {
 	Properties  properties
 	Body        []byte
 	Redelivered bool
+	bodySize    uint64 // expected body size from content header; used during assembly only
 }
 
 func (m *message) DeepCopy() *message {
@@ -1347,18 +1348,27 @@ func (c *connection) handleHeader(frame *frame) error {
 		return nil
 	}
 
+	// msgToDeliver is set when the message is complete and ready for routing.
+	// The deferred closure unlocks the mutex first, then delivers outside the lock.
+	var msgToDeliver *message
 	ch.mu.Lock()
-	defer ch.mu.Unlock() // Ensure unlock even on error paths
+	defer func() {
+		ch.mu.Unlock()
+		if msgToDeliver != nil {
+			built := msgToDeliver.DeepCopy()
+			c.deliverMessage(built, frame.Channel)
+		}
+	}()
 
 	// Check if channel is being closed by server
 	if ch.closingByServer {
 		c.server.Debug("Ignoring header frame on channel %d that is being closed by server", frame.Channel)
-		return nil // Just ignore it
+		return nil
 	}
 
 	if len(ch.pendingMessages) == 0 {
 		c.server.Warn("Received header frame with no pending message on channel %d", frame.Channel)
-		return c.sendChannelClose(frame.Channel, amqpError.UnexpectedFrame.Code(), "header frame received without pending basic.publish", uint16(ClassBasic), 0) // 0 for methodId as it's not a direct method response
+		return c.sendChannelClose(frame.Channel, amqpError.UnexpectedFrame.Code(), "header frame received without pending basic.publish", uint16(ClassBasic), 0)
 	}
 
 	pendingMessage := &ch.pendingMessages[0] // Get, don't remove yet
@@ -1379,7 +1389,7 @@ func (c *connection) handleHeader(frame *frame) error {
 
 	c.server.Info("Processing basic header frame: channel=%d, classId=%d, bodySize=%d", frame.Channel, classId, bodySize)
 
-	if classId != ClassBasic { // Only Basic class messages have properties like this
+	if classId != ClassBasic {
 		c.server.Warn("Received header frame for non-Basic class %d on channel %d", classId, frame.Channel)
 		// AMQP code 503 (COMMAND_INVALID) or 505 (UNEXPECTED_FRAME)
 		return c.sendChannelClose(frame.Channel, amqpError.CommandInvalid.Code(), fmt.Sprintf("header frame for unexpected class %d", classId), classId, 0)
@@ -1483,7 +1493,18 @@ func (c *connection) handleHeader(frame *frame) error {
 		c.server.Warn("Extra data at end of header frame payload on channel %d", frame.Channel)
 	}
 
-	return nil // Successfully processed header
+	// Store expected body size and pre-allocate body buffer
+	pendingMessage.bodySize = bodySize
+	if bodySize > 0 {
+		pendingMessage.Body = make([]byte, 0, bodySize)
+		return nil // Wait for body frame(s)
+	}
+
+	// bodySize == 0: no body frames will follow per AMQP spec — deliver immediately (in defer)
+	msg := ch.pendingMessages[0]
+	ch.pendingMessages = ch.pendingMessages[1:]
+	msgToDeliver = &msg
+	return nil
 }
 
 func (c *connection) handleMethodConfirmSelect(reader *bytes.Reader, channelId uint16, ch *channel) error {
@@ -1552,58 +1573,34 @@ func (c *connection) handleBody(frame *frame) {
 
 	ch.mu.Lock()
 
-	if len(ch.pendingMessages) > 0 {
-		// Take the FIRST pending message (FIFO)
-		pendingMessage := ch.pendingMessages[0]
-		ch.pendingMessages = ch.pendingMessages[1:] // Remove it
-
-		c.server.Info("Processing body frame: channel=%d, size=%d, exchange=%s, routingKey=%s",
-			frame.Channel, len(frame.Payload), pendingMessage.Exchange, pendingMessage.RoutingKey)
-
-		// Create a DEEP copy of Properties
-		propertiesCopy := properties{
-			ContentType:     pendingMessage.Properties.ContentType,
-			ContentEncoding: pendingMessage.Properties.ContentEncoding,
-			DeliveryMode:    pendingMessage.Properties.DeliveryMode,
-			Priority:        pendingMessage.Properties.Priority,
-			CorrelationId:   pendingMessage.Properties.CorrelationId,
-			ReplyTo:         pendingMessage.Properties.ReplyTo,
-			Expiration:      pendingMessage.Properties.Expiration,
-			MessageId:       pendingMessage.Properties.MessageId,
-			Timestamp:       pendingMessage.Properties.Timestamp,
-			Type:            pendingMessage.Properties.Type,
-			UserId:          pendingMessage.Properties.UserId,
-			AppId:           pendingMessage.Properties.AppId,
-			ClusterId:       pendingMessage.Properties.ClusterId,
-		}
-
-		// Deep copy the Headers map if it exists
-		if pendingMessage.Properties.Headers != nil {
-			propertiesCopy.Headers = make(map[string]interface{})
-			for k, v := range pendingMessage.Properties.Headers {
-				propertiesCopy.Headers[k] = v
-			}
-		}
-
-		// Create the complete message with deep-copied properties
-		messageToDeliver := message{
-			Exchange:   pendingMessage.Exchange,
-			RoutingKey: pendingMessage.RoutingKey,
-			Mandatory:  pendingMessage.Mandatory,
-			Immediate:  pendingMessage.Immediate,
-			Properties: propertiesCopy,
-			Body:       make([]byte, len(frame.Payload)),
-		}
-		copy(messageToDeliver.Body, frame.Payload)
-
-		ch.mu.Unlock()
-
-		// Deliver the message
-		c.deliverMessage(&messageToDeliver, frame.Channel)
-	} else {
+	if len(ch.pendingMessages) == 0 {
 		ch.mu.Unlock()
 		c.server.Warn("Received body frame with no pending message on channel %d", frame.Channel)
+		return
 	}
+
+	// Append this frame's payload to the pending message body
+	pendingMessage := &ch.pendingMessages[0]
+	pendingMessage.Body = append(pendingMessage.Body, frame.Payload...)
+
+	c.server.Info("Processing body frame: channel=%d, frameSize=%d, accumulated=%d/%d, exchange=%s, routingKey=%s",
+		frame.Channel, len(frame.Payload), len(pendingMessage.Body), pendingMessage.bodySize,
+		pendingMessage.Exchange, pendingMessage.RoutingKey)
+
+	// Check if we have received the complete body
+	if uint64(len(pendingMessage.Body)) < pendingMessage.bodySize {
+		// More body frames expected
+		ch.mu.Unlock()
+		return
+	}
+
+	// Body is complete — remove from pending and deliver
+	msg := ch.pendingMessages[0]
+	ch.pendingMessages = ch.pendingMessages[1:]
+	ch.mu.Unlock()
+
+	messageToDeliver := msg.DeepCopy()
+	c.deliverMessage(messageToDeliver, frame.Channel)
 }
 
 // RouteMessage handles all exchange type routing logic
