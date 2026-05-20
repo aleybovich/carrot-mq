@@ -233,6 +233,8 @@ type connection struct {
 	heartbeatTimeout chan struct{} // Signal from heartbeat goroutine to main loop
 	lastHeartbeat    time.Time
 	heartbeatMutex   sync.Mutex
+
+	cleanupOnce sync.Once // guards cleanupConnectionResources against double-call
 }
 
 type consumer struct {
@@ -860,18 +862,28 @@ func (s *server) handleConnection(conn net.Conn) {
 	// Create a channel to receive frames asynchronously
 	frameChan := make(chan *frame)
 	frameErrChan := make(chan error)
+	readerDone := make(chan struct{}) // closed when main loop exits, unblocks reader goroutine
 
 	// Start a goroutine to read frames
 	go func() {
 		for {
 			frame, err := c.readFrame()
 			if err != nil {
-				frameErrChan <- err
+				select {
+				case frameErrChan <- err:
+				case <-readerDone:
+				}
 				return
 			}
-			frameChan <- frame
+			select {
+			case frameChan <- frame:
+			case <-readerDone:
+				return
+			}
 		}
 	}()
+
+	defer close(readerDone) // unblock reader goroutine on any exit from this function
 
 	for {
 		select {
@@ -2435,79 +2447,81 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 }
 
 func (c *connection) cleanupConnectionResources() {
-	vhost := c.vhost
+	c.cleanupOnce.Do(func() {
+		vhost := c.vhost
 
-	c.server.Info("Cleaning up resources for connection %s", c.conn.RemoteAddr())
+		c.server.Info("Cleaning up resources for connection %s", c.conn.RemoteAddr())
 
-	// Stop heartbeat sender if running
-	if c.heartbeatStop != nil {
-		close(c.heartbeatStop)
-	}
+		// Stop heartbeat sender if running
+		if c.heartbeatStop != nil {
+			close(c.heartbeatStop)
+		}
 
-	c.mu.Lock() // Lock the connection to safely iterate over channels
+		c.mu.Lock() // Lock the connection to safely iterate over channels
 
-	// NEW: Collect queue names that will need dispatch attempts
-	affectedQueuesForDispatch := make(map[string]bool)
+		// NEW: Collect queue names that will need dispatch attempts
+		affectedQueuesForDispatch := make(map[string]bool)
 
-	for chanId, ch := range c.channels {
-		c.server.Info("Cleaning up resources for channel %d on connection %s", chanId, c.conn.RemoteAddr())
-		ch.mu.Lock() // Lock the specific channel
+		for chanId, ch := range c.channels {
+			c.server.Info("Cleaning up resources for channel %d on connection %s", chanId, c.conn.RemoteAddr())
+			ch.mu.Lock() // Lock the specific channel
 
-		// Handle unacked messages: requeue them
-		if len(ch.unackedMessages) > 0 {
-			c.server.Info("Channel %d has %d unacked messages during connection cleanup, preparing for requeue", chanId, len(ch.unackedMessages))
-			for deliveryTag, unacked := range ch.unackedMessages {
+			// Handle unacked messages: requeue them
+			if len(ch.unackedMessages) > 0 {
+				c.server.Info("Channel %d has %d unacked messages during connection cleanup, preparing for requeue", chanId, len(ch.unackedMessages))
+				for deliveryTag, unacked := range ch.unackedMessages {
+					vhost.mu.RLock() // RLock server to access s.queues
+					queue, qExists := vhost.queues[unacked.QueueName]
+					vhost.mu.RUnlock()
+
+					if qExists && queue != nil {
+						unacked.Message.Redelivered = true // Mark as redelivered
+
+						queue.mu.Lock() // Lock the specific queue
+						// Prepend to queue (requeued messages go to front)
+						queue.Messages = append([]message{unacked.Message}, queue.Messages...)
+						c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'", deliveryTag, chanId, unacked.QueueName)
+						affectedQueuesForDispatch[unacked.QueueName] = true // Mark queue for dispatch
+						queue.mu.Unlock()                                   // Unlock queue
+					} else {
+						c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d) during connection cleanup", unacked.QueueName, deliveryTag, chanId)
+					}
+				}
+				// Clear unacked messages for the channel
+				ch.unackedMessages = make(map[uint64]*unackedMessage)
+			}
+
+			// Clean up consumers associated with this channel
+			for consumerTag, queueName := range ch.consumers {
 				vhost.mu.RLock() // RLock server to access s.queues
-				queue, qExists := vhost.queues[unacked.QueueName]
-				vhost.mu.RUnlock()
-
-				if qExists && queue != nil {
-					unacked.Message.Redelivered = true // Mark as redelivered
-
+				if queue, ok := vhost.queues[queueName]; ok {
 					queue.mu.Lock() // Lock the specific queue
-					// Prepend to queue (requeued messages go to front)
-					queue.Messages = append([]message{unacked.Message}, queue.Messages...)
-					c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'", deliveryTag, chanId, unacked.QueueName)
-					affectedQueuesForDispatch[unacked.QueueName] = true // Mark queue for dispatch
-					queue.mu.Unlock()                                   // Unlock queue
-				} else {
-					c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d) during connection cleanup", unacked.QueueName, deliveryTag, chanId)
+					if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
+						c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
+						close(consumer.stopCh) // This will make the deliverMessages goroutine exit
+						delete(queue.Consumers, consumerTag)
+						// If this queue had messages and now has one less consumer, it might affect dispatch.
+						// The generic dispatch attempt later will cover this.
+					}
+					queue.mu.Unlock() // Unlock queue
 				}
+				vhost.mu.RUnlock()
 			}
-			// Clear unacked messages for the channel
-			ch.unackedMessages = make(map[uint64]*unackedMessage)
-		}
-
-		// Clean up consumers associated with this channel
-		for consumerTag, queueName := range ch.consumers {
-			vhost.mu.RLock() // RLock server to access s.queues
-			if queue, ok := vhost.queues[queueName]; ok {
-				queue.mu.Lock() // Lock the specific queue
-				if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
-					c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
-					close(consumer.stopCh) // This will make the deliverMessages goroutine exit
-					delete(queue.Consumers, consumerTag)
-					// If this queue had messages and now has one less consumer, it might affect dispatch.
-					// The generic dispatch attempt later will cover this.
-				}
-				queue.mu.Unlock() // Unlock queue
+			ch.consumers = map[string]string{} // Clear consumers map for the channel
+			ch.pendingMessages = nil           // Clear any partial messages from publish
+			// Ensure timer is stopped if channel was being closed by server
+			if ch.closeOkTimer != nil {
+				ch.closeOkTimer.Stop()
+				ch.closeOkTimer = nil
 			}
-			vhost.mu.RUnlock()
+			ch.mu.Unlock() // Unlock the channel
 		}
-		ch.consumers = map[string]string{} // Clear consumers map for the channel
-		ch.pendingMessages = nil           // Clear any partial messages from publish
-		// Ensure timer is stopped if channel was being closed by server
-		if ch.closeOkTimer != nil {
-			ch.closeOkTimer.Stop()
-			ch.closeOkTimer = nil
-		}
-		ch.mu.Unlock() // Unlock the channel
-	}
-	c.channels = map[uint16]*channel{} // Clear the channels map on the connection
-	c.mu.Unlock()                      // Unlock the connection
+		c.channels = map[uint16]*channel{} // Clear the channels map on the connection
+		c.mu.Unlock()                      // Unlock the connection
 
-	c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
-	// The underlying c.conn will be closed by the caller of cleanupConnectionResources or was already closed.
+		c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
+		// The underlying c.conn will be closed by the caller of cleanupConnectionResources or was already closed.
+	})
 }
 
 // Helper method to clean up queue bindings when an exchange is deleted
