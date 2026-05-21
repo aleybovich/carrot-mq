@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"runtime"
 	"strings"
 )
 
@@ -239,9 +240,13 @@ func readLongString(reader *bytes.Reader) (string, error) {
 	return string(data), nil
 }
 
-func writeShortString(writer *bytes.Buffer, s string) {
+func writeShortString(writer *bytes.Buffer, s string) error {
+	if len(s) > 255 {
+		return fmt.Errorf("short string exceeds 255 bytes: len=%d", len(s))
+	}
 	writer.WriteByte(uint8(len(s)))
 	writer.WriteString(s)
+	return nil
 }
 
 func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
@@ -619,9 +624,9 @@ func writeTable(writer *bytes.Buffer, table map[string]interface{}) error {
 	tablePayloadBuffer := &bytes.Buffer{}
 
 	for key, value := range table {
-		// Assuming writeShortString does not return an error.
-		// If it could fail, its error would need to be handled here.
-		writeShortString(tablePayloadBuffer, key)
+		if err := writeShortString(tablePayloadBuffer, key); err != nil {
+			return fmt.Errorf("serializing key '%s': %w", key, err)
+		}
 
 		if err := writeFieldValue(tablePayloadBuffer, value); err != nil {
 			return fmt.Errorf("serializing value for key '%s' (type %T): %w", key, value, err)
@@ -676,4 +681,12 @@ func GetMessageIdentifier(msg *message) string {
 
 	// Return hex representation of the hash
 	return fmt.Sprintf("%x", h.Sum64())
+}
+
+// Get caller function name for logging
+func getCallerName() string {
+	pc, _, _, _ := runtime.Caller(2) // Use depth 2 to get the actual caller, not the logging function
+	caller := runtime.FuncForPC(pc).Name()
+	parts := strings.Split(caller, ".")
+	return parts[len(parts)-1]
 }

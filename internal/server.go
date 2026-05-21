@@ -1332,7 +1332,9 @@ func (c *connection) sendBasicGetEmpty(channelId uint16) error {
 	payload := &bytes.Buffer{}
 	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
 	binary.Write(payload, binary.BigEndian, uint16(MethodBasicGetEmpty))
-	writeShortString(payload, "") // cluster-id (reserved, must be empty)
+	if err := writeShortString(payload, ""); err != nil {
+		return fmt.Errorf("writing cluster-id: %w", err)
+	}
 
 	return c.writeFrame(&frame{
 		Type:    FrameMethod,
@@ -1938,13 +1940,22 @@ func (c *connection) sendReturnedMessage(channelId uint16, msg *message) {
 
 	// Write properties based on flags
 	if flags&0x8000 != 0 {
-		writeShortString(headerPayload, msg.Properties.ContentType)
+		if err := writeShortString(headerPayload, msg.Properties.ContentType); err != nil {
+			c.server.Err("Failed to write content-type for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x4000 != 0 {
-		writeShortString(headerPayload, msg.Properties.ContentEncoding)
+		if err := writeShortString(headerPayload, msg.Properties.ContentEncoding); err != nil {
+			c.server.Err("Failed to write content-encoding for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x2000 != 0 {
-		writeTable(headerPayload, msg.Properties.Headers)
+		if err := writeTable(headerPayload, msg.Properties.Headers); err != nil {
+			c.server.Err("Failed to write headers for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x1000 != 0 {
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.DeliveryMode)
@@ -1953,31 +1964,55 @@ func (c *connection) sendReturnedMessage(channelId uint16, msg *message) {
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Priority)
 	}
 	if flags&0x0400 != 0 {
-		writeShortString(headerPayload, msg.Properties.CorrelationId)
+		if err := writeShortString(headerPayload, msg.Properties.CorrelationId); err != nil {
+			c.server.Err("Failed to write correlation-id for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x0200 != 0 {
-		writeShortString(headerPayload, msg.Properties.ReplyTo)
+		if err := writeShortString(headerPayload, msg.Properties.ReplyTo); err != nil {
+			c.server.Err("Failed to write reply-to for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x0100 != 0 {
-		writeShortString(headerPayload, msg.Properties.Expiration)
+		if err := writeShortString(headerPayload, msg.Properties.Expiration); err != nil {
+			c.server.Err("Failed to write expiration for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x0080 != 0 {
-		writeShortString(headerPayload, msg.Properties.MessageId)
+		if err := writeShortString(headerPayload, msg.Properties.MessageId); err != nil {
+			c.server.Err("Failed to write message-id for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x0040 != 0 {
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Timestamp)
 	}
 	if flags&0x0020 != 0 {
-		writeShortString(headerPayload, msg.Properties.Type)
+		if err := writeShortString(headerPayload, msg.Properties.Type); err != nil {
+			c.server.Err("Failed to write type for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x0010 != 0 {
-		writeShortString(headerPayload, msg.Properties.UserId)
+		if err := writeShortString(headerPayload, msg.Properties.UserId); err != nil {
+			c.server.Err("Failed to write user-id for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x0008 != 0 {
-		writeShortString(headerPayload, msg.Properties.AppId)
+		if err := writeShortString(headerPayload, msg.Properties.AppId); err != nil {
+			c.server.Err("Failed to write app-id for returned message: %v", err)
+			return
+		}
 	}
 	if flags&0x0004 != 0 {
-		writeShortString(headerPayload, msg.Properties.ClusterId)
+		if err := writeShortString(headerPayload, msg.Properties.ClusterId); err != nil {
+			c.server.Err("Failed to write cluster-id for returned message: %v", err)
+			return
+		}
 	}
 
 	// Send header frame
@@ -2008,7 +2043,9 @@ func (c *connection) sendBasicCancelFromServer(channelId uint16, consumerTag str
 	payload := &bytes.Buffer{}
 	binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
 	binary.Write(payload, binary.BigEndian, uint16(MethodBasicCancel))
-	writeShortString(payload, consumerTag)
+	if err := writeShortString(payload, consumerTag); err != nil {
+		return fmt.Errorf("writing consumer tag: %w", err)
+	}
 	binary.Write(payload, binary.BigEndian, byte(0x00)) // no-wait bit (always false for server-sent)
 
 	c.writeMu.Lock()
@@ -2266,7 +2303,18 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 		methodPayload := &bytes.Buffer{}
 		binary.Write(methodPayload, binary.BigEndian, uint16(ClassBasic))
 		binary.Write(methodPayload, binary.BigEndian, uint16(MethodBasicDeliver))
-		writeShortString(methodPayload, consumerTag)
+		if err := writeShortString(methodPayload, consumerTag); err != nil {
+			c.server.Err("Error building deliver method payload for tag %d: %v", deliveryTag, err)
+			queue.mu.Lock()
+			queue.Messages = append([]message{msg}, queue.Messages...)
+			queue.mu.Unlock()
+			if !noAck {
+				ch.mu.Lock()
+				delete(ch.unackedMessages, deliveryTag)
+				ch.mu.Unlock()
+			}
+			continue
+		}
 		binary.Write(methodPayload, binary.BigEndian, deliveryTag)
 
 		if msgCopy.Redelivered {
@@ -2275,8 +2323,30 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 			methodPayload.WriteByte(0)
 		}
 
-		writeShortString(methodPayload, msgCopy.Exchange)
-		writeShortString(methodPayload, msgCopy.RoutingKey)
+		if err := writeShortString(methodPayload, msgCopy.Exchange); err != nil {
+			c.server.Err("Error building deliver method payload for tag %d: %v", deliveryTag, err)
+			queue.mu.Lock()
+			queue.Messages = append([]message{msg}, queue.Messages...)
+			queue.mu.Unlock()
+			if !noAck {
+				ch.mu.Lock()
+				delete(ch.unackedMessages, deliveryTag)
+				ch.mu.Unlock()
+			}
+			continue
+		}
+		if err := writeShortString(methodPayload, msgCopy.RoutingKey); err != nil {
+			c.server.Err("Error building deliver method payload for tag %d: %v", deliveryTag, err)
+			queue.mu.Lock()
+			queue.Messages = append([]message{msg}, queue.Messages...)
+			queue.mu.Unlock()
+			if !noAck {
+				ch.mu.Lock()
+				delete(ch.unackedMessages, deliveryTag)
+				ch.mu.Unlock()
+			}
+			continue
+		}
 
 		// Construct Header Payload
 		headerPayload := &bytes.Buffer{}
@@ -2332,13 +2402,45 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 
 		// Write properties based on flags
 		if flags&0x8000 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.ContentType)
+			if err := writeShortString(headerPayload, msgCopy.Properties.ContentType); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x4000 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.ContentEncoding)
+			if err := writeShortString(headerPayload, msgCopy.Properties.ContentEncoding); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x2000 != 0 {
-			writeTable(headerPayload, msgCopy.Properties.Headers)
+			if err := writeTable(headerPayload, msgCopy.Properties.Headers); err != nil {
+				// Permanent encoding failure — requeuing would loop forever.
+				// Drop the message and clean up tracking.
+				c.server.Err("Dropping undeliverable message (tag %d): failed to encode headers: %v", deliveryTag, err)
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x1000 != 0 {
 			binary.Write(headerPayload, binary.BigEndian, msgCopy.Properties.DeliveryMode)
@@ -2347,31 +2449,119 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 			binary.Write(headerPayload, binary.BigEndian, msgCopy.Properties.Priority)
 		}
 		if flags&0x0400 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.CorrelationId)
+			if err := writeShortString(headerPayload, msgCopy.Properties.CorrelationId); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x0200 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.ReplyTo)
+			if err := writeShortString(headerPayload, msgCopy.Properties.ReplyTo); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x0100 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.Expiration)
+			if err := writeShortString(headerPayload, msgCopy.Properties.Expiration); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x0080 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.MessageId)
+			if err := writeShortString(headerPayload, msgCopy.Properties.MessageId); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x0040 != 0 {
 			binary.Write(headerPayload, binary.BigEndian, msgCopy.Properties.Timestamp)
 		}
 		if flags&0x0020 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.Type)
+			if err := writeShortString(headerPayload, msgCopy.Properties.Type); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x0010 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.UserId)
+			if err := writeShortString(headerPayload, msgCopy.Properties.UserId); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x0008 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.AppId)
+			if err := writeShortString(headerPayload, msgCopy.Properties.AppId); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 		if flags&0x0004 != 0 {
-			writeShortString(headerPayload, msgCopy.Properties.ClusterId)
+			if err := writeShortString(headerPayload, msgCopy.Properties.ClusterId); err != nil {
+				c.server.Err("Error building deliver header payload for tag %d: %v", deliveryTag, err)
+				queue.mu.Lock()
+				queue.Messages = append([]message{msg}, queue.Messages...)
+				queue.mu.Unlock()
+				if !noAck {
+					ch.mu.Lock()
+					delete(ch.unackedMessages, deliveryTag)
+					ch.mu.Unlock()
+				}
+				continue
+			}
 		}
 
 		// Lock, Buffer all frames, Flush once, Unlock
@@ -2577,7 +2767,10 @@ func (c *connection) sendChannelClose(channelId uint16, replyCode uint16, replyT
 		c.server.Err("Internal error serializing replyCode for Channel.Close: %v", err)
 		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR", 0, 0)
 	}
-	writeShortString(payload, replyText) // Assuming writeShortString doesn't error or handles internally
+	if err := writeShortString(payload, replyText); err != nil {
+		c.server.Err("Internal error writing replyText for Channel.Close: %v", err)
+		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR", 0, 0)
+	}
 	if err := binary.Write(payload, binary.BigEndian, offendingClassId); err != nil {
 		c.server.Err("Internal error serializing offendingClassId for Channel.Close: %v", err)
 		return c.sendConnectionClose(amqpError.InternalError.Code(), "INTERNAL_SERVER_ERROR", 0, 0)
@@ -2794,7 +2987,10 @@ func (c *connection) sendConnectionClose(replyCode uint16, replyText string, off
 	binary.Write(payload, binary.BigEndian, uint16(ClassConnection))
 	binary.Write(payload, binary.BigEndian, uint16(MethodConnectionClose))
 	binary.Write(payload, binary.BigEndian, replyCode)
-	writeShortString(payload, replyText)
+	if err := writeShortString(payload, replyText); err != nil {
+		c.server.Err("Internal error writing replyText for Connection.Close: %v", err)
+		return fmt.Errorf("writing replyText for Connection.Close: %w", err)
+	}
 	binary.Write(payload, binary.BigEndian, offendingClassId)
 	binary.Write(payload, binary.BigEndian, offendingMethodId)
 
@@ -2832,13 +3028,19 @@ func (c *connection) sendBasicReturn(channelId uint16, replyCode uint16, replyTe
 	}
 
 	// Write reply-text
-	writeShortString(payload, replyText)
+	if err := writeShortString(payload, replyText); err != nil {
+		return fmt.Errorf("writing reply-text for basic.return: %w", err)
+	}
 
 	// Write exchange
-	writeShortString(payload, exchange)
+	if err := writeShortString(payload, exchange); err != nil {
+		return fmt.Errorf("writing exchange for basic.return: %w", err)
+	}
 
 	// Write routing-key
-	writeShortString(payload, routingKey)
+	if err := writeShortString(payload, routingKey); err != nil {
+		return fmt.Errorf("writing routing-key for basic.return: %w", err)
+	}
 
 	return c.writeFrame(&frame{
 		Type:    FrameMethod,

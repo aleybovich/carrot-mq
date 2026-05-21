@@ -166,7 +166,9 @@ func (c *connection) handleMethodConnectionOpen(reader *bytes.Reader) error {
 	binary.Write(payload, binary.BigEndian, uint16(ClassConnection))
 	binary.Write(payload, binary.BigEndian, uint16(MethodConnectionOpenOk))
 	// AMQP 0-9-1 Connection.OpenOk has one field: known-hosts (shortstr), which "MUST be zero length".
-	writeShortString(payload, "") // known-hosts
+	if err := writeShortString(payload, ""); err != nil {
+		return fmt.Errorf("writing known-hosts: %w", err)
+	}
 
 	err = c.writeFrame(&frame{
 		Type:    FrameMethod,
@@ -930,7 +932,9 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 		payloadOk := &bytes.Buffer{}
 		binary.Write(payloadOk, binary.BigEndian, uint16(ClassQueue))
 		binary.Write(payloadOk, binary.BigEndian, uint16(MethodQueueDeclareOk))
-		writeShortString(payloadOk, actualQueueName)
+		if err := writeShortString(payloadOk, actualQueueName); err != nil {
+			return fmt.Errorf("writing queue name: %w", err)
+		}
 		binary.Write(payloadOk, binary.BigEndian, messageCount)
 		binary.Write(payloadOk, binary.BigEndian, consumerCount)
 
@@ -1682,8 +1686,12 @@ func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 		methodPayload.WriteByte(0) // redelivered = false
 	}
 
-	writeShortString(methodPayload, msg.Exchange)
-	writeShortString(methodPayload, msg.RoutingKey)
+	if err := writeShortString(methodPayload, msg.Exchange); err != nil {
+		return fmt.Errorf("writing exchange: %w", err)
+	}
+	if err := writeShortString(methodPayload, msg.RoutingKey); err != nil {
+		return fmt.Errorf("writing routing key: %w", err)
+	}
 	binary.Write(methodPayload, binary.BigEndian, messageCount)
 
 	// Prepare header frame
@@ -1741,13 +1749,19 @@ func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 
 	// Write properties based on flags
 	if flags&0x8000 != 0 {
-		writeShortString(headerPayload, msg.Properties.ContentType)
+		if err := writeShortString(headerPayload, msg.Properties.ContentType); err != nil {
+			return fmt.Errorf("writing content-type: %w", err)
+		}
 	}
 	if flags&0x4000 != 0 {
-		writeShortString(headerPayload, msg.Properties.ContentEncoding)
+		if err := writeShortString(headerPayload, msg.Properties.ContentEncoding); err != nil {
+			return fmt.Errorf("writing content-encoding: %w", err)
+		}
 	}
 	if flags&0x2000 != 0 {
-		writeTable(headerPayload, msg.Properties.Headers)
+		if err := writeTable(headerPayload, msg.Properties.Headers); err != nil {
+			return fmt.Errorf("writing headers: %w", err)
+		}
 	}
 	if flags&0x1000 != 0 {
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.DeliveryMode)
@@ -1756,31 +1770,47 @@ func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Priority)
 	}
 	if flags&0x0400 != 0 {
-		writeShortString(headerPayload, msg.Properties.CorrelationId)
+		if err := writeShortString(headerPayload, msg.Properties.CorrelationId); err != nil {
+			return fmt.Errorf("writing correlation-id: %w", err)
+		}
 	}
 	if flags&0x0200 != 0 {
-		writeShortString(headerPayload, msg.Properties.ReplyTo)
+		if err := writeShortString(headerPayload, msg.Properties.ReplyTo); err != nil {
+			return fmt.Errorf("writing reply-to: %w", err)
+		}
 	}
 	if flags&0x0100 != 0 {
-		writeShortString(headerPayload, msg.Properties.Expiration)
+		if err := writeShortString(headerPayload, msg.Properties.Expiration); err != nil {
+			return fmt.Errorf("writing expiration: %w", err)
+		}
 	}
 	if flags&0x0080 != 0 {
-		writeShortString(headerPayload, msg.Properties.MessageId)
+		if err := writeShortString(headerPayload, msg.Properties.MessageId); err != nil {
+			return fmt.Errorf("writing message-id: %w", err)
+		}
 	}
 	if flags&0x0040 != 0 {
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Timestamp)
 	}
 	if flags&0x0020 != 0 {
-		writeShortString(headerPayload, msg.Properties.Type)
+		if err := writeShortString(headerPayload, msg.Properties.Type); err != nil {
+			return fmt.Errorf("writing type: %w", err)
+		}
 	}
 	if flags&0x0010 != 0 {
-		writeShortString(headerPayload, msg.Properties.UserId)
+		if err := writeShortString(headerPayload, msg.Properties.UserId); err != nil {
+			return fmt.Errorf("writing user-id: %w", err)
+		}
 	}
 	if flags&0x0008 != 0 {
-		writeShortString(headerPayload, msg.Properties.AppId)
+		if err := writeShortString(headerPayload, msg.Properties.AppId); err != nil {
+			return fmt.Errorf("writing app-id: %w", err)
+		}
 	}
 	if flags&0x0004 != 0 {
-		writeShortString(headerPayload, msg.Properties.ClusterId)
+		if err := writeShortString(headerPayload, msg.Properties.ClusterId); err != nil {
+			return fmt.Errorf("writing cluster-id: %w", err)
+		}
 	}
 
 	// Send all three frames atomically
@@ -1888,7 +1918,9 @@ func (c *connection) handleMethodBasicCancel(reader *bytes.Reader, channelId uin
 		payload := &bytes.Buffer{}
 		binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
 		binary.Write(payload, binary.BigEndian, uint16(MethodBasicCancelOk))
-		writeShortString(payload, consumerTag)
+		if err := writeShortString(payload, consumerTag); err != nil {
+			return fmt.Errorf("writing consumer tag: %w", err)
+		}
 
 		if err := c.writeFrame(&frame{
 			Type:    FrameMethod,
@@ -2100,7 +2132,9 @@ func (c *connection) handleMethodBasicConsume(reader *bytes.Reader, channelId ui
 		payloadOk := &bytes.Buffer{}
 		binary.Write(payloadOk, binary.BigEndian, uint16(ClassBasic))
 		binary.Write(payloadOk, binary.BigEndian, uint16(MethodBasicConsumeOk))
-		writeShortString(payloadOk, actualConsumerTag)
+		if err := writeShortString(payloadOk, actualConsumerTag); err != nil {
+			return fmt.Errorf("writing consumer tag: %w", err)
+		}
 
 		if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
 			c.server.Err("Error sending basic.consume-ok for consumer '%s' on queue '%s': %v", actualConsumerTag, queueName, errWrite)
