@@ -117,6 +117,18 @@ func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	if err := binary.Read(reader, binary.BigEndian, &c.frameMax); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (frame-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}
+
+	// AMQP 0-9-1 spec: if client proposes frame-max higher than server's value,
+	// server MUST close the connection. A client value of 0 means "no limit" which
+	// we treat as accepting the server's proposed value.
+	if c.frameMax == 0 {
+		c.frameMax = suggestedFrameMaxSize
+	} else if c.frameMax > suggestedFrameMaxSize {
+		return c.sendConnectionClose(amqpError.NotAllowed.Code(),
+			fmt.Sprintf("frame-max %d exceeds server maximum %d", c.frameMax, suggestedFrameMaxSize),
+			uint16(ClassConnection), MethodConnectionTuneOk)
+	}
+
 	if err := binary.Read(reader, binary.BigEndian, &c.heartbeatInterval); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (heartbeat)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}

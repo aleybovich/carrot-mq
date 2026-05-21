@@ -26,6 +26,10 @@ const (
 	FrameBody      = 3
 	FrameHeartbeat = 8
 	FrameEnd       = 206
+
+	// frameMinSize is the minimum frame size all peers MUST accept before
+	// frame-max has been negotiated (AMQP 0-9-1 §2.3.7, constant "frame-min-size").
+	frameMinSize = 4096
 )
 
 const (

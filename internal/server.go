@@ -996,10 +996,17 @@ func (c *connection) readFrame() (*frame, error) {
 	}
 
 	size := binary.BigEndian.Uint32(header[3:7])
-	if c.frameMax > 0 && size > uint32(c.frameMax) {
-		// Send connection.close with frame-error
-		c.sendConnectionClose(amqpError.UnexpectedFrame.Code(), "frame too large", 0, 0)
-		return nil, fmt.Errorf("frame size %d exceeds negotiated max %d", size, c.frameMax)
+
+	// Enforce frame size limits per AMQP 0-9-1 spec:
+	// Before negotiation completes, peers MUST accept frames up to frame-min-size
+	// but are not required to accept larger ones. After negotiation, use frame-max.
+	effectiveMax := c.frameMax
+	if effectiveMax == 0 {
+		effectiveMax = frameMinSize
+	}
+	if size > effectiveMax {
+		c.sendConnectionClose(amqpError.FrameError.Code(), "frame too large", 0, 0)
+		return nil, fmt.Errorf("frame size %d exceeds max %d", size, effectiveMax)
 	}
 
 	frame.Payload = make([]byte, size)
