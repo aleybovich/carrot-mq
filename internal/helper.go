@@ -2,9 +2,10 @@ package internal
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"runtime"
 	"strings"
@@ -653,34 +654,19 @@ func FindMessageInQueueNonLocking(msgIdentifier string, queue *queue) (int, bool
 	return -1, false
 }
 
-// GetMessageIdentifier creates a unique hash for a message based on its key properties
-// Note: For production code, consider adding "crypto/sha256" to your imports
+// GetMessageIdentifier creates a unique hash for a message based on its key properties.
 func GetMessageIdentifier(msg *message) string {
 	if msg == nil {
 		return ""
 	}
 
-	// Create a buffer to concatenate all fields
-	var buffer bytes.Buffer
+	h := sha256.New()
+	h.Write([]byte(msg.Properties.MessageId))
+	binary.Write(h, binary.BigEndian, msg.Properties.Timestamp)
+	h.Write([]byte(msg.RoutingKey))
+	h.Write(msg.Body)
 
-	// Add message ID (or empty string if not set)
-	buffer.WriteString(msg.Properties.MessageId)
-
-	// Add timestamp as bytes
-	binary.Write(&buffer, binary.BigEndian, msg.Properties.Timestamp)
-
-	// Add routing key
-	buffer.WriteString(msg.RoutingKey)
-
-	// Add message body
-	buffer.Write(msg.Body)
-
-	// Create a simple hash using built-in hash/fnv package
-	h := fnv.New64a()
-	h.Write(buffer.Bytes())
-
-	// Return hex representation of the hash
-	return fmt.Sprintf("%x", h.Sum64())
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Get caller function name for logging

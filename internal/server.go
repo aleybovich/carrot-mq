@@ -270,6 +270,10 @@ type server struct {
 
 	// AMQP configuration
 	heartbeatInterval uint16 // Heartbeat interval in seconds
+
+	// Connection limiting
+	maxConnections int
+	connSem        chan struct{} // nil means unlimited
 }
 
 type amqpDecimal struct {
@@ -503,6 +507,19 @@ func WithHeartbeatInterval(interval uint16) ServerOption {
 	}
 }
 
+// WithMaxConnections sets the maximum number of concurrent client connections.
+// Once the limit is reached, new TCP connections are closed immediately.
+// A value of 0 means unlimited (default).
+func WithMaxConnections(max int) ServerOption {
+	return func(s *server) {
+		if max > 0 {
+			s.maxConnections = max
+			s.connSem = make(chan struct{}, max)
+			s.Info("Max connections configured to %d", max)
+		}
+	}
+}
+
 func (s *server) IsReady() bool {
 	return s.isReady.Load()
 }
@@ -515,11 +532,15 @@ func NewServer(opts ...ServerOption) *server {
 		logPrefix = "[AMQP] "
 	}
 
+	const defaultMaxConnections = 1024
+
 	s := &server{
 		vhosts:            make(map[string]*vHost),
 		internalLogger:    log.New(os.Stdout, logPrefix, log.LstdFlags|log.Lmicroseconds),
 		connections:       make(map[*connection]struct{}),
 		heartbeatInterval: suggestedHeartbeatInterval, // Default to 60 seconds
+		maxConnections:    defaultMaxConnections,
+		connSem:           make(chan struct{}, defaultMaxConnections),
 	}
 
 	// Create default vhost
@@ -583,6 +604,18 @@ func (s *server) Start(addr string) error {
 			s.Err("Error accepting connection: %v", err)
 			continue
 		}
+		// Enforce connection limit before spawning a handler goroutine
+		if s.connSem != nil {
+			select {
+			case s.connSem <- struct{}{}:
+				// Acquired slot
+			default:
+				s.Warn("Max connections (%d) reached, rejecting connection from %s", s.maxConnections, conn.RemoteAddr())
+				conn.Close()
+				continue
+			}
+		}
+
 		s.Info("New connection from %s", conn.RemoteAddr())
 		go s.handleConnection(conn)
 	}
@@ -814,6 +847,10 @@ func (s *server) removeConnection(c *connection) {
 	defer s.connectionsMu.Unlock()
 	if _, ok := s.connections[c]; ok {
 		delete(s.connections, c)
+		// Release connection semaphore slot
+		if s.connSem != nil {
+			<-s.connSem
+		}
 		s.Info("Connection %s removed from active list. Total remaining: %d", c.conn.RemoteAddr(), len(s.connections))
 	} else {
 		s.Warn("Attempted to remove connection %s from active list, but it was not found.", c.conn.RemoteAddr())
@@ -823,6 +860,14 @@ func (s *server) removeConnection(c *connection) {
 func (s *server) handleConnection(conn net.Conn) {
 
 	s.Info("Handling connection from %s", conn.RemoteAddr())
+
+	// releaseConnSlot releases the connection semaphore slot if the connection
+	// fails before being added to the active connections map.
+	releaseConnSlot := func() {
+		if s.connSem != nil {
+			<-s.connSem
+		}
+	}
 
 	c := &connection{
 		conn:             conn,
@@ -838,12 +883,14 @@ func (s *server) handleConnection(conn net.Conn) {
 	if _, err := io.ReadFull(c.reader, protocol); err != nil {
 		s.Err("Error reading protocol header from %s: %v", conn.RemoteAddr(), err)
 		conn.Close() // Ensure connection is closed on early error
+		releaseConnSlot()
 		return
 	}
 
 	if !bytes.Equal(protocol, []byte("AMQP\x00\x00\x09\x01")) {
 		s.Warn("Invalid protocol header from %s: %v", conn.RemoteAddr(), protocol)
 		conn.Close() // Ensure connection is closed
+		releaseConnSlot()
 		return
 	}
 	s.Info("Protocol header validated from %s", conn.RemoteAddr())
@@ -853,6 +900,7 @@ func (s *server) handleConnection(conn net.Conn) {
 		// No AMQP error to send here as connection.start itself failed.
 		c.cleanupConnectionResources() // Attempt cleanup
 		conn.Close()
+		releaseConnSlot()
 		return
 	}
 	s.Info("Sent connection.start to %s", conn.RemoteAddr())

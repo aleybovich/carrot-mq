@@ -562,14 +562,10 @@ func (c *connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 
 			// PERSISTENCE: Save durable exchange after successful creation
 			if c.server.persistenceManager != nil && durable {
-				vhost.mu.Unlock() // Unlock before persistence operation
-
 				record := ExchangeToRecord(newExchange)
 				if err := c.server.persistenceManager.SaveExchange(vhost.name, record); err != nil {
 					c.server.Err("Failed to persist exchange %s: %v", exchangeName, err)
 				}
-
-				vhost.mu.Lock() // Re-lock for consistency
 			}
 
 			vhost.exchanges[exchangeName] = newExchange
@@ -916,22 +912,18 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 				Exclusive:  exclusive,
 				AutoDelete: autoDelete,
 			}
-			vhost.queues[actualQueueName] = newQueue
-
-			c.server.Info("Created new queue: '%s', durable=%v, exclusive=%v, autoDelete=%v",
-				actualQueueName, durable, exclusive, autoDelete)
-
-			// PERSISTENCE: Save durable queue after successful creation
+			// PERSISTENCE: Save durable queue before exposing it
 			if c.server.persistenceManager != nil && durable {
-				vhost.mu.Unlock() // Unlock before persistence
-
 				record := QueueToRecord(newQueue)
 				if err := c.server.persistenceManager.SaveQueue(vhost.name, record); err != nil {
 					c.server.Err("Failed to persist queue %s: %v", actualQueueName, err)
 				}
-
-				vhost.mu.Lock() // Re-lock
 			}
+
+			vhost.queues[actualQueueName] = newQueue
+
+			c.server.Info("Created new queue: '%s', durable=%v, exclusive=%v, autoDelete=%v",
+				actualQueueName, durable, exclusive, autoDelete)
 
 			messageCount = 0
 			consumerCount = 0
