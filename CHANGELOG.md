@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1]
+
+## Added
+- Public `carrotmq.WithDisableLogging()` option to disable carrot-mq logging
+
 ## [0.3.0]
 
 ### Fixed

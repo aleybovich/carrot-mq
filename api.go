@@ -81,6 +81,13 @@ func NewServer(opts ...ServerOption) *Server {
 	}
 }
 
+// WithDisableLogging disables all server logging output.
+func WithDisableLogging() ServerOption {
+	return func(opts *serverOptions) {
+		opts.internalOpts = append(opts.internalOpts, internal.WithLoggingConfig(config.LoggingConfig{DisableLogging: true}))
+	}
+}
+
 // WithLogger sets a custom logger that implements the logger.Logger interface.
 // If not used, a default logger that writes to stdout will be used.
 func WithLogger(l logger.Logger) ServerOption {
