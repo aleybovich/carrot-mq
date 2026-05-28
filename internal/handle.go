@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -117,6 +116,18 @@ func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	if err := binary.Read(reader, binary.BigEndian, &c.frameMax); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (frame-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}
+
+	// AMQP 0-9-1 spec: if client proposes frame-max higher than server's value,
+	// server MUST close the connection. A client value of 0 means "no limit" which
+	// we treat as accepting the server's proposed value.
+	if c.frameMax == 0 {
+		c.frameMax = suggestedFrameMaxSize
+	} else if c.frameMax > suggestedFrameMaxSize {
+		return c.sendConnectionClose(amqpError.NotAllowed.Code(),
+			fmt.Sprintf("frame-max %d exceeds server maximum %d", c.frameMax, suggestedFrameMaxSize),
+			uint16(ClassConnection), MethodConnectionTuneOk)
+	}
+
 	if err := binary.Read(reader, binary.BigEndian, &c.heartbeatInterval); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (heartbeat)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}
@@ -166,7 +177,9 @@ func (c *connection) handleMethodConnectionOpen(reader *bytes.Reader) error {
 	binary.Write(payload, binary.BigEndian, uint16(ClassConnection))
 	binary.Write(payload, binary.BigEndian, uint16(MethodConnectionOpenOk))
 	// AMQP 0-9-1 Connection.OpenOk has one field: known-hosts (shortstr), which "MUST be zero length".
-	writeShortString(payload, "") // known-hosts
+	if err := writeShortString(payload, ""); err != nil {
+		return fmt.Errorf("writing known-hosts: %w", err)
+	}
 
 	err = c.writeFrame(&frame{
 		Type:    FrameMethod,
@@ -480,8 +493,8 @@ func (c *connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 		exchangeName, exchangeType, passive, durable, autoDelete, internal, noWait, args, channelId)
 
 	// Validate exchange type - essential for server operation. Headers exchange is not implemented for now
-	validTypes := map[string]bool{"direct": true, "fanout": true, "topic": true, "headers": false}
-	if _, isValidType := validTypes[exchangeType]; !isValidType {
+	validTypes := map[string]bool{"direct": true, "fanout": true, "topic": true}
+	if !validTypes[exchangeType] {
 		replyText := fmt.Sprintf("exchange type '%s' not implemented", exchangeType)
 		c.server.Warn("Exchange.Declare: %s for exchange '%s'. Sending Channel.Close.", replyText, exchangeName)
 		// AMQP code 540 (NOT_IMPLEMENTED)
@@ -548,14 +561,10 @@ func (c *connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 
 			// PERSISTENCE: Save durable exchange after successful creation
 			if c.server.persistenceManager != nil && durable {
-				vhost.mu.Unlock() // Unlock before persistence operation
-
 				record := ExchangeToRecord(newExchange)
 				if err := c.server.persistenceManager.SaveExchange(vhost.name, record); err != nil {
 					c.server.Err("Failed to persist exchange %s: %v", exchangeName, err)
 				}
-
-				vhost.mu.Lock() // Re-lock for consistency
 			}
 
 			vhost.exchanges[exchangeName] = newExchange
@@ -820,10 +829,8 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 		}
 		// Passive and exists: check compatibility.
 		q.mu.RLock()
-		// Per your original logic: if it's exclusive, it's a 405.
-		// This implies an attempt to use/check an exclusive queue owned by another connection.
-		// If your server tracked ownerChannel, a more nuanced check could be done here.
-		if q.Exclusive {
+		// If the queue is exclusive and this is NOT the owning connection, reject with 405.
+		if q.Exclusive && q.ownerConn != c {
 			q.mu.RUnlock()
 			vhost.mu.Unlock()
 			replyText := fmt.Sprintf("queue '%s' is exclusive", actualQueueName)
@@ -858,14 +865,11 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 	} else { // Not passive: declare or re-declare.
 		if exists {
 			q.mu.RLock()
-			// Per your original logic:
-			// 1. Check if it's an exclusive queue (implies owned by another if we don't track owner) -> 405
-			if q.Exclusive { // This implies an attempt to re-declare an existing exclusive queue.
-				// If this connection *is* the owner, this check might be too strict without ownerChannel tracking.
-				// However, if it *is* the owner, and tries to change 'exclusive' from true to false, that's a 406.
+			// If the queue is exclusive and this is NOT the owning connection, reject with 405.
+			if q.Exclusive && q.ownerConn != c {
 				q.mu.RUnlock()
 				vhost.mu.Unlock()
-				replyText := fmt.Sprintf("queue '%s' is exclusive and cannot be redeclared by this connection or with changed exclusive status", actualQueueName)
+				replyText := fmt.Sprintf("queue '%s' is exclusive and owned by another connection", actualQueueName)
 				c.server.Warn("Queue.Declare: %s. Sending Channel.Close.", replyText)
 				return c.sendChannelClose(channelId, amqpError.ResourceLocked.Code(), replyText, uint16(ClassQueue), MethodQueueDeclare)
 			}
@@ -893,6 +897,10 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 			consumerCount = uint32(len(q.Consumers))
 			q.mu.RUnlock()
 		} else { // Not passive and not exists: create it.
+			var owner *connection
+			if exclusive {
+				owner = c
+			}
 			newQueue := &queue{
 				Name:       actualQueueName,
 				Messages:   []message{},
@@ -901,23 +909,20 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 				Durable:    durable,
 				Exclusive:  exclusive,
 				AutoDelete: autoDelete,
+				ownerConn:  owner,
 			}
-			vhost.queues[actualQueueName] = newQueue
-
-			c.server.Info("Created new queue: '%s', durable=%v, exclusive=%v, autoDelete=%v",
-				actualQueueName, durable, exclusive, autoDelete)
-
-			// PERSISTENCE: Save durable queue after successful creation
+			// PERSISTENCE: Save durable queue before exposing it
 			if c.server.persistenceManager != nil && durable {
-				vhost.mu.Unlock() // Unlock before persistence
-
 				record := QueueToRecord(newQueue)
 				if err := c.server.persistenceManager.SaveQueue(vhost.name, record); err != nil {
 					c.server.Err("Failed to persist queue %s: %v", actualQueueName, err)
 				}
-
-				vhost.mu.Lock() // Re-lock
 			}
+
+			vhost.queues[actualQueueName] = newQueue
+
+			c.server.Info("Created new queue: '%s', durable=%v, exclusive=%v, autoDelete=%v",
+				actualQueueName, durable, exclusive, autoDelete)
 
 			messageCount = 0
 			consumerCount = 0
@@ -930,7 +935,9 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 		payloadOk := &bytes.Buffer{}
 		binary.Write(payloadOk, binary.BigEndian, uint16(ClassQueue))
 		binary.Write(payloadOk, binary.BigEndian, uint16(MethodQueueDeclareOk))
-		writeShortString(payloadOk, actualQueueName)
+		if err := writeShortString(payloadOk, actualQueueName); err != nil {
+			return fmt.Errorf("writing queue name: %w", err)
+		}
 		binary.Write(payloadOk, binary.BigEndian, messageCount)
 		binary.Write(payloadOk, binary.BigEndian, consumerCount)
 
@@ -1682,8 +1689,12 @@ func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 		methodPayload.WriteByte(0) // redelivered = false
 	}
 
-	writeShortString(methodPayload, msg.Exchange)
-	writeShortString(methodPayload, msg.RoutingKey)
+	if err := writeShortString(methodPayload, msg.Exchange); err != nil {
+		return fmt.Errorf("writing exchange: %w", err)
+	}
+	if err := writeShortString(methodPayload, msg.RoutingKey); err != nil {
+		return fmt.Errorf("writing routing key: %w", err)
+	}
 	binary.Write(methodPayload, binary.BigEndian, messageCount)
 
 	// Prepare header frame
@@ -1741,13 +1752,19 @@ func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 
 	// Write properties based on flags
 	if flags&0x8000 != 0 {
-		writeShortString(headerPayload, msg.Properties.ContentType)
+		if err := writeShortString(headerPayload, msg.Properties.ContentType); err != nil {
+			return fmt.Errorf("writing content-type: %w", err)
+		}
 	}
 	if flags&0x4000 != 0 {
-		writeShortString(headerPayload, msg.Properties.ContentEncoding)
+		if err := writeShortString(headerPayload, msg.Properties.ContentEncoding); err != nil {
+			return fmt.Errorf("writing content-encoding: %w", err)
+		}
 	}
 	if flags&0x2000 != 0 {
-		writeTable(headerPayload, msg.Properties.Headers)
+		if err := writeTable(headerPayload, msg.Properties.Headers); err != nil {
+			return fmt.Errorf("writing headers: %w", err)
+		}
 	}
 	if flags&0x1000 != 0 {
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.DeliveryMode)
@@ -1756,31 +1773,47 @@ func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Priority)
 	}
 	if flags&0x0400 != 0 {
-		writeShortString(headerPayload, msg.Properties.CorrelationId)
+		if err := writeShortString(headerPayload, msg.Properties.CorrelationId); err != nil {
+			return fmt.Errorf("writing correlation-id: %w", err)
+		}
 	}
 	if flags&0x0200 != 0 {
-		writeShortString(headerPayload, msg.Properties.ReplyTo)
+		if err := writeShortString(headerPayload, msg.Properties.ReplyTo); err != nil {
+			return fmt.Errorf("writing reply-to: %w", err)
+		}
 	}
 	if flags&0x0100 != 0 {
-		writeShortString(headerPayload, msg.Properties.Expiration)
+		if err := writeShortString(headerPayload, msg.Properties.Expiration); err != nil {
+			return fmt.Errorf("writing expiration: %w", err)
+		}
 	}
 	if flags&0x0080 != 0 {
-		writeShortString(headerPayload, msg.Properties.MessageId)
+		if err := writeShortString(headerPayload, msg.Properties.MessageId); err != nil {
+			return fmt.Errorf("writing message-id: %w", err)
+		}
 	}
 	if flags&0x0040 != 0 {
 		binary.Write(headerPayload, binary.BigEndian, msg.Properties.Timestamp)
 	}
 	if flags&0x0020 != 0 {
-		writeShortString(headerPayload, msg.Properties.Type)
+		if err := writeShortString(headerPayload, msg.Properties.Type); err != nil {
+			return fmt.Errorf("writing type: %w", err)
+		}
 	}
 	if flags&0x0010 != 0 {
-		writeShortString(headerPayload, msg.Properties.UserId)
+		if err := writeShortString(headerPayload, msg.Properties.UserId); err != nil {
+			return fmt.Errorf("writing user-id: %w", err)
+		}
 	}
 	if flags&0x0008 != 0 {
-		writeShortString(headerPayload, msg.Properties.AppId)
+		if err := writeShortString(headerPayload, msg.Properties.AppId); err != nil {
+			return fmt.Errorf("writing app-id: %w", err)
+		}
 	}
 	if flags&0x0004 != 0 {
-		writeShortString(headerPayload, msg.Properties.ClusterId)
+		if err := writeShortString(headerPayload, msg.Properties.ClusterId); err != nil {
+			return fmt.Errorf("writing cluster-id: %w", err)
+		}
 	}
 
 	// Send all three frames atomically
@@ -1888,7 +1921,9 @@ func (c *connection) handleMethodBasicCancel(reader *bytes.Reader, channelId uin
 		payload := &bytes.Buffer{}
 		binary.Write(payload, binary.BigEndian, uint16(ClassBasic))
 		binary.Write(payload, binary.BigEndian, uint16(MethodBasicCancelOk))
-		writeShortString(payload, consumerTag)
+		if err := writeShortString(payload, consumerTag); err != nil {
+			return fmt.Errorf("writing consumer tag: %w", err)
+		}
 
 		if err := c.writeFrame(&frame{
 			Type:    FrameMethod,
@@ -2100,7 +2135,9 @@ func (c *connection) handleMethodBasicConsume(reader *bytes.Reader, channelId ui
 		payloadOk := &bytes.Buffer{}
 		binary.Write(payloadOk, binary.BigEndian, uint16(ClassBasic))
 		binary.Write(payloadOk, binary.BigEndian, uint16(MethodBasicConsumeOk))
-		writeShortString(payloadOk, actualConsumerTag)
+		if err := writeShortString(payloadOk, actualConsumerTag); err != nil {
+			return fmt.Errorf("writing consumer tag: %w", err)
+		}
 
 		if errWrite := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payloadOk.Bytes()}); errWrite != nil {
 			c.server.Err("Error sending basic.consume-ok for consumer '%s' on queue '%s': %v", actualConsumerTag, queueName, errWrite)
@@ -2255,14 +2292,14 @@ func (c *connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 		messagesByQueue := make(map[string][]string)
 
 		for _, msgInfo := range messagesToDelete {
-			key := msgInfo.VHostName + ":" + msgInfo.QueueName
+			key := compositeKey(msgInfo.VHostName, msgInfo.QueueName)
 			messagesByQueue[key] = append(messagesByQueue[key], msgInfo.MessageId)
 		}
 
 		// Delete in batches by queue
 		for queueKey, messageIds := range messagesByQueue {
-			parts := strings.Split(queueKey, ":")
-			vhostName, queueName := parts[0], parts[1]
+			decoded, _ := splitCompositeKey(queueKey, 2)
+			vhostName, queueName := decoded[0], decoded[1]
 
 			if err := c.server.persistenceManager.DeleteMessagesBatch(vhostName, queueName, messageIds); err != nil {
 				c.server.Err("Failed to delete nacked messages from queue %s: %v", queueName, err)

@@ -2,10 +2,12 @@ package internal
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
-	"hash/fnv"
 	"io"
+	"runtime"
 	"strings"
 )
 
@@ -239,9 +241,13 @@ func readLongString(reader *bytes.Reader) (string, error) {
 	return string(data), nil
 }
 
-func writeShortString(writer *bytes.Buffer, s string) {
+func writeShortString(writer *bytes.Buffer, s string) error {
+	if len(s) > 255 {
+		return fmt.Errorf("short string exceeds 255 bytes: len=%d", len(s))
+	}
 	writer.WriteByte(uint8(len(s)))
 	writer.WriteString(s)
+	return nil
 }
 
 func readFieldValue(reader *bytes.Reader, valueType byte) (interface{}, error) {
@@ -619,9 +625,9 @@ func writeTable(writer *bytes.Buffer, table map[string]interface{}) error {
 	tablePayloadBuffer := &bytes.Buffer{}
 
 	for key, value := range table {
-		// Assuming writeShortString does not return an error.
-		// If it could fail, its error would need to be handled here.
-		writeShortString(tablePayloadBuffer, key)
+		if err := writeShortString(tablePayloadBuffer, key); err != nil {
+			return fmt.Errorf("serializing key '%s': %w", key, err)
+		}
 
 		if err := writeFieldValue(tablePayloadBuffer, value); err != nil {
 			return fmt.Errorf("serializing value for key '%s' (type %T): %w", key, value, err)
@@ -648,32 +654,25 @@ func FindMessageInQueueNonLocking(msgIdentifier string, queue *queue) (int, bool
 	return -1, false
 }
 
-// GetMessageIdentifier creates a unique hash for a message based on its key properties
-// Note: For production code, consider adding "crypto/sha256" to your imports
+// GetMessageIdentifier creates a unique hash for a message based on its key properties.
 func GetMessageIdentifier(msg *message) string {
 	if msg == nil {
 		return ""
 	}
 
-	// Create a buffer to concatenate all fields
-	var buffer bytes.Buffer
+	h := sha256.New()
+	h.Write([]byte(msg.Properties.MessageId))
+	binary.Write(h, binary.BigEndian, msg.Properties.Timestamp)
+	h.Write([]byte(msg.RoutingKey))
+	h.Write(msg.Body)
 
-	// Add message ID (or empty string if not set)
-	buffer.WriteString(msg.Properties.MessageId)
+	return hex.EncodeToString(h.Sum(nil))
+}
 
-	// Add timestamp as bytes
-	binary.Write(&buffer, binary.BigEndian, msg.Properties.Timestamp)
-
-	// Add routing key
-	buffer.WriteString(msg.RoutingKey)
-
-	// Add message body
-	buffer.Write(msg.Body)
-
-	// Create a simple hash using built-in hash/fnv package
-	h := fnv.New64a()
-	h.Write(buffer.Bytes())
-
-	// Return hex representation of the hash
-	return fmt.Sprintf("%x", h.Sum64())
+// Get caller function name for logging
+func getCallerName() string {
+	pc, _, _, _ := runtime.Caller(2) // Use depth 2 to get the actual caller, not the logging function
+	caller := runtime.FuncForPC(pc).Name()
+	parts := strings.Split(caller, ".")
+	return parts[len(parts)-1]
 }

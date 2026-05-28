@@ -1,4 +1,4 @@
-package amqpError
+package amqperror
 
 // AmqpError represents AMQP protocol error codes
 type AmqpError uint16

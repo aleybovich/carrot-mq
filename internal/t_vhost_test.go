@@ -185,27 +185,26 @@ func TestVHost_Delete_AlreadyDeleting(t *testing.T) {
 	t.Logf("Deletion attempt 1 returned: %v", err1)
 	t.Logf("Deletion attempt 2 returned: %v", err2)
 
-	alreadyDeletingSubstr := "is already in the process of deletion"
-	// vhostDoesNotExistSubstr := "does not exist" // We are less concerned about this for this specific test's goal
-
-	// Condition: One call successfully initiated the deletion (returning nil),
-	// and the other call attempted to delete while it was in progress.
-	err1IsAlreadyDeleting := err1 != nil && strings.Contains(err1.Error(), alreadyDeletingSubstr)
-	err2IsAlreadyDeleting := err2 != nil && strings.Contains(err2.Error(), alreadyDeletingSubstr)
-
-	// The logic should be: one of them successfully started the deletion (err is nil for that one),
-	// and the other one found the 'deleting' flag set.
-	testPassed := (err1IsAlreadyDeleting && err2 == nil) || (err2IsAlreadyDeleting && err1 == nil)
-
-	if !testPassed {
-		// Provide a more detailed failure message if the primary condition isn't met
-		t.Errorf("Expected one DeleteVHost call to return nil (successful initiation) and the other to return an error containing '%s'. "+
-			"Got err1: %v, err2: %v", alreadyDeletingSubstr, err1, err2)
+	// Exactly one call should succeed (nil error). The other should fail with either
+	// "already in the process of deletion" (caught mid-delete) or "does not exist"
+	// (deletion completed before the second call started). Both are valid race outcomes.
+	isExpectedErr := func(err error) bool {
+		if err == nil {
+			return false
+		}
+		msg := err.Error()
+		return strings.Contains(msg, "is already in the process of deletion") ||
+			strings.Contains(msg, "does not exist")
 	}
 
-	assert.True(t, testPassed,
-		fmt.Sprintf("Expected one deletion to succeed (nil error) and the other to report 'already in process of deletion'. "+
-			"Actual errors - err1: [%v], err2: [%v]", err1, err2))
+	oneNil := (err1 == nil) != (err2 == nil) // exactly one is nil
+	loserErr := err1
+	if err1 == nil {
+		loserErr = err2
+	}
+
+	assert.True(t, oneNil && isExpectedErr(loserErr),
+		fmt.Sprintf("Expected exactly one nil and one expected error. Got err1: [%v], err2: [%v]", err1, err2))
 }
 
 func TestVHost_Delete_WithConnections(t *testing.T) {

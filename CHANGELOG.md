@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.0]
+
+### Fixed
+- Support for multi-frame body
+- Go routine leaks on frame read
+- Error handling when writin gframes
+- Frame recursion DoS prevention
+- Setting connection limit for DoS prevention
+
+
 ## [0.2.3]
 
 ### Added
