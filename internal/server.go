@@ -186,6 +186,7 @@ type queue struct {
 	Durable    bool
 	Exclusive  bool
 	AutoDelete bool
+	ownerConn  *connection // non-nil only when Exclusive == true; set at declaration time
 	mu         sync.RWMutex
 
 	deleting atomic.Bool
@@ -2763,6 +2764,82 @@ func (c *connection) cleanupConnectionResources() {
 		}
 		c.channels = map[uint16]*channel{} // Clear the channels map on the connection
 		c.mu.Unlock()                      // Unlock the connection
+
+		// Delete exclusive queues owned by this connection (AMQP 0-9-1 §3.1.3).
+		// This runs after c.mu.Unlock() to avoid lock-ordering deadlocks with
+		// concurrent queue operations that acquire queue.mu then c.mu.
+		if vhost == nil {
+			c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
+			return
+		}
+		vhost.mu.RLock()
+		var exclusiveToDelete []string
+		for name, q := range vhost.queues {
+			q.mu.RLock()
+			if q.Exclusive && q.ownerConn == c {
+				exclusiveToDelete = append(exclusiveToDelete, name)
+			}
+			q.mu.RUnlock()
+		}
+		vhost.mu.RUnlock()
+
+		for _, queueName := range exclusiveToDelete {
+			vhost.mu.RLock()
+			q, exists := vhost.queues[queueName]
+			vhost.mu.RUnlock()
+			if !exists {
+				continue
+			}
+			// Re-verify ownership: between the scan and this point the original queue
+			// could have been deleted and a new one created under the same name.
+			q.mu.RLock()
+			isOurs := q.Exclusive && q.ownerConn == c
+			q.mu.RUnlock()
+			if !isOurs {
+				continue
+			}
+			if !q.deleting.CompareAndSwap(false, true) {
+				continue
+			}
+
+			q.mu.Lock()
+			bindingsSnapshot := make([]string, 0, len(q.Bindings))
+			for b := range q.Bindings {
+				bindingsSnapshot = append(bindingsSnapshot, b)
+			}
+			// Consumers on exclusive queues belong to this connection and were
+			// already stopped during the per-channel cleanup above. Use a
+			// non-blocking select to safely close only those still open.
+			for _, con := range q.Consumers {
+				select {
+				case <-con.stopCh:
+					// Already closed
+				default:
+					close(con.stopCh)
+				}
+			}
+			q.Messages = nil
+			q.Consumers = make(map[string]*consumer)
+			q.Bindings = make(map[string]bool)
+			q.mu.Unlock()
+
+			c.cleanupExchangeBindings(queueName, bindingsSnapshot)
+
+			vhost.mu.Lock()
+			delete(vhost.queues, queueName)
+			vhost.mu.Unlock()
+
+			c.server.Info("Deleted exclusive queue '%s' after owning connection closed", queueName)
+
+			if c.server.persistenceManager != nil {
+				if err := c.server.persistenceManager.DeleteAllQueueMessages(vhost.name, queueName); err != nil {
+					c.server.Err("Failed to delete messages for exclusive queue %s: %v", queueName, err)
+				}
+				if err := c.server.persistenceManager.DeleteQueue(vhost.name, queueName); err != nil {
+					c.server.Err("Failed to delete exclusive queue %s from persistence: %v", queueName, err)
+				}
+			}
+		}
 
 		c.server.Info("Finished cleaning up resources for connection %s", c.conn.RemoteAddr())
 		// The underlying c.conn will be closed by the caller of cleanupConnectionResources or was already closed.
