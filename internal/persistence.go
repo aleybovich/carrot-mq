@@ -13,29 +13,74 @@ import (
 	"github.com/aleybovich/carrot-mq/storage"
 )
 
-// Helper functions to construct storage keys
+// encodeKeySegment encodes a user-controlled name so it cannot contain the ":"
+// separator used in storage keys. Percent-encodes "%" and ":" only, keeping
+// all other characters untouched for readability.
+func encodeKeySegment(s string) string {
+	// Encode % first (escape character itself), then :
+	s = strings.ReplaceAll(s, "%", "%25")
+	s = strings.ReplaceAll(s, ":", "%3A")
+	return s
+}
+
+// decodeKeySegment reverses encodeKeySegment.
+func decodeKeySegment(s string) (string, error) {
+	// Decode : first, then % (reverse order of encoding)
+	s = strings.ReplaceAll(s, "%3A", ":")
+	s = strings.ReplaceAll(s, "%25", "%")
+	return s, nil
+}
+
+// Helper functions to construct storage keys.
+// All user-controlled segments are URL-path-encoded to prevent colon collisions.
 func VHostKey(name string) string {
-	return storage.KeyPrefixVHost + name
+	return storage.KeyPrefixVHost + encodeKeySegment(name)
 }
 
 func ExchangeKey(vhost, exchange string) string {
-	return storage.KeyPrefixExchange + vhost + ":" + exchange
+	return storage.KeyPrefixExchange + encodeKeySegment(vhost) + ":" + encodeKeySegment(exchange)
 }
 
 func QueueKey(vhost, queue string) string {
-	return storage.KeyPrefixQueue + vhost + ":" + queue
+	return storage.KeyPrefixQueue + encodeKeySegment(vhost) + ":" + encodeKeySegment(queue)
 }
 
 func BindingKey(vhost, exchange, queue, routingKey string) string {
-	return storage.KeyPrefixBinding + vhost + ":" + exchange + ":" + queue + ":" + routingKey
+	return storage.KeyPrefixBinding + encodeKeySegment(vhost) + ":" + encodeKeySegment(exchange) + ":" + encodeKeySegment(queue) + ":" + encodeKeySegment(routingKey)
 }
 
 func MessageKey(vhost, queue, messageId string) string {
-	return storage.KeyPrefixMessage + vhost + ":" + queue + ":" + messageId
+	return storage.KeyPrefixMessage + encodeKeySegment(vhost) + ":" + encodeKeySegment(queue) + ":" + encodeKeySegment(messageId)
 }
 
 func MessageIndexKey(vhost, queue string) string {
-	return storage.KeyPrefixMsgIndex + vhost + ":" + queue
+	return storage.KeyPrefixMsgIndex + encodeKeySegment(vhost) + ":" + encodeKeySegment(queue)
+}
+
+// compositeKey builds a colon-separated key from encoded segments, safe to split.
+func compositeKey(parts ...string) string {
+	encoded := make([]string, len(parts))
+	for i, p := range parts {
+		encoded[i] = encodeKeySegment(p)
+	}
+	return strings.Join(encoded, ":")
+}
+
+// splitCompositeKey splits a composite key and decodes each segment.
+func splitCompositeKey(key string, n int) ([]string, error) {
+	parts := strings.SplitN(key, ":", n)
+	if len(parts) != n {
+		return nil, fmt.Errorf("expected %d parts in key %q, got %d", n, key, len(parts))
+	}
+	decoded := make([]string, n)
+	for i, p := range parts {
+		d, err := decodeKeySegment(p)
+		if err != nil {
+			return nil, fmt.Errorf("decoding segment %d of key %q: %w", i, key, err)
+		}
+		decoded[i] = d
+	}
+	return decoded, nil
 }
 
 // Storage record types that map to our domain objects
@@ -887,7 +932,7 @@ func (pt *persistenceTransaction) SaveMessage(vhostName, queueName string, recor
 	}
 
 	// Update message index in transaction
-	indexKey := vhostName + ":" + queueName
+	cacheKey := compositeKey(vhostName, queueName)
 	index, err := pt.getOrLoadMessageIndex(vhostName, queueName)
 	if err != nil {
 		return fmt.Errorf("loading message index: %w", err)
@@ -897,7 +942,7 @@ func (pt *persistenceTransaction) SaveMessage(vhostName, queueName string, recor
 	index.Messages = append(index.Messages, record.ID)
 
 	// Mark index as updated
-	pt.messageIndexUpdates[indexKey] = index
+	pt.messageIndexUpdates[cacheKey] = index
 
 	return nil
 }
@@ -910,7 +955,7 @@ func (pt *persistenceTransaction) DeleteMessage(vhostName, queueName, messageId 
 	}
 
 	// Update message index in transaction
-	indexKey := vhostName + ":" + queueName
+	cacheKey := compositeKey(vhostName, queueName)
 	index, err := pt.getOrLoadMessageIndex(vhostName, queueName)
 	if err != nil {
 		return fmt.Errorf("loading message index: %w", err)
@@ -926,7 +971,7 @@ func (pt *persistenceTransaction) DeleteMessage(vhostName, queueName, messageId 
 	index.Messages = newMessages
 
 	// Mark index as updated
-	pt.messageIndexUpdates[indexKey] = index
+	pt.messageIndexUpdates[cacheKey] = index
 
 	return nil
 }
@@ -934,22 +979,22 @@ func (pt *persistenceTransaction) DeleteMessage(vhostName, queueName, messageId 
 func (pt *persistenceTransaction) Commit() error {
 	// First, save all message index updates
 	for key, index := range pt.messageIndexUpdates {
-		parts := strings.Split(key, ":")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid index key format: %s", key)
+		decoded, err := splitCompositeKey(key, 2)
+		if err != nil {
+			return fmt.Errorf("invalid index key format: %w", err)
 		}
-		vhostName, queueName := parts[0], parts[1]
+		vhostName, queueName := decoded[0], decoded[1]
 
 		// Serialize index
 		data, err := json.Marshal(index)
 		if err != nil {
-			return fmt.Errorf("marshaling message index for %s: %w", key, err)
+			return fmt.Errorf("marshaling message index for %s/%s: %w", vhostName, queueName, err)
 		}
 
 		// Save to transaction
 		indexKey := MessageIndexKey(vhostName, queueName)
 		if err := pt.tx.Set(indexKey, data); err != nil {
-			return fmt.Errorf("saving message index for %s: %w", key, err)
+			return fmt.Errorf("saving message index for %s/%s: %w", vhostName, queueName, err)
 		}
 	}
 
@@ -988,7 +1033,7 @@ func (pt *persistenceTransaction) Rollback() error {
 
 // Helper method to get or load message index
 func (pt *persistenceTransaction) getOrLoadMessageIndex(vhostName, queueName string) (*MessageIndex, error) {
-	cacheKey := vhostName + ":" + queueName
+	cacheKey := compositeKey(vhostName, queueName)
 
 	// Check if we already have it in updates
 	if index, exists := pt.messageIndexUpdates[cacheKey]; exists {
@@ -1045,7 +1090,7 @@ func (pt *persistenceTransaction) DeleteMessageIndex(vhostName, queueName string
 	indexKey := MessageIndexKey(vhostName, queueName)
 
 	// Remove from updates if it exists
-	cacheKey := vhostName + ":" + queueName
+	cacheKey := compositeKey(vhostName, queueName)
 	delete(pt.messageIndexUpdates, cacheKey)
 	delete(pt.messageIndexCache, cacheKey)
 

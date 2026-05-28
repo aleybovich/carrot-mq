@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -494,8 +493,8 @@ func (c *connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 		exchangeName, exchangeType, passive, durable, autoDelete, internal, noWait, args, channelId)
 
 	// Validate exchange type - essential for server operation. Headers exchange is not implemented for now
-	validTypes := map[string]bool{"direct": true, "fanout": true, "topic": true, "headers": false}
-	if _, isValidType := validTypes[exchangeType]; !isValidType {
+	validTypes := map[string]bool{"direct": true, "fanout": true, "topic": true}
+	if !validTypes[exchangeType] {
 		replyText := fmt.Sprintf("exchange type '%s' not implemented", exchangeType)
 		c.server.Warn("Exchange.Declare: %s for exchange '%s'. Sending Channel.Close.", replyText, exchangeName)
 		// AMQP code 540 (NOT_IMPLEMENTED)
@@ -2293,14 +2292,14 @@ func (c *connection) handleMethodBasicAck(reader *bytes.Reader, channelId uint16
 		messagesByQueue := make(map[string][]string)
 
 		for _, msgInfo := range messagesToDelete {
-			key := msgInfo.VHostName + ":" + msgInfo.QueueName
+			key := compositeKey(msgInfo.VHostName, msgInfo.QueueName)
 			messagesByQueue[key] = append(messagesByQueue[key], msgInfo.MessageId)
 		}
 
 		// Delete in batches by queue
 		for queueKey, messageIds := range messagesByQueue {
-			parts := strings.Split(queueKey, ":")
-			vhostName, queueName := parts[0], parts[1]
+			decoded, _ := splitCompositeKey(queueKey, 2)
+			vhostName, queueName := decoded[0], decoded[1]
 
 			if err := c.server.persistenceManager.DeleteMessagesBatch(vhostName, queueName, messageIds); err != nil {
 				c.server.Err("Failed to delete nacked messages from queue %s: %v", queueName, err)

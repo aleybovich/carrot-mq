@@ -509,7 +509,7 @@ func WithHeartbeatInterval(interval uint16) ServerOption {
 
 // WithMaxConnections sets the maximum number of concurrent client connections.
 // Once the limit is reached, new TCP connections are closed immediately.
-// A value of 0 means unlimited (default).
+// A value of 0 means unlimited (default 1024).
 func WithMaxConnections(max int) ServerOption {
 	return func(s *server) {
 		if max > 0 {
