@@ -51,8 +51,8 @@ func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (s *server, ad
 	time.Sleep(200 * time.Millisecond)
 
 	cleanup = func() {
-		if s.listener != nil {
-			err := s.listener.Close()
+		if ln := s.getListener(); ln != nil {
+			err := ln.Close()
 			if err != nil {
 				t.Logf("Error closing test server listener on %s: %v", addr, err)
 			}

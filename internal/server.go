@@ -596,14 +596,26 @@ func NewServer(opts ...ServerOption) *server {
 	return s
 }
 
+// getListener returns the server's listener under the read lock. Start writes the
+// listener from a separate goroutine, so every other reader must go through here.
+func (s *server) getListener() net.Listener {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.listener
+}
+
 func (s *server) Start(addr string) error {
-	var err error
 	s.Info("Starting AMQP server on %s", addr)
-	s.listener, err = net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		s.Err("Error starting server: %v", err)
 		return err
 	}
+	// Publish the listener under the lock; concurrent readers (Shutdown, handler
+	// goroutines, tests) access it via getListener().
+	s.mu.Lock()
+	s.listener = ln
+	s.mu.Unlock()
 	s.Info("Server listening on %s", addr)
 
 	// Mark server as ready after listener is successfully created
@@ -613,7 +625,7 @@ func (s *server) Start(addr string) error {
 	defer s.isReady.Store(false)
 
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				s.Info("Server listener on %s closed. Stopping accept loop.", addr)
@@ -647,8 +659,8 @@ func (s *server) Shutdown(ctx context.Context) error {
 	s.isReady.Store(false)
 
 	// 1. Stop accepting new connections
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
+	if ln := s.getListener(); ln != nil {
+		if err := ln.Close(); err != nil {
 			s.Warn("Error closing network listener: %v", err)
 		}
 	}

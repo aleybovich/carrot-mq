@@ -811,7 +811,7 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 			return c.sendChannelClose(channelId, amqpError.AccessRefused.Code(), errMsg, uint16(ClassQueue), MethodQueueDeclare)
 		}
 		// Generate a unique name
-		actualQueueName = fmt.Sprintf("amq.gen-%s-%d-%d-q", c.conn.LocalAddr().String(), channelId, c.server.listener.Addr().(*net.TCPAddr).Port)
+		actualQueueName = fmt.Sprintf("amq.gen-%s-%d-%d-q", c.conn.LocalAddr().String(), channelId, c.server.getListener().Addr().(*net.TCPAddr).Port)
 		tempCounter := 0
 		baseName := actualQueueName
 		// Ensure unique name (simple approach)

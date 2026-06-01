@@ -579,8 +579,11 @@ make test-race
 go test -run TestServerPublishConsume ./...
 ```
 
-NOTE: tests spin up real servers, so they can be slow; the make targets set a
-generous timeout (`-timeout 1m`, and `2m` under `-race`). When running `go test`
+NOTE: tests spin up real servers, so they take ~tens of seconds. The make targets
+run the suite fresh (`-count=1`, bypassing Go's test cache) with a generous timeout
+(`-timeout 1m`, and `2m` under `-race`), so a result always reflects a real run —
+the slightly longer runtime (locally and in CI) is the intended trade-off for
+trustworthy results, especially under the race detector. When running `go test`
 directly, pass `-timeout 1m` to avoid intermittent timeouts.
 
 ## Limitations
