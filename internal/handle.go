@@ -113,20 +113,24 @@ func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	if err := binary.Read(reader, binary.BigEndian, &c.channelMax); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (channel-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}
-	if err := binary.Read(reader, binary.BigEndian, &c.frameMax); err != nil {
+	// frameMax is read by the frame-reader goroutine on every frame, so it's atomic.
+	// Decode + validate into a local, then publish the negotiated value with one Store.
+	var frameMax uint32
+	if err := binary.Read(reader, binary.BigEndian, &frameMax); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (frame-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}
 
 	// AMQP 0-9-1 spec: if client proposes frame-max higher than server's value,
 	// server MUST close the connection. A client value of 0 means "no limit" which
 	// we treat as accepting the server's proposed value.
-	if c.frameMax == 0 {
-		c.frameMax = suggestedFrameMaxSize
-	} else if c.frameMax > suggestedFrameMaxSize {
+	if frameMax == 0 {
+		frameMax = suggestedFrameMaxSize
+	} else if frameMax > suggestedFrameMaxSize {
 		return c.sendConnectionClose(amqpError.NotAllowed.Code(),
-			fmt.Sprintf("frame-max %d exceeds server maximum %d", c.frameMax, suggestedFrameMaxSize),
+			fmt.Sprintf("frame-max %d exceeds server maximum %d", frameMax, suggestedFrameMaxSize),
 			uint16(ClassConnection), MethodConnectionTuneOk)
 	}
+	c.frameMax.Store(frameMax)
 
 	if err := binary.Read(reader, binary.BigEndian, &c.heartbeatInterval); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (heartbeat)", uint16(ClassConnection), MethodConnectionTuneOk)
@@ -136,7 +140,7 @@ func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	}
 
 	c.server.Info("Connection parameters negotiated: channelMax=%d, frameMax=%d, heartbeat=%d",
-		c.channelMax, c.frameMax, c.heartbeatInterval)
+		c.channelMax, frameMax, c.heartbeatInterval)
 
 	// Start heartbeat sender if heartbeat is enabled
 	if c.heartbeatInterval > 0 {

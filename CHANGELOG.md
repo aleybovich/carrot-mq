@@ -4,6 +4,8 @@
 
 ### Fixed
 - Idle consumers now wake immediately on publish and on nack/reject/recover requeue, instead of waiting out the ~100ms delivery poll. Previously there was no publish→consumer signal, so each idle queue hop added up to ~100ms of latency, which compounded badly in multi-hop pipelines. Added a per-queue wakeup signal ("doorbell"); the existing poll is retained as a fallback so no enqueue path can strand a message.
+- Data race on `connection.frameMax`: it was written during `connection.tune-ok` by the method-handling goroutine while the frame-reader goroutine read it on every frame. It is now an `atomic.Uint32`.
+- Data race on `queue.Messages`: `deliverToQueue` read `len(queue.Messages)` for a log line without holding the queue lock while `deliverMessages` mutated the slice (exposed by the immediate-wakeup change above). The count is now read under the lock.
 
 ## [0.3.1]
 

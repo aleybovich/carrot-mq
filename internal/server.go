@@ -239,7 +239,7 @@ type connection struct {
 
 	// negotiated values
 	channelMax        uint16
-	frameMax          uint32
+	frameMax          atomic.Uint32 // read by the frame-reader goroutine every frame; written once at tune-ok
 	heartbeatInterval uint16
 
 	username string // Store authenticated username
@@ -1065,7 +1065,7 @@ func (c *connection) readFrame() (*frame, error) {
 	// Enforce frame size limits per AMQP 0-9-1 spec:
 	// Before negotiation completes, peers MUST accept frames up to frame-min-size
 	// but are not required to accept larger ones. After negotiation, use frame-max.
-	effectiveMax := c.frameMax
+	effectiveMax := c.frameMax.Load()
 	if effectiveMax == 0 {
 		effectiveMax = frameMinSize
 	}
@@ -2211,8 +2211,13 @@ func (c *connection) deliverToQueue(queueName string, msg *message) error {
 	// Wake an idle consumer immediately instead of letting it wait out the poll.
 	queue.wake()
 
+	// Read the count under the lock: deliverMessages mutates queue.Messages
+	// concurrently, and immediate wakeup makes that overlap the common case.
+	queue.mu.RLock()
+	msgCount := len(queue.Messages)
+	queue.mu.RUnlock()
 	c.server.Info("Message enqueued to queue '%s'. Queue now has %d messages.",
-		queueName, len(queue.Messages))
+		queueName, msgCount)
 
 	return nil
 }
