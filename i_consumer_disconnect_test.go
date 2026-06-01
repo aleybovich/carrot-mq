@@ -393,13 +393,37 @@ func TestConsumerReconnectionPattern(t *testing.T) {
 
 	qName := uniqueName("q-reconnect-pattern")
 
+	// stop signals the background reconnect goroutine to exit. We wait for it to
+	// finish (via done) before the test returns, so it can never t.Log after the
+	// test has completed.
+	stop := make(chan struct{})
+
+	// retryWait sleeps for the retry interval but returns early if stop is closed.
+	// Returns true if the loop should exit.
+	retryWait := func() bool {
+		select {
+		case <-stop:
+			return true
+		case <-time.After(1 * time.Second):
+			return false
+		}
+	}
+
 	// Example of reconnection pattern
 	consumeWithReconnect := func() {
 		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
 			conn, err := amqp.Dial("amqp://" + addr)
 			if err != nil {
 				t.Logf("Failed to connect: %v", err)
-				time.Sleep(1 * time.Second)
+				if retryWait() {
+					return
+				}
 				continue
 			}
 
@@ -407,7 +431,9 @@ func TestConsumerReconnectionPattern(t *testing.T) {
 			if err != nil {
 				t.Logf("Failed to open channel: %v", err)
 				conn.Close()
-				time.Sleep(1 * time.Second)
+				if retryWait() {
+					return
+				}
 				continue
 			}
 
@@ -424,7 +450,9 @@ func TestConsumerReconnectionPattern(t *testing.T) {
 				t.Logf("Failed to declare queue: %v", err)
 				ch.Close()
 				conn.Close()
-				time.Sleep(1 * time.Second)
+				if retryWait() {
+					return
+				}
 				continue
 			}
 
@@ -442,23 +470,38 @@ func TestConsumerReconnectionPattern(t *testing.T) {
 				t.Logf("Failed to start consumer: %v", err)
 				ch.Close()
 				conn.Close()
-				time.Sleep(1 * time.Second)
+				if retryWait() {
+					return
+				}
 				continue
 			}
 
 			// Consumer loop
 			t.Log("Consumer started successfully")
-			for msg := range msgs {
-				// Process message
-				t.Logf("Received message: %s", msg.Body)
-				_ = msg.Ack(false)
+		consumeLoop:
+			for {
+				select {
+				case <-stop:
+					ch.Close()
+					conn.Close()
+					return
+				case msg, ok := <-msgs:
+					if !ok {
+						break consumeLoop
+					}
+					// Process message
+					t.Logf("Received message: %s", msg.Body)
+					_ = msg.Ack(false)
+				}
 			}
 
 			// If we get here, consumer was closed
 			t.Log("Consumer loop exited, will reconnect...")
 			ch.Close()
 			conn.Close()
-			time.Sleep(1 * time.Second)
+			if retryWait() {
+				return
+			}
 		}
 	}
 
@@ -472,5 +515,8 @@ func TestConsumerReconnectionPattern(t *testing.T) {
 	// Let it run briefly
 	time.Sleep(500 * time.Millisecond)
 
-	// Test passes - this is just demonstrating the pattern
+	// Stop the reconnect goroutine and wait for it to exit before returning, so it
+	// cannot t.Log after the test has completed. This is just demonstrating the pattern.
+	close(stop)
+	<-done
 }

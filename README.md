@@ -566,17 +566,22 @@ The server includes detailed logging with color support to make it easier to tra
 
 ## Testing
 
-NOTE: due to the number of unit tests, increase `go.testTimeout` to `1m` to avoid intermittent unit test timeouts. This can be done in VSCode settings (`go.testTimeout`) or by running tests with the flag: `go test -v -timeout 1m`.
-
-The project includes comprehensive tests demonstrating the server capabilities:
+The project includes comprehensive tests demonstrating the server capabilities.
 
 ```bash
-# Run all tests
-go test -v -timeout 1m
+# Run the full suite (root integration tests + internal unit tests)
+make test
 
-# Run a specific test
-go test -v -timeout 1m -run TestServerPublishConsume
+# Run the full suite under the race detector
+make test-race
+
+# Run a single test
+go test -run TestServerPublishConsume ./...
 ```
+
+NOTE: tests spin up real servers, so they can be slow; the make targets set a
+generous timeout (`-timeout 1m`, and `2m` under `-race`). When running `go test`
+directly, pass `-timeout 1m` to avoid intermittent timeouts.
 
 ## Limitations
 
