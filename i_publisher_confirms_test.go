@@ -313,11 +313,15 @@ func TestPublisherConfirms_ConcurrentPublish(t *testing.T) {
 		}(g)
 	}
 
-	// Collect confirmations
+	// Collect confirmations. The collector goroutine and the assertions below both
+	// touch `confirmed`, so guard it with a mutex.
 	confirmed := make(map[uint64]bool)
+	var confirmedMu sync.Mutex
 	go func() {
 		for confirm := range confirms {
+			confirmedMu.Lock()
 			confirmed[confirm.DeliveryTag] = confirm.Ack
+			confirmedMu.Unlock()
 		}
 	}()
 
@@ -326,12 +330,20 @@ func TestPublisherConfirms_ConcurrentPublish(t *testing.T) {
 	// Give time for all confirmations
 	time.Sleep(500 * time.Millisecond)
 
+	// Snapshot under the lock, then assert on the copy.
+	confirmedMu.Lock()
+	snapshot := make(map[uint64]bool, len(confirmed))
+	for tag, ack := range confirmed {
+		snapshot[tag] = ack
+	}
+	confirmedMu.Unlock()
+
 	// Verify we got confirmations for all messages
-	assert.GreaterOrEqual(t, len(confirmed), totalMessages,
+	assert.GreaterOrEqual(t, len(snapshot), totalMessages,
 		"Should have confirmations for all %d messages", totalMessages)
 
 	// All should be positive acks
-	for tag, ack := range confirmed {
+	for tag, ack := range snapshot {
 		assert.True(t, ack, "Message %d should be acked", tag)
 	}
 }

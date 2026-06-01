@@ -35,13 +35,15 @@ const (
 
 const failedAuthThrottle = 1 * time.Second // Throttle failed auth attempts to prevent abuse
 
-// Flag to determine if we're logging to a terminal (with colors) or a file
-var IsTerminal bool
+// Flag to determine if we're logging to a terminal (with colors) or a file.
+// atomic because every log call reads it across connection goroutines while
+// init (and tests) write it.
+var IsTerminal atomic.Bool
 
 func init() {
 	// Check if stdout is a terminal
 	fileInfo, _ := os.Stdout.Stat()
-	IsTerminal = (fileInfo.Mode() & os.ModeCharDevice) != 0
+	IsTerminal.Store((fileInfo.Mode() & os.ModeCharDevice) != 0)
 }
 
 type Server interface {
@@ -543,7 +545,7 @@ func (s *server) IsReady() bool {
 
 func NewServer(opts ...ServerOption) *server {
 	var logPrefix string
-	if IsTerminal {
+	if IsTerminal.Load() {
 		logPrefix = fmt.Sprintf("%s[AMQP]%s ", colorBlue, colorReset)
 	} else {
 		logPrefix = "[AMQP] "

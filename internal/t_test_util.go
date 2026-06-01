@@ -30,7 +30,7 @@ func uniqueName(prefix string) string {
 
 // Helper to start a server and return its address and a cleanup function
 func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (s *server, addr string, cleanup func()) {
-	IsTerminal = true // Force colorized output for server logs during tests
+	IsTerminal.Store(true) // Force colorized output for server logs during tests
 	addr = getNextTestPort()
 	s = NewServer(opts...) // Uses default internal logger
 

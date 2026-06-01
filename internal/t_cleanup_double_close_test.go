@@ -13,7 +13,7 @@ import (
 // of the heartbeatStop channel. This is reachable when, e.g., a graceful close
 // triggers cleanup and then the read error path also triggers cleanup.
 func TestCleanupConnectionResources_DoubleClose_SRV_C2(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 
 	// Create a minimal server and connection with heartbeat enabled
 	s := NewServer()

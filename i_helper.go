@@ -36,7 +36,7 @@ func uniqueName(prefix string) string {
 }
 
 func setupTestServer(t *testing.T, opts ...ServerOption) (addr string, cleanup func()) {
-	internal.IsTerminal = true // Force colorized output for server logs during tests
+	internal.IsTerminal.Store(true) // Force colorized output for server logs during tests
 	addr = getNextTestPort()
 	s := NewServer(opts...) // Uses default internal logger
 

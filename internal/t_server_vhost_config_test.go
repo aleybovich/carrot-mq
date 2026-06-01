@@ -9,7 +9,7 @@ import (
 )
 
 func TestWithVHosts_HappyPath(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/production",
@@ -161,7 +161,7 @@ func TestWithVHosts_HappyPath(t *testing.T) {
 }
 
 func TestWithVHosts_DefaultVHost(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/", // Default vhost
@@ -207,7 +207,7 @@ func TestWithVHosts_DefaultVHost(t *testing.T) {
 }
 
 func TestWithVHosts_EmptyConfiguration(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	// Test with empty vhost list
 	server := NewServer(WithVHosts([]config.VHostConfig{}))
 
@@ -225,7 +225,7 @@ func TestWithVHosts_EmptyConfiguration(t *testing.T) {
 }
 
 func TestWithVHosts_ExistingExchangesAndQueues(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/test",
@@ -272,7 +272,7 @@ func TestWithVHosts_ExistingExchangesAndQueues(t *testing.T) {
 }
 
 func TestWithVHosts_InvalidBindings(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/test-bindings",
@@ -331,7 +331,7 @@ func TestWithVHosts_InvalidBindings(t *testing.T) {
 }
 
 func TestWithVHosts_OnlyExchanges(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/exchanges-only",
@@ -369,7 +369,7 @@ func TestWithVHosts_OnlyExchanges(t *testing.T) {
 }
 
 func TestWithVHosts_OnlyQueues(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/queues-only",
@@ -422,7 +422,7 @@ func TestWithVHosts_OnlyQueues(t *testing.T) {
 }
 
 func TestWithVHosts_MultipleVHostsWithSameNames(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/duplicate",
@@ -458,7 +458,7 @@ func TestWithVHosts_MultipleVHostsWithSameNames(t *testing.T) {
 }
 
 func TestWithVHosts_CombinedWithOtherOptions(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/combined-test",
@@ -495,7 +495,7 @@ func TestWithVHosts_CombinedWithOtherOptions(t *testing.T) {
 }
 
 func TestWithVHosts_ComplexBindingScenarios(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/complex-bindings",
@@ -576,7 +576,7 @@ func TestWithVHosts_ComplexBindingScenarios(t *testing.T) {
 }
 
 func TestWithVHosts_ErrorRecovery(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	// Test that errors in one vhost don't prevent processing others
 	vhosts := []config.VHostConfig{
 		{
@@ -613,7 +613,7 @@ func TestWithVHosts_ErrorRecovery(t *testing.T) {
 }
 
 func TestWithVHosts_QueuePropertiesValidation(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/queue-props-test",
@@ -687,7 +687,7 @@ func TestWithVHosts_QueuePropertiesValidation(t *testing.T) {
 }
 
 func TestWithVHosts_ExchangePropertiesValidation(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/exchange-props-test",
@@ -754,7 +754,7 @@ func TestWithVHosts_ExchangePropertiesValidation(t *testing.T) {
 }
 
 func TestWithVHosts_EmptyBindingsMap(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/empty-bindings-test",
@@ -844,7 +844,7 @@ func TestWithVHosts_EmptyBindingsMap(t *testing.T) {
 // }
 
 func TestWithVHosts_SpecialCharactersInNames(t *testing.T) {
-	IsTerminal = true
+	IsTerminal.Store(true)
 	vhosts := []config.VHostConfig{
 		{
 			Name: "/special-chars-test",

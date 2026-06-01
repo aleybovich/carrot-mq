@@ -26,7 +26,7 @@ func (s *server) Fatal(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if IsTerminal {
+	if IsTerminal.Load() {
 		prefix := fmt.Sprintf("%s[FATAL]%s %s%s%s: ", colorBoldRed, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -46,7 +46,7 @@ func (s *server) Err(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if IsTerminal {
+	if IsTerminal.Load() {
 		prefix := fmt.Sprintf("%s[ERROR]%s %s%s%s: ", colorBoldRed, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -64,7 +64,7 @@ func (s *server) Warn(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if IsTerminal {
+	if IsTerminal.Load() {
 		prefix := fmt.Sprintf("%s[WARN]%s %s%s%s: ", colorYellow, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -82,7 +82,7 @@ func (s *server) Info(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if IsTerminal {
+	if IsTerminal.Load() {
 		prefix := fmt.Sprintf("%s[INFO]%s %s%s%s: ", colorGreen, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
@@ -105,7 +105,7 @@ func (s *server) Debug(format string, args ...interface{}) {
 
 	funcName := getCallerName()
 
-	if IsTerminal {
+	if IsTerminal.Load() {
 		prefix := fmt.Sprintf("%s[DEBUG]%s %s%s%s: ", colorPurple, colorReset, colorCyan, funcName, colorReset)
 		s.internalLogger.Printf(prefix+format, args...)
 	} else {
