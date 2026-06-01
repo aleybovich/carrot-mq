@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.2]
+
+### Fixed
+- Idle consumers now wake immediately on publish and on nack/reject/recover requeue, instead of waiting out the ~100ms delivery poll. Previously there was no publish→consumer signal, so each idle queue hop added up to ~100ms of latency, which compounded badly in multi-hop pipelines. Added a per-queue wakeup signal ("doorbell"); the existing poll is retained as a fallback so no enqueue path can strand a message.
+
 ## [0.3.1]
 
 ## Added

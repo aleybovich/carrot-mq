@@ -189,7 +189,22 @@ type queue struct {
 	ownerConn  *connection // non-nil only when Exclusive == true; set at declaration time
 	mu         sync.RWMutex
 
+	// notify is a buffered (cap 1) "doorbell": ringing it wakes an idle consumer
+	// immediately instead of waiting for the delivery poll. Signals coalesce into a
+	// single pending wakeup, so one ring is enough no matter how many were sent.
+	notify chan struct{}
+
 	deleting atomic.Bool
+}
+
+// wake rings the queue's doorbell to nudge an idle consumer that work is available.
+// Non-blocking: if a wakeup is already pending (or no consumer is waiting yet) it is
+// a no-op. Safe to call while holding q.mu — the receive side never takes q.mu.
+func (q *queue) wake() {
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
 }
 
 type exchange struct {
@@ -353,6 +368,7 @@ func WithVHosts(vhosts []config.VHostConfig) ServerOption {
 					Durable:    queueConfig.Durable,
 					Exclusive:  queueConfig.Exclusive,
 					AutoDelete: queueConfig.AutoDelete,
+					notify:     make(chan struct{}, 1),
 				}
 				s.Info("Created queue '%s' in vhost '%s' (durable: %v, exclusive: %v)",
 					queueConfig.Name, vhostConfig.Name, queueConfig.Durable, queueConfig.Exclusive)
@@ -2192,6 +2208,9 @@ func (c *connection) deliverToQueue(queueName string, msg *message) error {
 		queue.mu.Unlock()
 	}
 
+	// Wake an idle consumer immediately instead of letting it wait out the poll.
+	queue.wake()
+
 	c.server.Info("Message enqueued to queue '%s'. Queue now has %d messages.",
 		queueName, len(queue.Messages))
 
@@ -2211,13 +2230,18 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 		queue.mu.Unlock()
 
 		if !messageAvailable {
-			// Only use select with timer when no messages
+			// Wait for a doorbell ring (immediate on publish/requeue) or fall back to a
+			// short poll. The fallback is a safety net so no enqueue path can strand a
+			// message even if it didn't ring the doorbell.
 			select {
 			case <-consumer.stopCh:
 				c.server.Info("Consumer %s stopped on channel %d", consumerTag, channelId)
 				return
+			case <-queue.notify:
+				// Doorbell rung — re-check for messages immediately.
+				continue
 			case <-time.After(100 * time.Millisecond):
-				// Check again for messages
+				// Fallback poll.
 				continue
 			}
 		} else {
