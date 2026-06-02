@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -18,15 +17,19 @@ import (
 )
 
 var testRand = rand.New(rand.NewSource(time.Now().UnixNano())) // For unique names
-// testServerPortCounter is a global counter to assign unique ports to test servers.
-var testServerPortCounter = 5800 // Starting port number, different from previous example
-var portCounterMutex sync.Mutex
 
-func getNextTestPort() string {
-	portCounterMutex.Lock()
-	defer portCounterMutex.Unlock()
-	port := testServerPortCounter
-	testServerPortCounter++
+// getNextTestPort asks the OS for a free ephemeral port by binding ":0" and
+// immediately releasing it. Replaces the previous monotonic counter scheme,
+// which collided when the chosen port was already taken (TIME_WAIT from a
+// prior run, another process, etc.). A tiny race remains between the probe
+// close and the server's rebind, but ephemeral-range collisions are rare
+// enough that this eliminates the flake in practice.
+func getNextTestPort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "Failed to probe a free port")
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close(), "Failed to release probed port %d", port)
 	return fmt.Sprintf(":%d", port)
 }
 
@@ -37,7 +40,7 @@ func uniqueName(prefix string) string {
 
 func setupTestServer(t *testing.T, opts ...ServerOption) (addr string, cleanup func()) {
 	internal.IsTerminal.Store(true) // Force colorized output for server logs during tests
-	addr = getNextTestPort()
+	addr = getNextTestPort(t)
 	s := NewServer(opts...) // Uses default internal logger
 
 	// Channel to signal when server goroutine exits

@@ -2748,12 +2748,27 @@ func (c *connection) cleanupConnectionResources() {
 
 		c.mu.Lock() // Lock the connection to safely iterate over channels
 
-		// NEW: Collect queue names that will need dispatch attempts
-		affectedQueuesForDispatch := make(map[string]bool)
-
 		for chanId, ch := range c.channels {
 			c.server.Info("Cleaning up resources for channel %d on connection %s", chanId, c.conn.RemoteAddr())
 			ch.mu.Lock() // Lock the specific channel
+
+			// Stop this channel's consumers FIRST so their deliverMessages goroutines
+			// exit before we wake the queue below. Otherwise a doomed consumer could
+			// drain the wake token and the peer consumer would wait out the fallback poll.
+			for consumerTag, queueName := range ch.consumers {
+				vhost.mu.RLock() // RLock server to access s.queues
+				if queue, ok := vhost.queues[queueName]; ok {
+					queue.mu.Lock() // Lock the specific queue
+					if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
+						c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
+						close(consumer.stopCh) // This will make the deliverMessages goroutine exit
+						delete(queue.Consumers, consumerTag)
+					}
+					queue.mu.Unlock() // Unlock queue
+				}
+				vhost.mu.RUnlock()
+			}
+			ch.consumers = map[string]string{} // Clear consumers map for the channel
 
 			// Handle unacked messages: requeue them
 			if len(ch.unackedMessages) > 0 {
@@ -2770,8 +2785,9 @@ func (c *connection) cleanupConnectionResources() {
 						// Prepend to queue (requeued messages go to front)
 						queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 						c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'", deliveryTag, chanId, unacked.QueueName)
-						affectedQueuesForDispatch[unacked.QueueName] = true // Mark queue for dispatch
-						queue.mu.Unlock()                                   // Unlock queue
+						queue.mu.Unlock() // Unlock queue
+						// Wake a peer consumer so requeued messages don't wait out the fallback poll.
+						queue.wake()
 					} else {
 						c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d) during connection cleanup", unacked.QueueName, deliveryTag, chanId)
 					}
@@ -2780,23 +2796,6 @@ func (c *connection) cleanupConnectionResources() {
 				ch.unackedMessages = make(map[uint64]*unackedMessage)
 			}
 
-			// Clean up consumers associated with this channel
-			for consumerTag, queueName := range ch.consumers {
-				vhost.mu.RLock() // RLock server to access s.queues
-				if queue, ok := vhost.queues[queueName]; ok {
-					queue.mu.Lock() // Lock the specific queue
-					if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
-						c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
-						close(consumer.stopCh) // This will make the deliverMessages goroutine exit
-						delete(queue.Consumers, consumerTag)
-						// If this queue had messages and now has one less consumer, it might affect dispatch.
-						// The generic dispatch attempt later will cover this.
-					}
-					queue.mu.Unlock() // Unlock queue
-				}
-				vhost.mu.RUnlock()
-			}
-			ch.consumers = map[string]string{} // Clear consumers map for the channel
 			ch.pendingMessages = nil           // Clear any partial messages from publish
 			// Ensure timer is stopped if channel was being closed by server
 			if ch.closeOkTimer != nil {
@@ -3084,7 +3083,27 @@ func (c *connection) forceRemoveChannel(channelId uint16, reason string) {
 		ch.closeOkTimer = nil
 	}
 
-	affectedQueuesForDispatch := make(map[string]bool)
+	// Stop this channel's consumers FIRST so their deliverMessages goroutines
+	// exit before we wake the queue below. Otherwise a doomed consumer could
+	// drain the wake token and a peer consumer would wait out the fallback poll.
+	if len(ch.consumers) > 0 {
+		c.server.Info("Channel %d cleaning up %d consumers", channelId, len(ch.consumers))
+		for consumerTag, queueName := range ch.consumers {
+			vhost.mu.RLock()
+			if q, qExists := vhost.queues[queueName]; qExists {
+				q.mu.Lock()
+				if consumer, consumerExists := q.Consumers[consumerTag]; consumerExists {
+					close(consumer.stopCh)
+					delete(q.Consumers, consumerTag)
+					c.server.Info("Closed consumer %s on queue %s for channel %d",
+						consumerTag, queueName, channelId)
+				}
+				q.mu.Unlock()
+			}
+			vhost.mu.RUnlock()
+		}
+		ch.consumers = map[string]string{}
+	}
 
 	if len(ch.unackedMessages) > 0 {
 		c.server.Info("Channel %d has %d unacked messages, requeuing", channelId, len(ch.unackedMessages))
@@ -3099,8 +3118,9 @@ func (c *connection) forceRemoveChannel(channelId uint16, reason string) {
 				queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 				c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'",
 					deliveryTag, channelId, unacked.QueueName)
-				affectedQueuesForDispatch[unacked.QueueName] = true
 				queue.mu.Unlock()
+				// Wake a peer consumer so requeued messages don't wait out the fallback poll.
+				queue.wake()
 			} else {
 				c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d)",
 					unacked.QueueName, deliveryTag, channelId)
@@ -3121,25 +3141,6 @@ func (c *connection) forceRemoveChannel(channelId uint16, reason string) {
 			c.sendBasicNack(channelId, maxTag, true, false)
 		}
 		ch.pendingConfirms = make(map[uint64]bool)
-	}
-
-	if len(ch.consumers) > 0 {
-		c.server.Info("Channel %d cleaning up %d consumers", channelId, len(ch.consumers))
-		for consumerTag, queueName := range ch.consumers {
-			vhost.mu.RLock()
-			if q, qExists := vhost.queues[queueName]; qExists {
-				q.mu.Lock()
-				if consumer, consumerExists := q.Consumers[consumerTag]; consumerExists {
-					close(consumer.stopCh)
-					delete(q.Consumers, consumerTag)
-					c.server.Info("Closed consumer %s on queue %s for channel %d",
-						consumerTag, queueName, channelId)
-				}
-				q.mu.Unlock()
-			}
-			vhost.mu.RUnlock()
-		}
-		ch.consumers = map[string]string{}
 	}
 	ch.pendingMessages = nil
 	ch.mu.Unlock()

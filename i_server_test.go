@@ -33,7 +33,7 @@ func TestServerIsReady(t *testing.T) {
 	assert.False(t, s.IsReady(), "Server should not be ready before Start is called")
 	
 	// Get a test port
-	addr := getNextTestPort()
+	addr := getNextTestPort(t)
 	
 	// Start server in a goroutine
 	serverDone := make(chan error, 1)
