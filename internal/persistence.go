@@ -204,6 +204,7 @@ func RecordToQueue(r *QueueRecord) *queue {
 		Durable:    r.Durable,
 		Exclusive:  r.Exclusive,
 		AutoDelete: r.AutoDelete,
+		notify:     make(chan struct{}, 1),
 	}
 }
 

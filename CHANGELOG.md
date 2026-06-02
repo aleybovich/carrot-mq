@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.2]
+
+### Fixed
+- Idle consumers now wake immediately on every enqueue path — publish, nack/reject/recover requeue, **and** the requeues that happen when a connection or channel is torn down with unacked messages — instead of waiting out the ~100ms delivery poll. Previously there was no enqueue→consumer signal, so each idle queue hop added up to ~100ms of latency, which compounded badly in multi-hop pipelines and on failover. Added a per-queue wakeup signal ("doorbell"); the existing poll is retained as a fallback so no enqueue path can strand a message. Connection and channel cleanup also stop the dying channel's own consumers *before* requeueing so the wakeup reaches a live peer consumer rather than being drained by a doomed one.
+- Data race on `connection.frameMax`: it was written during `connection.tune-ok` by the method-handling goroutine while the frame-reader goroutine read it on every frame. It is now an `atomic.Uint32`.
+- Data race on `queue.Messages`: `deliverToQueue` read `len(queue.Messages)` for a log line without holding the queue lock while `deliverMessages` mutated the slice (exposed by the immediate-wakeup change above). The count is now read under the lock.
+- Data race on the `IsTerminal` terminal-detection flag: it is read by the logger on every log call across connection goroutines while `init` (and tests) write it. It is now an `atomic.Bool`.
+- Test races/leaks that prevented the suite from running under `-race`: `TestPublisherConfirms_ConcurrentPublish` accessed its result map without a lock, and `TestConsumerReconnectionPattern` leaked its reconnect goroutine which kept dialing and calling `t.Log` after the test completed (a panic under `-race`). Both are now synchronized/awaited.
+- Intermittent "address already in use" failures from the test suite. Tests previously assigned ports from a fixed monotonic counter (`:5800`, `:5801`, …) which collided when a chosen port was held by another process or in TCP `TIME_WAIT` from an earlier run. The helpers now ask the OS for a free ephemeral port instead.
+
+### Added
+- `make test` and `make test-race` targets. The full suite now passes cleanly, including under the race detector.
+- Latency tests asserting that requeued messages reach an idle peer consumer well within the ~100ms fallback poll window, for both the connection-cleanup and channel-close paths.
+
 ## [0.3.1]
 
 ## Added

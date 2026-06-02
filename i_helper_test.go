@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/aleybovich/carrot-mq/internal"
+	"github.com/aleybovich/carrot-mq/internal/testutil"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
@@ -18,17 +18,6 @@ import (
 )
 
 var testRand = rand.New(rand.NewSource(time.Now().UnixNano())) // For unique names
-// testServerPortCounter is a global counter to assign unique ports to test servers.
-var testServerPortCounter = 5800 // Starting port number, different from previous example
-var portCounterMutex sync.Mutex
-
-func getNextTestPort() string {
-	portCounterMutex.Lock()
-	defer portCounterMutex.Unlock()
-	port := testServerPortCounter
-	testServerPortCounter++
-	return fmt.Sprintf(":%d", port)
-}
 
 // Helper to generate unique names for exchanges, queues, etc.
 func uniqueName(prefix string) string {
@@ -36,8 +25,8 @@ func uniqueName(prefix string) string {
 }
 
 func setupTestServer(t *testing.T, opts ...ServerOption) (addr string, cleanup func()) {
-	internal.IsTerminal = true // Force colorized output for server logs during tests
-	addr = getNextTestPort()
+	internal.IsTerminal.Store(true) // Force colorized output for server logs during tests
+	addr = testutil.GetNextTestPort(t)
 	s := NewServer(opts...) // Uses default internal logger
 
 	// Channel to signal when server goroutine exits

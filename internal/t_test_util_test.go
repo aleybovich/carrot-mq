@@ -5,23 +5,13 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/aleybovich/carrot-mq/internal/testutil"
 )
 
 var testRand = rand.New(rand.NewSource(time.Now().UnixNano())) // For unique names
-// testServerPortCounter is a global counter to assign unique ports to test servers.
-var testServerPortCounter = 5800 // Starting port number, different from previous example
-var portCounterMutex sync.Mutex
-
-func getNextTestPort() string {
-	portCounterMutex.Lock()
-	defer portCounterMutex.Unlock()
-	port := testServerPortCounter
-	testServerPortCounter++
-	return fmt.Sprintf(":%d", port)
-}
 
 // Helper to generate unique names for exchanges, queues, etc.
 func uniqueName(prefix string) string {
@@ -30,8 +20,8 @@ func uniqueName(prefix string) string {
 
 // Helper to start a server and return its address and a cleanup function
 func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (s *server, addr string, cleanup func()) {
-	IsTerminal = true // Force colorized output for server logs during tests
-	addr = getNextTestPort()
+	IsTerminal.Store(true) // Force colorized output for server logs during tests
+	addr = testutil.GetNextTestPort(t)
 	s = NewServer(opts...) // Uses default internal logger
 
 	// Channel to signal when server goroutine exits
@@ -51,8 +41,8 @@ func setupAndReturnTestServer(t *testing.T, opts ...ServerOption) (s *server, ad
 	time.Sleep(200 * time.Millisecond)
 
 	cleanup = func() {
-		if s.listener != nil {
-			err := s.listener.Close()
+		if ln := s.getListener(); ln != nil {
+			err := ln.Close()
 			if err != nil {
 				t.Logf("Error closing test server listener on %s: %v", addr, err)
 			}

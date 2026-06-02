@@ -113,20 +113,24 @@ func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	if err := binary.Read(reader, binary.BigEndian, &c.channelMax); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (channel-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}
-	if err := binary.Read(reader, binary.BigEndian, &c.frameMax); err != nil {
+	// frameMax is read by the frame-reader goroutine on every frame, so it's atomic.
+	// Decode + validate into a local, then publish the negotiated value with one Store.
+	var frameMax uint32
+	if err := binary.Read(reader, binary.BigEndian, &frameMax); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (frame-max)", uint16(ClassConnection), MethodConnectionTuneOk)
 	}
 
 	// AMQP 0-9-1 spec: if client proposes frame-max higher than server's value,
 	// server MUST close the connection. A client value of 0 means "no limit" which
 	// we treat as accepting the server's proposed value.
-	if c.frameMax == 0 {
-		c.frameMax = suggestedFrameMaxSize
-	} else if c.frameMax > suggestedFrameMaxSize {
+	if frameMax == 0 {
+		frameMax = suggestedFrameMaxSize
+	} else if frameMax > suggestedFrameMaxSize {
 		return c.sendConnectionClose(amqpError.NotAllowed.Code(),
-			fmt.Sprintf("frame-max %d exceeds server maximum %d", c.frameMax, suggestedFrameMaxSize),
+			fmt.Sprintf("frame-max %d exceeds server maximum %d", frameMax, suggestedFrameMaxSize),
 			uint16(ClassConnection), MethodConnectionTuneOk)
 	}
+	c.frameMax.Store(frameMax)
 
 	if err := binary.Read(reader, binary.BigEndian, &c.heartbeatInterval); err != nil {
 		return c.sendConnectionClose(amqpError.SyntaxError.Code(), "malformed connection.tune-ok (heartbeat)", uint16(ClassConnection), MethodConnectionTuneOk)
@@ -136,7 +140,7 @@ func (c *connection) handleMethodConnectionTuneOk(reader *bytes.Reader) error {
 	}
 
 	c.server.Info("Connection parameters negotiated: channelMax=%d, frameMax=%d, heartbeat=%d",
-		c.channelMax, c.frameMax, c.heartbeatInterval)
+		c.channelMax, frameMax, c.heartbeatInterval)
 
 	// Start heartbeat sender if heartbeat is enabled
 	if c.heartbeatInterval > 0 {
@@ -807,7 +811,7 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 			return c.sendChannelClose(channelId, amqpError.AccessRefused.Code(), errMsg, uint16(ClassQueue), MethodQueueDeclare)
 		}
 		// Generate a unique name
-		actualQueueName = fmt.Sprintf("amq.gen-%s-%d-%d-q", c.conn.LocalAddr().String(), channelId, c.server.listener.Addr().(*net.TCPAddr).Port)
+		actualQueueName = fmt.Sprintf("amq.gen-%s-%d-%d-q", c.conn.LocalAddr().String(), channelId, c.server.getListener().Addr().(*net.TCPAddr).Port)
 		tempCounter := 0
 		baseName := actualQueueName
 		// Ensure unique name (simple approach)
@@ -910,6 +914,7 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 				Exclusive:  exclusive,
 				AutoDelete: autoDelete,
 				ownerConn:  owner,
+				notify:     make(chan struct{}, 1),
 			}
 			// PERSISTENCE: Save durable queue before exposing it
 			if c.server.persistenceManager != nil && durable {
@@ -2412,6 +2417,7 @@ func (c *connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 				c.server.Info("Requeued message to queue '%s' (original delivery tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
 				affectedQueues[unacked.QueueName] = true
 				queue.mu.Unlock()
+				queue.wake()
 			} else {
 				c.server.Warn("Queue '%s' not found for requeuing nacked message (tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
 			}
@@ -2529,6 +2535,7 @@ func (c *connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 			queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 			c.server.Info("Requeued rejected message to queue '%s' (delivery tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
 			queue.mu.Unlock()
+			queue.wake()
 		} else {
 			c.server.Warn("Queue '%s' not found for requeuing rejected message (tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
 		}
@@ -2663,6 +2670,7 @@ func (c *connection) handleMethodBasicRecover(reader *bytes.Reader, channelId ui
 				c.server.Info("Requeued recovered message to queue '%s' (original delivery tag %d on channel %d)",
 					unacked.QueueName, unacked.DeliveryTag, channelId)
 				queue.mu.Unlock()
+				queue.wake()
 			} else {
 				c.server.Warn("Queue '%s' not found for requeuing recovered message (tag %d on channel %d)",
 					unacked.QueueName, unacked.DeliveryTag, channelId)

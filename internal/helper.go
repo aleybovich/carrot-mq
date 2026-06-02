@@ -13,7 +13,7 @@ import (
 
 // colorize adds ANSI color to a string if the output is a terminal
 func colorize(s string, color string) string {
-	if IsTerminal {
+	if IsTerminal.Load() {
 		return fmt.Sprintf("%s%s%s", color, s, colorReset)
 	}
 	return s

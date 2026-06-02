@@ -35,13 +35,15 @@ const (
 
 const failedAuthThrottle = 1 * time.Second // Throttle failed auth attempts to prevent abuse
 
-// Flag to determine if we're logging to a terminal (with colors) or a file
-var IsTerminal bool
+// Flag to determine if we're logging to a terminal (with colors) or a file.
+// atomic because every log call reads it across connection goroutines while
+// init (and tests) write it.
+var IsTerminal atomic.Bool
 
 func init() {
 	// Check if stdout is a terminal
 	fileInfo, _ := os.Stdout.Stat()
-	IsTerminal = (fileInfo.Mode() & os.ModeCharDevice) != 0
+	IsTerminal.Store((fileInfo.Mode() & os.ModeCharDevice) != 0)
 }
 
 type Server interface {
@@ -189,7 +191,22 @@ type queue struct {
 	ownerConn  *connection // non-nil only when Exclusive == true; set at declaration time
 	mu         sync.RWMutex
 
+	// notify is a buffered (cap 1) "doorbell": ringing it wakes an idle consumer
+	// immediately instead of waiting for the delivery poll. Signals coalesce into a
+	// single pending wakeup, so one ring is enough no matter how many were sent.
+	notify chan struct{}
+
 	deleting atomic.Bool
+}
+
+// wake rings the queue's doorbell to nudge an idle consumer that work is available.
+// Non-blocking: if a wakeup is already pending (or no consumer is waiting yet) it is
+// a no-op. Safe to call while holding q.mu — the receive side never takes q.mu.
+func (q *queue) wake() {
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
 }
 
 type exchange struct {
@@ -224,7 +241,7 @@ type connection struct {
 
 	// negotiated values
 	channelMax        uint16
-	frameMax          uint32
+	frameMax          atomic.Uint32 // read by the frame-reader goroutine every frame; written once at tune-ok
 	heartbeatInterval uint16
 
 	username string // Store authenticated username
@@ -353,6 +370,7 @@ func WithVHosts(vhosts []config.VHostConfig) ServerOption {
 					Durable:    queueConfig.Durable,
 					Exclusive:  queueConfig.Exclusive,
 					AutoDelete: queueConfig.AutoDelete,
+					notify:     make(chan struct{}, 1),
 				}
 				s.Info("Created queue '%s' in vhost '%s' (durable: %v, exclusive: %v)",
 					queueConfig.Name, vhostConfig.Name, queueConfig.Durable, queueConfig.Exclusive)
@@ -527,7 +545,7 @@ func (s *server) IsReady() bool {
 
 func NewServer(opts ...ServerOption) *server {
 	var logPrefix string
-	if IsTerminal {
+	if IsTerminal.Load() {
 		logPrefix = fmt.Sprintf("%s[AMQP]%s ", colorBlue, colorReset)
 	} else {
 		logPrefix = "[AMQP] "
@@ -578,14 +596,26 @@ func NewServer(opts ...ServerOption) *server {
 	return s
 }
 
+// getListener returns the server's listener under the read lock. Start writes the
+// listener from a separate goroutine, so every other reader must go through here.
+func (s *server) getListener() net.Listener {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.listener
+}
+
 func (s *server) Start(addr string) error {
-	var err error
 	s.Info("Starting AMQP server on %s", addr)
-	s.listener, err = net.Listen("tcp", addr)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		s.Err("Error starting server: %v", err)
 		return err
 	}
+	// Publish the listener under the lock; concurrent readers (Shutdown, handler
+	// goroutines, tests) access it via getListener().
+	s.mu.Lock()
+	s.listener = ln
+	s.mu.Unlock()
 	s.Info("Server listening on %s", addr)
 
 	// Mark server as ready after listener is successfully created
@@ -595,7 +625,7 @@ func (s *server) Start(addr string) error {
 	defer s.isReady.Store(false)
 
 	for {
-		conn, err := s.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				s.Info("Server listener on %s closed. Stopping accept loop.", addr)
@@ -629,8 +659,8 @@ func (s *server) Shutdown(ctx context.Context) error {
 	s.isReady.Store(false)
 
 	// 1. Stop accepting new connections
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
+	if ln := s.getListener(); ln != nil {
+		if err := ln.Close(); err != nil {
 			s.Warn("Error closing network listener: %v", err)
 		}
 	}
@@ -1049,7 +1079,7 @@ func (c *connection) readFrame() (*frame, error) {
 	// Enforce frame size limits per AMQP 0-9-1 spec:
 	// Before negotiation completes, peers MUST accept frames up to frame-min-size
 	// but are not required to accept larger ones. After negotiation, use frame-max.
-	effectiveMax := c.frameMax
+	effectiveMax := c.frameMax.Load()
 	if effectiveMax == 0 {
 		effectiveMax = frameMinSize
 	}
@@ -2192,8 +2222,16 @@ func (c *connection) deliverToQueue(queueName string, msg *message) error {
 		queue.mu.Unlock()
 	}
 
+	// Wake an idle consumer immediately instead of letting it wait out the poll.
+	queue.wake()
+
+	// Read the count under the lock: deliverMessages mutates queue.Messages
+	// concurrently, and immediate wakeup makes that overlap the common case.
+	queue.mu.RLock()
+	msgCount := len(queue.Messages)
+	queue.mu.RUnlock()
 	c.server.Info("Message enqueued to queue '%s'. Queue now has %d messages.",
-		queueName, len(queue.Messages))
+		queueName, msgCount)
 
 	return nil
 }
@@ -2211,13 +2249,18 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 		queue.mu.Unlock()
 
 		if !messageAvailable {
-			// Only use select with timer when no messages
+			// Wait for a doorbell ring (immediate on publish/requeue) or fall back to a
+			// short poll. The fallback is a safety net so no enqueue path can strand a
+			// message even if it didn't ring the doorbell.
 			select {
 			case <-consumer.stopCh:
 				c.server.Info("Consumer %s stopped on channel %d", consumerTag, channelId)
 				return
+			case <-queue.notify:
+				// Doorbell rung — re-check for messages immediately.
+				continue
 			case <-time.After(100 * time.Millisecond):
-				// Check again for messages
+				// Fallback poll.
 				continue
 			}
 		} else {
@@ -2705,12 +2748,27 @@ func (c *connection) cleanupConnectionResources() {
 
 		c.mu.Lock() // Lock the connection to safely iterate over channels
 
-		// NEW: Collect queue names that will need dispatch attempts
-		affectedQueuesForDispatch := make(map[string]bool)
-
 		for chanId, ch := range c.channels {
 			c.server.Info("Cleaning up resources for channel %d on connection %s", chanId, c.conn.RemoteAddr())
 			ch.mu.Lock() // Lock the specific channel
+
+			// Stop this channel's consumers FIRST so their deliverMessages goroutines
+			// exit before we wake the queue below. Otherwise a doomed consumer could
+			// drain the wake token and the peer consumer would wait out the fallback poll.
+			for consumerTag, queueName := range ch.consumers {
+				vhost.mu.RLock() // RLock server to access s.queues
+				if queue, ok := vhost.queues[queueName]; ok {
+					queue.mu.Lock() // Lock the specific queue
+					if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
+						c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
+						close(consumer.stopCh) // This will make the deliverMessages goroutine exit
+						delete(queue.Consumers, consumerTag)
+					}
+					queue.mu.Unlock() // Unlock queue
+				}
+				vhost.mu.RUnlock()
+			}
+			ch.consumers = map[string]string{} // Clear consumers map for the channel
 
 			// Handle unacked messages: requeue them
 			if len(ch.unackedMessages) > 0 {
@@ -2727,8 +2785,9 @@ func (c *connection) cleanupConnectionResources() {
 						// Prepend to queue (requeued messages go to front)
 						queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 						c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'", deliveryTag, chanId, unacked.QueueName)
-						affectedQueuesForDispatch[unacked.QueueName] = true // Mark queue for dispatch
-						queue.mu.Unlock()                                   // Unlock queue
+						queue.mu.Unlock() // Unlock queue
+						// Wake a peer consumer so requeued messages don't wait out the fallback poll.
+						queue.wake()
 					} else {
 						c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d) during connection cleanup", unacked.QueueName, deliveryTag, chanId)
 					}
@@ -2737,23 +2796,6 @@ func (c *connection) cleanupConnectionResources() {
 				ch.unackedMessages = make(map[uint64]*unackedMessage)
 			}
 
-			// Clean up consumers associated with this channel
-			for consumerTag, queueName := range ch.consumers {
-				vhost.mu.RLock() // RLock server to access s.queues
-				if queue, ok := vhost.queues[queueName]; ok {
-					queue.mu.Lock() // Lock the specific queue
-					if consumer, consumerExists := queue.Consumers[consumerTag]; consumerExists {
-						c.server.Info("Closing consumer message channel for tag '%s' on queue '%s' (channel %d)", consumerTag, queueName, chanId)
-						close(consumer.stopCh) // This will make the deliverMessages goroutine exit
-						delete(queue.Consumers, consumerTag)
-						// If this queue had messages and now has one less consumer, it might affect dispatch.
-						// The generic dispatch attempt later will cover this.
-					}
-					queue.mu.Unlock() // Unlock queue
-				}
-				vhost.mu.RUnlock()
-			}
-			ch.consumers = map[string]string{} // Clear consumers map for the channel
 			ch.pendingMessages = nil           // Clear any partial messages from publish
 			// Ensure timer is stopped if channel was being closed by server
 			if ch.closeOkTimer != nil {
@@ -3041,7 +3083,27 @@ func (c *connection) forceRemoveChannel(channelId uint16, reason string) {
 		ch.closeOkTimer = nil
 	}
 
-	affectedQueuesForDispatch := make(map[string]bool)
+	// Stop this channel's consumers FIRST so their deliverMessages goroutines
+	// exit before we wake the queue below. Otherwise a doomed consumer could
+	// drain the wake token and a peer consumer would wait out the fallback poll.
+	if len(ch.consumers) > 0 {
+		c.server.Info("Channel %d cleaning up %d consumers", channelId, len(ch.consumers))
+		for consumerTag, queueName := range ch.consumers {
+			vhost.mu.RLock()
+			if q, qExists := vhost.queues[queueName]; qExists {
+				q.mu.Lock()
+				if consumer, consumerExists := q.Consumers[consumerTag]; consumerExists {
+					close(consumer.stopCh)
+					delete(q.Consumers, consumerTag)
+					c.server.Info("Closed consumer %s on queue %s for channel %d",
+						consumerTag, queueName, channelId)
+				}
+				q.mu.Unlock()
+			}
+			vhost.mu.RUnlock()
+		}
+		ch.consumers = map[string]string{}
+	}
 
 	if len(ch.unackedMessages) > 0 {
 		c.server.Info("Channel %d has %d unacked messages, requeuing", channelId, len(ch.unackedMessages))
@@ -3056,8 +3118,9 @@ func (c *connection) forceRemoveChannel(channelId uint16, reason string) {
 				queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 				c.server.Debug("Prepared message (tag %d from channel %d) for requeue to queue '%s'",
 					deliveryTag, channelId, unacked.QueueName)
-				affectedQueuesForDispatch[unacked.QueueName] = true
 				queue.mu.Unlock()
+				// Wake a peer consumer so requeued messages don't wait out the fallback poll.
+				queue.wake()
 			} else {
 				c.server.Warn("Queue '%s' not found for requeuing unacked message (tag %d from channel %d)",
 					unacked.QueueName, deliveryTag, channelId)
@@ -3078,25 +3141,6 @@ func (c *connection) forceRemoveChannel(channelId uint16, reason string) {
 			c.sendBasicNack(channelId, maxTag, true, false)
 		}
 		ch.pendingConfirms = make(map[uint64]bool)
-	}
-
-	if len(ch.consumers) > 0 {
-		c.server.Info("Channel %d cleaning up %d consumers", channelId, len(ch.consumers))
-		for consumerTag, queueName := range ch.consumers {
-			vhost.mu.RLock()
-			if q, qExists := vhost.queues[queueName]; qExists {
-				q.mu.Lock()
-				if consumer, consumerExists := q.Consumers[consumerTag]; consumerExists {
-					close(consumer.stopCh)
-					delete(q.Consumers, consumerTag)
-					c.server.Info("Closed consumer %s on queue %s for channel %d",
-						consumerTag, queueName, channelId)
-				}
-				q.mu.Unlock()
-			}
-			vhost.mu.RUnlock()
-		}
-		ch.consumers = map[string]string{}
 	}
 	ch.pendingMessages = nil
 	ch.mu.Unlock()
