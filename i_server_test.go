@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aleybovich/carrot-mq/internal/testutil"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,7 +35,7 @@ func TestServerIsReady(t *testing.T) {
 	assert.False(t, s.IsReady(), "Server should not be ready before Start is called")
 	
 	// Get a test port
-	addr := getNextTestPort(t)
+	addr := testutil.GetNextTestPort(t)
 	
 	// Start server in a goroutine
 	serverDone := make(chan error, 1)
