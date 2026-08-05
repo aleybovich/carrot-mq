@@ -505,6 +505,15 @@ func (c *connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 		return c.sendChannelClose(channelId, amqpError.NotImplemented.Code(), replyText, uint16(ClassExchange), MethodExchangeDeclare)
 	}
 
+	// Validate the "alternate-exchange" argument. The exchange it names does not have to
+	// exist: an unresolvable alternate exchange simply leaves messages unroutable.
+	alternate, errAlt := validateAlternateExchange(args)
+	if errAlt != nil {
+		replyText := fmt.Sprintf("PRECONDITION_FAILED - %v", errAlt)
+		c.server.Warn("Exchange.Declare: %s for exchange '%s'. Sending Channel.Close.", replyText, exchangeName)
+		return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), replyText, uint16(ClassExchange), MethodExchangeDeclare)
+	}
+
 	vhost := c.vhost
 	vhost.mu.Lock()
 	ex, exists := vhost.exchanges[exchangeName]
@@ -551,16 +560,26 @@ func (c *connection) handleMethodExchangeDeclare(reader *bytes.Reader, channelId
 				// AMQP code 406 (PRECONDITION_FAILED)
 				return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), replyText, uint16(ClassExchange), MethodExchangeDeclare)
 			}
+			// The alternate-exchange argument is part of the exchange's identity, so a
+			// re-declaration must name the same one (other arguments stay unchecked).
+			if alternateExchangeName(ex.Arguments) != alternate {
+				vhost.mu.Unlock()
+				replyText := fmt.Sprintf("PRECONDITION_FAILED - cannot redeclare exchange '%s' with a different '%s'", exchangeName, alternateExchangeArgKey)
+				c.server.Warn("Exchange.Declare: %s. Existing: '%s'. Req: '%s'", replyText, alternateExchangeName(ex.Arguments), alternate)
+				return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), replyText, uint16(ClassExchange), MethodExchangeDeclare)
+			}
 			c.server.Info("Exchange '%s' re-declared with matching properties.", exchangeName)
 		} else { // Not passive and not exists: create it.
 
 			newExchange := &exchange{
-				Name:       exchangeName,
-				Type:       exchangeType,
-				Durable:    durable,
-				AutoDelete: autoDelete,
-				Internal:   internal,
-				Bindings:   make(map[string][]string),
+				Name:             exchangeName,
+				Type:             exchangeType,
+				Durable:          durable,
+				AutoDelete:       autoDelete,
+				Internal:         internal,
+				Bindings:         make(map[string][]string),
+				ExchangeBindings: make(map[string][]string),
+				Arguments:        args,
 			}
 
 			// PERSISTENCE: Save durable exchange after successful creation
@@ -660,13 +679,10 @@ func (c *connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId 
 		return c.sendChannelClose(channelId, amqpError.NotFound.Code(), replyText, uint16(ClassExchange), MethodExchangeDelete)
 	}
 
-	// Check if-unused condition
+	// Check if-unused condition. An exchange is "in use" only when it is the SOURCE of a
+	// binding; inbound exchange-to-exchange edges never block deletion.
 	if ifUnused {
-		exchange.mu.RLock()
-		hasBindings := len(exchange.Bindings) > 0
-		exchange.mu.RUnlock()
-
-		if hasBindings {
+		if exchange.hasOutboundBindings() {
 			vhost.mu.RUnlock()
 			replyText := fmt.Sprintf("PRECONDITION_FAILED - exchange '%s' in use (has bindings)", exchangeName)
 			c.server.Warn("Exchange.Delete: %s. Sending Channel.Close.", replyText)
@@ -687,6 +703,9 @@ func (c *connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId 
 	// First, clean up any queue bindings that reference this exchange
 	c.cleanupQueueBindingsForExchange(vhost, exchangeName)
 
+	// Then drop every exchange-to-exchange binding it takes part in, in either direction.
+	removedEdges := c.cleanupExchangeBindingsForExchange(vhost, exchangeName)
+
 	// Remove from vhost
 	vhost.mu.Lock()
 	delete(vhost.exchanges, exchangeName)
@@ -696,6 +715,12 @@ func (c *connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId 
 
 	// PERSISTENCE: Delete exchange after successful memory deletion
 	if c.server.persistenceManager != nil {
+		for _, edge := range removedEdges {
+			if err := c.server.persistenceManager.DeleteExchangeBinding(vhost.name, edge.Source, edge.Destination, edge.RoutingKey); err != nil {
+				c.server.Err("Failed to delete exchange binding %s:%s->%s from persistence: %v",
+					edge.Source, edge.RoutingKey, edge.Destination, err)
+			}
+		}
 		if err := c.server.persistenceManager.DeleteExchange(vhost.name, exchangeName); err != nil {
 			c.server.Err("Failed to delete exchange %s from persistence: %v", exchangeName, err)
 		}
@@ -719,6 +744,203 @@ func (c *connection) handleMethodExchangeDelete(reader *bytes.Reader, channelId 
 	}
 
 	return nil
+}
+
+// exchangeBindFields carries the arguments of exchange.bind and exchange.unbind, which
+// share an identical payload layout.
+type exchangeBindFields struct {
+	destination string
+	source      string
+	routingKey  string
+	noWait      bool
+	arguments   map[string]interface{}
+}
+
+// readExchangeBindFields parses the payload shared by exchange.bind and exchange.unbind:
+// reserved-1 (short), destination (shortstr), source (shortstr), routing-key (shortstr),
+// no-wait (bit), arguments (table).
+func readExchangeBindFields(reader *bytes.Reader) (*exchangeBindFields, error) {
+	var reserved1 uint16
+	if err := binary.Read(reader, binary.BigEndian, &reserved1); err != nil {
+		return nil, fmt.Errorf("reading reserved-1: %w", err)
+	}
+
+	destination, err := readShortString(reader)
+	if err != nil {
+		return nil, fmt.Errorf("reading destination: %w", err)
+	}
+
+	source, err := readShortString(reader)
+	if err != nil {
+		return nil, fmt.Errorf("reading source: %w", err)
+	}
+
+	routingKey, err := readShortString(reader)
+	if err != nil {
+		return nil, fmt.Errorf("reading routing key: %w", err)
+	}
+
+	bits, err := reader.ReadByte()
+	if err != nil {
+		return nil, fmt.Errorf("reading bits: %w", err)
+	}
+
+	arguments, err := readTable(reader)
+	if err != nil {
+		return nil, fmt.Errorf("reading arguments table: %w", err)
+	}
+
+	return &exchangeBindFields{
+		destination: destination,
+		source:      source,
+		routingKey:  routingKey,
+		noWait:      (bits & 0x01) != 0,
+		arguments:   arguments,
+	}, nil
+}
+
+// checkExchangeBindEndpoints enforces the endpoint rules shared by exchange.bind and
+// exchange.unbind: neither end may be the default exchange (403), and both must exist
+// (404). It returns the reply code and text to close the channel with, or ok = true.
+func checkExchangeBindEndpoints(f *exchangeBindFields, sourceExists, destinationExists bool) (replyCode uint16, replyText string, ok bool) {
+	if f.source == "" || f.destination == "" {
+		return amqpError.AccessRefused.Code(), "ACCESS_REFUSED - the default exchange cannot be used in an exchange binding", false
+	}
+	if !sourceExists {
+		return amqpError.NotFound.Code(), fmt.Sprintf("NOT_FOUND - no exchange '%s' in vhost '/'", f.source), false
+	}
+	if !destinationExists {
+		return amqpError.NotFound.Code(), fmt.Sprintf("NOT_FOUND - no exchange '%s' in vhost '/'", f.destination), false
+	}
+	return 0, "", true
+}
+
+// sendExchangeMethodOk writes a bodyless exchange-class response frame.
+func (c *connection) sendExchangeMethodOk(channelId uint16, methodId uint16) error {
+	payload := &bytes.Buffer{}
+	binary.Write(payload, binary.BigEndian, uint16(ClassExchange))
+	binary.Write(payload, binary.BigEndian, methodId)
+
+	if err := c.writeFrame(&frame{Type: FrameMethod, Channel: channelId, Payload: payload.Bytes()}); err != nil {
+		c.server.Err("Error sending %s: %v", getFullMethodName(ClassExchange, methodId), err)
+		return err
+	}
+	c.server.Info("Sent %s on channel %d", getFullMethodName(ClassExchange, methodId), channelId)
+	return nil
+}
+
+func (c *connection) handleMethodExchangeBind(reader *bytes.Reader, channelId uint16) error {
+	f, err := readExchangeBindFields(reader)
+	if err != nil {
+		c.server.Err("Error reading exchange.bind: %v", err)
+		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed exchange.bind", uint16(ClassExchange), MethodExchangeBind)
+	}
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of exchange.bind payload.")
+	}
+
+	c.server.Info("Processing exchange.bind: destination='%s', source='%s', routingKey='%s', noWait=%v, args=%v on channel %d",
+		f.destination, f.source, f.routingKey, f.noWait, f.arguments, channelId)
+
+	vhost := c.vhost
+
+	vhost.mu.RLock()
+	if vhost.IsDeleting() {
+		vhost.mu.RUnlock()
+		c.server.Info("Exchange.Bind: VHost is being deleted")
+		return c.sendConnectionClose(amqpError.ConnectionForced.Code(), "VHost deleted", uint16(ClassExchange), MethodExchangeBind)
+	}
+	source, sourceExists := vhost.exchanges[f.source]
+	destination, destinationExists := vhost.exchanges[f.destination]
+	vhost.mu.RUnlock()
+
+	if replyCode, replyText, ok := checkExchangeBindEndpoints(f, sourceExists, destinationExists); !ok {
+		c.server.Warn("Exchange.Bind failed: %s. Sending Channel.Close.", replyText)
+		return c.sendChannelClose(channelId, replyCode, replyText, uint16(ClassExchange), MethodExchangeBind)
+	}
+
+	if source.addExchangeBinding(f.routingKey, f.destination) {
+		c.server.Info("Bound exchange '%s' (type: %s) to exchange '%s' with routing key '%s'",
+			f.source, source.Type, f.destination, f.routingKey)
+
+		// PERSISTENCE: an exchange binding may only outlive a restart when both of its
+		// endpoints do.
+		if c.server.persistenceManager != nil && source.Durable && destination.Durable {
+			bindingRecord := &ExchangeBindingRecord{
+				Source:      f.source,
+				Destination: f.destination,
+				RoutingKey:  f.routingKey,
+				Arguments:   f.arguments,
+				CreatedAt:   time.Now(),
+			}
+
+			if err := c.server.persistenceManager.SaveExchangeBinding(vhost.name, bindingRecord); err != nil {
+				c.server.Err("Failed to persist exchange binding %s:%s->%s: %v",
+					f.source, f.routingKey, f.destination, err)
+			}
+		}
+	} else {
+		c.server.Info("Exchange binding already exists from '%s' to '%s' with routing key '%s'",
+			f.source, f.destination, f.routingKey)
+	}
+
+	if f.noWait {
+		return nil
+	}
+	return c.sendExchangeMethodOk(channelId, MethodExchangeBindOk)
+}
+
+func (c *connection) handleMethodExchangeUnbind(reader *bytes.Reader, channelId uint16) error {
+	f, err := readExchangeBindFields(reader)
+	if err != nil {
+		c.server.Err("Error reading exchange.unbind: %v", err)
+		return c.sendChannelClose(channelId, amqpError.SyntaxError.Code(), "SYNTAX_ERROR - malformed exchange.unbind", uint16(ClassExchange), MethodExchangeUnbind)
+	}
+
+	if reader.Len() > 0 {
+		c.server.Warn("Extra data at end of exchange.unbind payload.")
+	}
+
+	c.server.Info("Processing exchange.unbind: destination='%s', source='%s', routingKey='%s', noWait=%v, args=%v on channel %d",
+		f.destination, f.source, f.routingKey, f.noWait, f.arguments, channelId)
+
+	vhost := c.vhost
+
+	vhost.mu.RLock()
+	if vhost.IsDeleting() {
+		vhost.mu.RUnlock()
+		c.server.Info("Exchange.Unbind: VHost is being deleted")
+		return c.sendConnectionClose(amqpError.ConnectionForced.Code(), "VHost deleted", uint16(ClassExchange), MethodExchangeUnbind)
+	}
+	source, sourceExists := vhost.exchanges[f.source]
+	_, destinationExists := vhost.exchanges[f.destination]
+	vhost.mu.RUnlock()
+
+	if replyCode, replyText, ok := checkExchangeBindEndpoints(f, sourceExists, destinationExists); !ok {
+		c.server.Warn("Exchange.Unbind failed: %s. Sending Channel.Close.", replyText)
+		return c.sendChannelClose(channelId, replyCode, replyText, uint16(ClassExchange), MethodExchangeUnbind)
+	}
+
+	// Unbinding a binding that never existed is a silent success.
+	if source.removeExchangeBinding(f.routingKey, f.destination) {
+		c.server.Info("Unbound exchange '%s' from exchange '%s' with routing key '%s'",
+			f.destination, f.source, f.routingKey)
+
+		if c.server.persistenceManager != nil {
+			if err := c.server.persistenceManager.DeleteExchangeBinding(vhost.name, f.source, f.destination, f.routingKey); err != nil {
+				c.server.Err("Failed to delete exchange binding from persistence: %v", err)
+			}
+		}
+	} else {
+		c.server.Info("No exchange binding found to remove from '%s' to '%s' with routing key '%s'",
+			f.source, f.destination, f.routingKey)
+	}
+
+	if f.noWait {
+		return nil
+	}
+	return c.sendExchangeMethodOk(channelId, MethodExchangeUnbindOk)
 }
 
 func (c *connection) handleClassExchangeMethod(methodId uint16, reader *bytes.Reader, channelId uint16) error {
@@ -747,6 +969,12 @@ func (c *connection) handleClassExchangeMethod(methodId uint16, reader *bytes.Re
 
 	case MethodExchangeDelete:
 		return c.handleMethodExchangeDelete(reader, channelId)
+
+	case MethodExchangeBind:
+		return c.handleMethodExchangeBind(reader, channelId)
+
+	case MethodExchangeUnbind:
+		return c.handleMethodExchangeUnbind(reader, channelId)
 
 	default:
 		replyText := fmt.Sprintf("unknown or not implemented exchange method id %d", methodId)
@@ -2016,17 +2244,21 @@ func (c *connection) handleMethodBasicPublish(reader *bytes.Reader, channelId ui
 
 	// Server-side validation for exchange existence (unless it's the default "" exchange which always exists)
 	if exchangeName != "" {
-		vhost := c.vhost
-		vhost.mu.RLock()
-		_, exExists := vhost.exchanges[exchangeName]
-		vhost.mu.RUnlock()
-		if !exExists {
+		ex := c.vhost.lookupExchange(exchangeName)
+		if ex == nil {
 			replyText := fmt.Sprintf("no exchange '%s' in vhost '/'", exchangeName)
 			c.server.Warn("Basic.Publish: %s. Sending Channel.Close.", replyText)
 			// AMQP code 404 (NOT_FOUND)
 			// Note: If 'mandatory' is true, a Basic.Return should be sent if no queue is bound.
 			// However, a non-existent exchange is a more fundamental error leading to Channel.Close.
 			return c.sendChannelClose(channelId, amqpError.NotFound.Code(), replyText, uint16(ClassBasic), MethodBasicPublish)
+		}
+		// An internal exchange may only be reached through a binding or an
+		// alternate-exchange hop, never by publishing to it directly.
+		if ex.Internal {
+			replyText := fmt.Sprintf("ACCESS_REFUSED - cannot publish to internal exchange '%s' in vhost '/'", exchangeName)
+			c.server.Warn("Basic.Publish: %s. Sending Channel.Close.", replyText)
+			return c.sendChannelClose(channelId, amqpError.AccessRefused.Code(), replyText, uint16(ClassBasic), MethodBasicPublish)
 		}
 	}
 

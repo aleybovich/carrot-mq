@@ -207,8 +207,11 @@ func recordDeath(msg *message, reason, queueName, originalExpiration string) {
 
 // routeInVHost resolves the queue names an (exchange, routingKey) pair routes
 // to, independent of any client connection. The default exchange ("") routes
-// directly to the queue named by the routing key.
-func routeInVHost(vh *vHost, exchangeName, routingKey string) ([]string, error) {
+// directly to the queue named by the routing key; every other exchange walks
+// the binding graph (see routeThroughExchange), so dead-lettered messages
+// traverse exchange-to-exchange bindings and alternate exchanges just like
+// client publishes do.
+func (s *server) routeInVHost(vh *vHost, exchangeName, routingKey string) ([]string, error) {
 	if exchangeName == "" {
 		vh.mu.RLock()
 		_, exists := vh.queues[routingKey]
@@ -219,48 +222,19 @@ func routeInVHost(vh *vHost, exchangeName, routingKey string) ([]string, error) 
 		return nil, nil
 	}
 
-	vh.mu.RLock()
-	ex := vh.exchanges[exchangeName]
-	vh.mu.RUnlock()
+	ex := vh.lookupExchange(exchangeName)
 	if ex == nil {
 		return nil, fmt.Errorf("exchange '%s' not found", exchangeName)
 	}
 
-	ex.mu.RLock()
-	defer ex.mu.RUnlock()
-
-	switch ex.Type {
-	case "direct":
-		return ex.Bindings[routingKey], nil
-	case "fanout":
-		queues := make([]string, 0)
-		seen := make(map[string]bool)
-		for _, bound := range ex.Bindings {
-			for _, q := range bound {
-				if !seen[q] {
-					seen[q] = true
-					queues = append(queues, q)
-				}
-			}
-		}
-		return queues, nil
-	case "topic":
-		queues := make([]string, 0)
-		seen := make(map[string]bool)
-		for pattern, bound := range ex.Bindings {
-			if topicMatch(pattern, routingKey) {
-				for _, q := range bound {
-					if !seen[q] {
-						seen[q] = true
-						queues = append(queues, q)
-					}
-				}
-			}
-		}
-		return queues, nil
-	default:
-		return nil, fmt.Errorf("unknown exchange type: %s", ex.Type)
+	// Walk the binding graph: each exchange matches its own bindings - queue and
+	// exchange alike - with its own type, against the message's original routing key.
+	queues := make([]string, 0)
+	if err := s.routeThroughExchange(vh, ex, routingKey, make(map[string]bool), make(map[string]bool), &queues); err != nil {
+		return nil, err
 	}
+
+	return queues, nil
 }
 
 // deadLetterMessage republishes msg — already removed from sourceQueue — to
@@ -299,7 +273,7 @@ func (s *server) deadLetterMessage(vh *vHost, sourceQueue *queue, msg *message, 
 	dead.Mandatory = false
 	dead.Immediate = false
 
-	queueNames, err := routeInVHost(vh, dead.Exchange, dead.RoutingKey)
+	queueNames, err := s.routeInVHost(vh, dead.Exchange, dead.RoutingKey)
 	if err != nil {
 		s.Warn("Dead-lettering from queue '%s': %v; message dropped", sourceQueue.Name, err)
 		return

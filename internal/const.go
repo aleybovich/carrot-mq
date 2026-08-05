@@ -82,6 +82,12 @@ const (
 	MethodExchangeDeclareOk = 11
 	MethodExchangeDelete    = 20
 	MethodExchangeDeleteOk  = 21
+	MethodExchangeBind      = 30
+	MethodExchangeBindOk    = 31
+	MethodExchangeUnbind    = 40
+	// MethodExchangeUnbindOk is 51, not 41: the AMQP 0-9-1 extension numbers
+	// exchange.unbind-ok this way and amqp091-go expects it.
+	MethodExchangeUnbindOk = 51
 
 	MethodQueueDeclare   = 10
 	MethodQueueDeclareOk = 11

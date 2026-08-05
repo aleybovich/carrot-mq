@@ -228,8 +228,14 @@ type exchange struct {
 	Durable    bool
 	AutoDelete bool
 	Internal   bool
-	Bindings   map[string][]string
-	mu         sync.RWMutex
+	Bindings   map[string][]string // routing key -> bound queue names
+	// ExchangeBindings holds exchange-to-exchange bindings for which this exchange is
+	// the source: routing key -> destination exchange names.
+	ExchangeBindings map[string][]string
+	// Arguments is the declare arguments table, kept so that "alternate-exchange" can
+	// be consulted during routing and compared on re-declaration.
+	Arguments map[string]interface{}
+	mu        sync.RWMutex
 
 	deleted atomic.Bool
 }
@@ -357,12 +363,13 @@ func WithVHosts(vhosts []config.VHostConfig) ServerOption {
 				}
 
 				vhost.exchanges[exchConfig.Name] = &exchange{
-					Name:       exchConfig.Name,
-					Type:       exchConfig.Type,
-					Durable:    exchConfig.Durable,
-					AutoDelete: exchConfig.AutoDelete,
-					Internal:   exchConfig.Internal,
-					Bindings:   make(map[string][]string),
+					Name:             exchConfig.Name,
+					Type:             exchConfig.Type,
+					Durable:          exchConfig.Durable,
+					AutoDelete:       exchConfig.AutoDelete,
+					Internal:         exchConfig.Internal,
+					Bindings:         make(map[string][]string),
+					ExchangeBindings: make(map[string][]string),
 				}
 				s.Info("Created exchange '%s' (type: %s) in vhost '%s'", exchConfig.Name, exchConfig.Type, vhostConfig.Name)
 			}
@@ -852,6 +859,25 @@ func (s *server) recoverVHostEntities(vhostName string) error {
 				s.Info("Recovered binding %s:%s -> %s in vhost %s",
 					bindRec.Exchange, bindRec.RoutingKey, bindRec.Queue, vhostName)
 			}
+		}
+	}
+
+	// Recover exchange-to-exchange bindings. Exchanges are restored above, so both
+	// endpoints of a persisted binding are resolvable by the time we get here.
+	exchangeBindingRecords, err := s.persistenceManager.LoadAllExchangeBindings(vhostName)
+	if err != nil {
+		s.Warn("Failed to load exchange bindings for vhost %s: %v", vhostName, err)
+	} else {
+		for _, bindRec := range exchangeBindingRecords {
+			source := vhost.lookupExchange(bindRec.Source)
+			if source == nil || vhost.lookupExchange(bindRec.Destination) == nil {
+				continue
+			}
+
+			source.addExchangeBinding(bindRec.RoutingKey, bindRec.Destination)
+
+			s.Info("Recovered exchange binding %s:%s -> %s in vhost %s",
+				bindRec.Source, bindRec.RoutingKey, bindRec.Destination, vhostName)
 		}
 	}
 
@@ -1741,7 +1767,7 @@ func (c *connection) handleBody(frame *frame) {
 // lives in routeInVHost so server-side republishing (dead-lettering) can
 // route without a client connection.
 func (c *connection) routeMessage(msg *message) ([]string, error) {
-	return routeInVHost(c.vhost, msg.Exchange, msg.RoutingKey)
+	return c.server.routeInVHost(c.vhost, msg.Exchange, msg.RoutingKey)
 }
 
 func (c *connection) deliverMessage(msg *message, channelId uint16) {
