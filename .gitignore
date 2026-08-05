@@ -25,3 +25,5 @@ go.work.sum
 .env
 
 .claude/settings.local.json
+# Session-local agent worktrees
+.claude/worktrees/
