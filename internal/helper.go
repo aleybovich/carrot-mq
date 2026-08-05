@@ -109,6 +109,14 @@ func getMethodName(classId uint16, methodId uint16) string {
 			return "delete"
 		case MethodExchangeDeleteOk:
 			return "delete-ok"
+		case MethodExchangeBind:
+			return "bind"
+		case MethodExchangeBindOk:
+			return "bind-ok"
+		case MethodExchangeUnbind:
+			return "unbind"
+		case MethodExchangeUnbindOk:
+			return "unbind-ok"
 		}
 	case ClassQueue:
 		switch methodId {

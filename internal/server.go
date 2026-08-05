@@ -215,8 +215,14 @@ type exchange struct {
 	Durable    bool
 	AutoDelete bool
 	Internal   bool
-	Bindings   map[string][]string
-	mu         sync.RWMutex
+	Bindings   map[string][]string // routing key -> bound queue names
+	// ExchangeBindings holds exchange-to-exchange bindings for which this exchange is
+	// the source: routing key -> destination exchange names.
+	ExchangeBindings map[string][]string
+	// Arguments is the declare arguments table, kept so that "alternate-exchange" can
+	// be consulted during routing and compared on re-declaration.
+	Arguments map[string]interface{}
+	mu        sync.RWMutex
 
 	deleted atomic.Bool
 }
@@ -343,12 +349,13 @@ func WithVHosts(vhosts []config.VHostConfig) ServerOption {
 				}
 
 				vhost.exchanges[exchConfig.Name] = &exchange{
-					Name:       exchConfig.Name,
-					Type:       exchConfig.Type,
-					Durable:    exchConfig.Durable,
-					AutoDelete: exchConfig.AutoDelete,
-					Internal:   exchConfig.Internal,
-					Bindings:   make(map[string][]string),
+					Name:             exchConfig.Name,
+					Type:             exchConfig.Type,
+					Durable:          exchConfig.Durable,
+					AutoDelete:       exchConfig.AutoDelete,
+					Internal:         exchConfig.Internal,
+					Bindings:         make(map[string][]string),
+					ExchangeBindings: make(map[string][]string),
 				}
 				s.Info("Created exchange '%s' (type: %s) in vhost '%s'", exchConfig.Name, exchConfig.Type, vhostConfig.Name)
 			}
@@ -823,6 +830,25 @@ func (s *server) recoverVHostEntities(vhostName string) error {
 				s.Info("Recovered binding %s:%s -> %s in vhost %s",
 					bindRec.Exchange, bindRec.RoutingKey, bindRec.Queue, vhostName)
 			}
+		}
+	}
+
+	// Recover exchange-to-exchange bindings. Exchanges are restored above, so both
+	// endpoints of a persisted binding are resolvable by the time we get here.
+	exchangeBindingRecords, err := s.persistenceManager.LoadAllExchangeBindings(vhostName)
+	if err != nil {
+		s.Warn("Failed to load exchange bindings for vhost %s: %v", vhostName, err)
+	} else {
+		for _, bindRec := range exchangeBindingRecords {
+			source := vhost.lookupExchange(bindRec.Source)
+			if source == nil || vhost.lookupExchange(bindRec.Destination) == nil {
+				continue
+			}
+
+			source.addExchangeBinding(bindRec.RoutingKey, bindRec.Destination)
+
+			s.Info("Recovered exchange binding %s:%s -> %s in vhost %s",
+				bindRec.Source, bindRec.RoutingKey, bindRec.Destination, vhostName)
 		}
 	}
 
@@ -1718,69 +1744,19 @@ func (c *connection) routeMessage(msg *message) ([]string, error) {
 		return nil, nil
 	}
 
-	vhost.mu.RLock()
-	exchange := vhost.exchanges[msg.Exchange]
-	vhost.mu.RUnlock()
-
+	exchange := vhost.lookupExchange(msg.Exchange)
 	if exchange == nil {
 		return nil, fmt.Errorf("exchange '%s' not found", msg.Exchange)
 	}
 
-	exchange.mu.RLock()
-	defer exchange.mu.RUnlock()
-
-	switch exchange.Type {
-	case "direct":
-		return c.routeDirect(exchange, msg.RoutingKey), nil
-	case "fanout":
-		return c.routeFanout(exchange), nil
-	case "topic":
-		return c.routeTopic(exchange, msg.RoutingKey), nil
-	// case "headers": // Not implemented yet
-	default:
-		return nil, fmt.Errorf("unknown exchange type: %s", exchange.Type)
-	}
-}
-
-// routeDirect returns queues bound with exact routing key match
-func (c *connection) routeDirect(exchange *exchange, routingKey string) []string {
-	return exchange.Bindings[routingKey]
-}
-
-// routeFanout returns all queues bound to the exchange
-func (c *connection) routeFanout(exchange *exchange) []string {
+	// Walk the binding graph: each exchange matches its own bindings - queue and
+	// exchange alike - with its own type, against the message's original routing key.
 	queues := make([]string, 0)
-	queueSet := make(map[string]bool)
-
-	for _, boundQueues := range exchange.Bindings {
-		for _, queueName := range boundQueues {
-			if !queueSet[queueName] {
-				queueSet[queueName] = true
-				queues = append(queues, queueName)
-			}
-		}
+	if err := c.routeThroughExchange(vhost, exchange, msg.RoutingKey, make(map[string]bool), make(map[string]bool), &queues); err != nil {
+		return nil, err
 	}
 
-	return queues
-}
-
-// routeTopic returns queues with topic pattern matching
-func (c *connection) routeTopic(exchange *exchange, routingKey string) []string {
-	queues := make([]string, 0)
-	queueSet := make(map[string]bool)
-
-	for pattern, boundQueues := range exchange.Bindings {
-		if topicMatch(pattern, routingKey) {
-			for _, queueName := range boundQueues {
-				if !queueSet[queueName] {
-					queueSet[queueName] = true
-					queues = append(queues, queueName)
-				}
-			}
-		}
-	}
-
-	return queues
+	return queues, nil
 }
 
 func (c *connection) deliverMessage(msg *message, channelId uint16) {

@@ -38,9 +38,10 @@ func (s *server) addVHostInternal(name string, persist bool) error {
 
 	// Create default direct exchange for this vhost
 	newVHost.exchanges[""] = &exchange{
-		Name:     "",
-		Type:     "direct",
-		Bindings: make(map[string][]string),
+		Name:             "",
+		Type:             "direct",
+		Bindings:         make(map[string][]string),
+		ExchangeBindings: make(map[string][]string),
 	}
 
 	s.vhosts[name] = newVHost
@@ -177,6 +178,14 @@ func (s *server) GetVHost(name string) (*vHost, error) {
 	return vhost, nil
 }
 
+// lookupExchange returns the named exchange, or nil when it does not exist.
+func (vh *vHost) lookupExchange(name string) *exchange {
+	vh.mu.RLock()
+	defer vh.mu.RUnlock()
+
+	return vh.exchanges[name]
+}
+
 // IsDeleting returns true if the vhost is being deleted
 func (vh *vHost) IsDeleting() bool {
 	return vh.deleting.Load()
@@ -233,14 +242,16 @@ func (vh *vHost) cleanup(s *server) { // s *Server is used for logging
 		ex.mu.Lock()
 		s.Debug("VHost '%s': Clearing bindings for exchange '%s'.", vh.name, exchangeName)
 		ex.Bindings = make(map[string][]string) // Clear bindings
+		ex.ExchangeBindings = make(map[string][]string)
 		ex.mu.Unlock()
 	}
 	vh.exchanges = make(map[string]*exchange) // Reset the map
 	// Re-add the default "" exchange.
 	vh.exchanges[""] = &exchange{
-		Name:     "",
-		Type:     "direct",
-		Bindings: make(map[string][]string),
+		Name:             "",
+		Type:             "direct",
+		Bindings:         make(map[string][]string),
+		ExchangeBindings: make(map[string][]string),
 	}
 
 	s.Info("VHost '%s': Internal resource cleanup complete.", vh.name)

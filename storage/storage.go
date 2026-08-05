@@ -14,9 +14,12 @@ const (
 	KeyPrefixExchange = "exchange:"
 	KeyPrefixQueue    = "queue:"
 	KeyPrefixBinding  = "binding:"
-	KeyPrefixMessage  = "message:"
-	KeyPrefixMsgIndex = "msgidx:" // Message index by queue
-	KeySeqCounter     = "system:msgseqno" // Global message sequence counter
+	// KeyPrefixExBinding covers exchange-to-exchange bindings. It deliberately does not
+	// start with KeyPrefixExchange, so an exchange prefix scan never picks these up.
+	KeyPrefixExBinding = "exbinding:"
+	KeyPrefixMessage   = "message:"
+	KeyPrefixMsgIndex  = "msgidx:"         // Message index by queue
+	KeySeqCounter      = "system:msgseqno" // Global message sequence counter
 )
 
 // StorageProvider is the low-level storage abstraction

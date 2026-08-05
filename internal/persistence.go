@@ -49,6 +49,10 @@ func BindingKey(vhost, exchange, queue, routingKey string) string {
 	return storage.KeyPrefixBinding + encodeKeySegment(vhost) + ":" + encodeKeySegment(exchange) + ":" + encodeKeySegment(queue) + ":" + encodeKeySegment(routingKey)
 }
 
+func ExchangeBindingKey(vhost, source, destination, routingKey string) string {
+	return storage.KeyPrefixExBinding + encodeKeySegment(vhost) + ":" + encodeKeySegment(source) + ":" + encodeKeySegment(destination) + ":" + encodeKeySegment(routingKey)
+}
+
 func MessageKey(vhost, queue, messageId string) string {
 	return storage.KeyPrefixMessage + encodeKeySegment(vhost) + ":" + encodeKeySegment(queue) + ":" + encodeKeySegment(messageId)
 }
@@ -123,6 +127,14 @@ type BindingRecord struct {
 	CreatedAt  time.Time              `json:"created_at"`
 }
 
+type ExchangeBindingRecord struct {
+	Source      string                 `json:"source"`
+	Destination string                 `json:"destination"`
+	RoutingKey  string                 `json:"routing_key"`
+	Arguments   map[string]interface{} `json:"arguments,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+}
+
 type MessageRecord struct {
 	ID          string                 `json:"id"`          // Unique message identifier
 	Exchange    string                 `json:"exchange"`    // Original exchange
@@ -168,19 +180,21 @@ func ExchangeToRecord(e *exchange) *ExchangeRecord {
 		Durable:    e.Durable,
 		AutoDelete: e.AutoDelete,
 		Internal:   e.Internal,
-		Arguments:  nil, // TODO: Add arguments field to Exchange struct
+		Arguments:  e.Arguments,
 		CreatedAt:  time.Now(),
 	}
 }
 
 func RecordToExchange(r *ExchangeRecord) *exchange {
 	return &exchange{
-		Name:       r.Name,
-		Type:       r.Type,
-		Durable:    r.Durable,
-		AutoDelete: r.AutoDelete,
-		Internal:   r.Internal,
-		Bindings:   make(map[string][]string),
+		Name:             r.Name,
+		Type:             r.Type,
+		Durable:          r.Durable,
+		AutoDelete:       r.AutoDelete,
+		Internal:         r.Internal,
+		Bindings:         make(map[string][]string),
+		ExchangeBindings: make(map[string][]string),
+		Arguments:        r.Arguments,
 	}
 }
 
@@ -581,6 +595,49 @@ func (pm *PersistenceManager) LoadAllBindings(vhostName string) ([]*BindingRecor
 	return bindings, nil
 }
 
+// --- Exchange Binding Operations ---
+
+func (pm *PersistenceManager) SaveExchangeBinding(vhostName string, record *ExchangeBindingRecord) error {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshaling exchange binding record: %w", err)
+	}
+	key := ExchangeBindingKey(vhostName, record.Source, record.Destination, record.RoutingKey)
+	return pm.storage.Set(key, data)
+}
+
+func (pm *PersistenceManager) DeleteExchangeBinding(vhostName, source, destination, routingKey string) error {
+	return pm.storage.Delete(ExchangeBindingKey(vhostName, source, destination, routingKey))
+}
+
+func (pm *PersistenceManager) LoadAllExchangeBindings(vhostName string) ([]*ExchangeBindingRecord, error) {
+	prefix := storage.KeyPrefixExBinding + vhostName + ":"
+	keys, err := pm.storage.Keys(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing exchange binding keys: %w", err)
+	}
+
+	bindings := make([]*ExchangeBindingRecord, 0, len(keys))
+	for _, key := range keys {
+		data, err := pm.storage.Get(key)
+		if err != nil {
+			if err == storage.ErrKeyNotFound {
+				continue
+			}
+			return nil, fmt.Errorf("getting exchange binding %s: %w", key, err)
+		}
+
+		var record ExchangeBindingRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			pm.logger.Warn("Failed to unmarshal exchange binding record %s: %v", key, err)
+			continue
+		}
+		bindings = append(bindings, &record)
+	}
+
+	return bindings, nil
+}
+
 // --- Message Operations ---
 
 func (pm *PersistenceManager) SaveMessage(vhostName, queueName string, record *MessageRecord) error {
@@ -785,6 +842,17 @@ func (pm *PersistenceManager) DeleteAllVHostData(vhostName string) error {
 	if err := tx.DeleteBatch(bindingKeys); err != nil {
 		tx.Rollback()
 		return fmt.Errorf("deleting bindings: %w", err)
+	}
+
+	// Delete all exchange-to-exchange bindings
+	exchangeBindingKeys, err := pm.storage.Keys(storage.KeyPrefixExBinding + vhostName + ":")
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("listing exchange bindings: %w", err)
+	}
+	if err := tx.DeleteBatch(exchangeBindingKeys); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("deleting exchange bindings: %w", err)
 	}
 
 	// Delete all messages
