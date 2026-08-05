@@ -217,6 +217,7 @@ func (vh *vHost) cleanup(s *server) { // s *Server is used for logging
 		s.Debug("VHost '%s': Clearing messages and bindings for queue '%s'.", vh.name, queueName)
 		q.Messages = nil // Clear messages
 		q.Bindings = make(map[string]bool)
+		q.stopExpiryTimerLocked()
 		if len(q.Consumers) > 0 { // Should be empty if stopAllConsumers worked
 			s.Warn("VHost '%s', Queue '%s': Consumers map not empty during final cleanup. Force clearing.", vh.name, queueName)
 			for tag, consumer := range q.Consumers {

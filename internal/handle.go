@@ -796,6 +796,20 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 	c.server.Info("Processing queue.declare: name='%s', passive=%v, durable=%v, exclusive=%v, autoDelete=%v, noWait=%v, args=%v on channel %d",
 		queueNameIn, passive, durable, exclusive, autoDelete, noWait, args, channelId)
 
+	// Validate dead-letter/TTL/length arguments. Passive declares ignore
+	// arguments entirely (RabbitMQ-compatible), so only non-passive declares
+	// are validated.
+	var parsedArgs queueArgs
+	if !passive {
+		var errParse error
+		parsedArgs, errParse = parseQueueArgs(args)
+		if errParse != nil {
+			replyText := fmt.Sprintf("PRECONDITION_FAILED - %v", errParse)
+			c.server.Warn("Queue.Declare: %s. Sending Channel.Close.", replyText)
+			return c.sendChannelClose(channelId, amqpError.PreconditionFailed.Code(), replyText, uint16(ClassQueue), MethodQueueDeclare)
+		}
+	}
+
 	var actualQueueName = queueNameIn
 	var messageCount uint32 = 0
 	var consumerCount uint32 = 0
@@ -884,7 +898,8 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 			// Also consider autoDelete and arguments for full compliance.
 			propertiesMatch := (q.Durable == durable &&
 				q.Exclusive == exclusive &&
-				q.AutoDelete == autoDelete) // && areTablesEqual(q.Arguments, args)
+				q.AutoDelete == autoDelete &&
+				q.args.equivalent(parsedArgs))
 
 			if !propertiesMatch {
 				q.mu.RUnlock()
@@ -913,6 +928,8 @@ func (c *connection) handleMethodQueueDeclare(reader *bytes.Reader, channelId ui
 				Durable:    durable,
 				Exclusive:  exclusive,
 				AutoDelete: autoDelete,
+				Arguments:  args,
+				args:       parsedArgs,
 				ownerConn:  owner,
 				notify:     make(chan struct{}, 1),
 			}
@@ -1203,6 +1220,7 @@ func (c *connection) handleMethodQueueDelete(reader *bytes.Reader, channelId uin
 	queue.Messages = nil
 	queue.Consumers = make(map[string]*consumer)
 	queue.Bindings = make(map[string]bool)
+	queue.stopExpiryTimerLocked()
 
 	queue.mu.Unlock()
 
@@ -1627,21 +1645,33 @@ func (c *connection) handleMethodBasicGet(reader *bytes.Reader, channelId uint16
 		return c.sendChannelClose(channelId, amqpError.NotFound.Code(), replyText, uint16(ClassBasic), MethodBasicGet)
 	}
 
-	// Try to get a message from the queue
-	queue.mu.Lock()
+	// Try to get a message from the queue, dead-lettering any expired
+	// messages at the head that the expiry timer hasn't collected yet.
+	var msg message
+	var messageCount uint32
+	for {
+		queue.mu.Lock()
 
-	if len(queue.Messages) == 0 {
+		if len(queue.Messages) == 0 {
+			queue.mu.Unlock()
+			// Send Basic.GetEmpty
+			c.server.Info("No messages available in queue '%s' for basic.get", queueName)
+			return c.sendBasicGetEmpty(channelId)
+		}
+
+		if expired, ok := takeExpiredHeadLocked(queue, time.Now()); ok {
+			queue.mu.Unlock()
+			c.server.deadLetterExpiredFromQueue(vhost, queue, &expired)
+			continue
+		}
+
+		// Get the first message
+		msg = queue.Messages[0]
+		queue.Messages = queue.Messages[1:]
+		messageCount = uint32(len(queue.Messages))
 		queue.mu.Unlock()
-		// Send Basic.GetEmpty
-		c.server.Info("No messages available in queue '%s' for basic.get", queueName)
-		return c.sendBasicGetEmpty(channelId)
+		break
 	}
-
-	// Get the first message
-	msg := queue.Messages[0]
-	queue.Messages = queue.Messages[1:]
-	messageCount := uint32(len(queue.Messages))
-	queue.mu.Unlock()
 
 	// Get channel for delivery tag management
 	ch, exists, isClosing := c.getChannel(channelId)
@@ -2416,6 +2446,7 @@ func (c *connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 				queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 				c.server.Info("Requeued message to queue '%s' (original delivery tag %d on channel %d)", unacked.QueueName, unacked.DeliveryTag, channelId)
 				affectedQueues[unacked.QueueName] = true
+				c.server.scheduleExpiryLocked(vhost, queue)
 				queue.mu.Unlock()
 				queue.wake()
 			} else {
@@ -2443,6 +2474,17 @@ func (c *connection) handleMethodBasicNack(reader *bytes.Reader, channelId uint1
 					msgInfo.QueueName, msgInfo.MessageId); err != nil {
 					c.server.Err("Failed to delete nacked message %s from persistence: %v", msgInfo.MessageId, err)
 				}
+			}
+		}
+
+		// Dead-letter each nacked message whose queue has a DLX configured.
+		vhost := c.vhost
+		for _, unacked := range messagesToProcess {
+			vhost.mu.RLock()
+			sourceQueue, qExists := vhost.queues[unacked.QueueName]
+			vhost.mu.RUnlock()
+			if qExists && sourceQueue != nil {
+				c.server.deadLetterMessage(vhost, sourceQueue, &unacked.Message, deathReasonRejected)
 			}
 		}
 	}
@@ -2534,6 +2576,7 @@ func (c *connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 			queue.mu.Lock()
 			queue.Messages = append([]message{unacked.Message}, queue.Messages...)
 			c.server.Info("Requeued rejected message to queue '%s' (delivery tag %d on channel %d)", unacked.QueueName, deliveryTag, channelId)
+			c.server.scheduleExpiryLocked(vhost, queue)
 			queue.mu.Unlock()
 			queue.wake()
 		} else {
@@ -2548,6 +2591,15 @@ func (c *connection) handleMethodBasicReject(reader *bytes.Reader, channelId uin
 				messageToDelete.QueueName, messageToDelete.MessageId); err != nil {
 				c.server.Err("Failed to delete rejected message %s from persistence: %v", messageToDelete.MessageId, err)
 			}
+		}
+
+		// Dead-letter the rejected message if its queue has a DLX configured.
+		vhost := c.vhost
+		vhost.mu.RLock()
+		sourceQueue, qExists := vhost.queues[unacked.QueueName]
+		vhost.mu.RUnlock()
+		if qExists && sourceQueue != nil {
+			c.server.deadLetterMessage(vhost, sourceQueue, &unacked.Message, deathReasonRejected)
 		}
 	}
 
@@ -2884,6 +2936,13 @@ func (c *connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 		QueueName string
 	}
 
+	// Messages nacked with requeue=false are dead-lettered (if their queue
+	// has a DLX) once the channel lock is released.
+	var messagesToDeadLetter []struct {
+		Message   message
+		QueueName string
+	}
+
 	// Process negative acknowledgements
 	for _, nack := range nacksToProcess {
 		if nack.Multiple {
@@ -2898,12 +2957,21 @@ func (c *connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 							Message:   unacked.Message,
 							QueueName: unacked.QueueName,
 						})
-					} else if unacked.Message.Properties.DeliveryMode == 2 {
-						// Not requeuing and message is persistent - delete from storage
-						messagesToDelete = append(messagesToDelete, AckedMessageInfo{
-							MessageId: GetMessageIdentifier(&unacked.Message),
+					} else {
+						if unacked.Message.Properties.DeliveryMode == 2 {
+							// Not requeuing and message is persistent - delete from storage
+							messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+								MessageId: GetMessageIdentifier(&unacked.Message),
+								QueueName: unacked.QueueName,
+								VHostName: c.vhost.name,
+							})
+						}
+						messagesToDeadLetter = append(messagesToDeadLetter, struct {
+							Message   message
+							QueueName string
+						}{
+							Message:   unacked.Message,
 							QueueName: unacked.QueueName,
-							VHostName: c.vhost.name,
 						})
 					}
 					delete(ch.unackedMessages, tag)
@@ -2921,12 +2989,21 @@ func (c *connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 						Message:   unacked.Message,
 						QueueName: unacked.QueueName,
 					})
-				} else if unacked.Message.Properties.DeliveryMode == 2 {
-					// Not requeuing and message is persistent - delete from storage
-					messagesToDelete = append(messagesToDelete, AckedMessageInfo{
-						MessageId: GetMessageIdentifier(&unacked.Message),
+				} else {
+					if unacked.Message.Properties.DeliveryMode == 2 {
+						// Not requeuing and message is persistent - delete from storage
+						messagesToDelete = append(messagesToDelete, AckedMessageInfo{
+							MessageId: GetMessageIdentifier(&unacked.Message),
+							QueueName: unacked.QueueName,
+							VHostName: c.vhost.name,
+						})
+					}
+					messagesToDeadLetter = append(messagesToDeadLetter, struct {
+						Message   message
+						QueueName string
+					}{
+						Message:   unacked.Message,
 						QueueName: unacked.QueueName,
-						VHostName: c.vhost.name,
 					})
 				}
 				delete(ch.unackedMessages, nack.DeliveryTag)
@@ -2949,8 +3026,23 @@ func (c *connection) handleMethodTxCommit(reader *bytes.Reader, channelId uint16
 				item.Message.Redelivered = true
 				queue.mu.Lock()
 				queue.Messages = append([]message{item.Message}, queue.Messages...)
+				c.server.scheduleExpiryLocked(vhost, queue)
 				queue.mu.Unlock()
+				queue.wake()
 				c.server.Debug("Requeued message to queue '%s' via transaction commit", item.QueueName)
+			}
+		}
+	}
+
+	// Dead-letter messages nacked with requeue=false in this transaction.
+	if len(messagesToDeadLetter) > 0 {
+		vhost := c.vhost
+		for _, item := range messagesToDeadLetter {
+			vhost.mu.RLock()
+			sourceQueue, exists := vhost.queues[item.QueueName]
+			vhost.mu.RUnlock()
+			if exists && sourceQueue != nil {
+				c.server.deadLetterMessage(vhost, sourceQueue, &item.Message, deathReasonRejected)
 			}
 		}
 	}

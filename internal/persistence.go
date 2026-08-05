@@ -190,12 +190,21 @@ func QueueToRecord(q *queue) *QueueRecord {
 		Durable:    q.Durable,
 		Exclusive:  q.Exclusive,
 		AutoDelete: q.AutoDelete,
-		Arguments:  nil, // TODO: Add arguments field to Queue struct
+		Arguments:  q.Arguments,
 		CreatedAt:  time.Now(),
 	}
 }
 
 func RecordToQueue(r *QueueRecord) *queue {
+	// Re-parse the persisted arguments so recovered queues keep enforcing
+	// dead-letter/TTL/length semantics. JSON round-trips integers as
+	// float64; parseQueueArgs normalizes them. Arguments that persisted
+	// successfully were valid at declare time, so a parse error here only
+	// means the stored data was corrupted — treat as no special arguments.
+	parsedArgs, err := parseQueueArgs(r.Arguments)
+	if err != nil {
+		parsedArgs = queueArgs{messageTTL: -1, maxLength: -1}
+	}
 	return &queue{
 		Name:       r.Name,
 		Messages:   []message{},
@@ -204,6 +213,8 @@ func RecordToQueue(r *QueueRecord) *queue {
 		Durable:    r.Durable,
 		Exclusive:  r.Exclusive,
 		AutoDelete: r.AutoDelete,
+		Arguments:  r.Arguments,
+		args:       parsedArgs,
 		notify:     make(chan struct{}, 1),
 	}
 }

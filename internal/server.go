@@ -131,6 +131,11 @@ type message struct {
 	Body        []byte
 	Redelivered bool
 	bodySize    uint64 // expected body size from content header; used during assembly only
+
+	// expiresAt is the TTL deadline stamped when the message is enqueued
+	// (zero = never expires). Deadlines survive requeues: TTL is measured
+	// from the original arrival in the queue.
+	expiresAt time.Time
 }
 
 func (m *message) DeepCopy() *message {
@@ -177,6 +182,7 @@ func (m *message) DeepCopy() *message {
 		Properties:  propsCopy,
 		Body:        bodyCopy,
 		Redelivered: m.Redelivered,
+		expiresAt:   m.expiresAt,
 	}
 }
 
@@ -188,8 +194,15 @@ type queue struct {
 	Durable    bool
 	Exclusive  bool
 	AutoDelete bool
+	Arguments  map[string]interface{} // raw queue.declare arguments (persisted for durable queues)
+	args       queueArgs              // parsed dead-letter/TTL/length arguments
 	ownerConn  *connection // non-nil only when Exclusive == true; set at declaration time
 	mu         sync.RWMutex
+
+	// expiryTimer drives message TTL: armed for the earliest deadline in
+	// Messages (see scheduleExpiryLocked), owned by the queue, disarmed via
+	// stopExpiryTimerLocked on queue deletion, vhost cleanup, and shutdown.
+	expiryTimer *time.Timer
 
 	// notify is a buffered (cap 1) "doorbell": ringing it wakes an idle consumer
 	// immediately instead of waiting for the delivery poll. Signals coalesce into a
@@ -271,6 +284,7 @@ type server struct {
 	customLogger   logger.Logger // External logger interface, if provided
 	mu             sync.RWMutex
 	isReady        atomic.Bool // Track if server is ready to accept connections
+	shuttingDown   atomic.Bool // Set at the start of Shutdown; stops TTL timers from re-arming
 
 	// Authentication fields
 	authMode    config.AuthMode
@@ -655,8 +669,9 @@ func (s *server) Start(addr string) error {
 func (s *server) Shutdown(ctx context.Context) error {
 	s.Info("Shutting down AMQP server...")
 
-	// Mark server as not ready
+	// Mark server as not ready and stop TTL timers from re-arming
 	s.isReady.Store(false)
+	s.shuttingDown.Store(true)
 
 	// 1. Stop accepting new connections
 	if ln := s.getListener(); ln != nil {
@@ -705,7 +720,21 @@ func (s *server) Shutdown(ctx context.Context) error {
 		s.connectionsMu.RUnlock()
 	}
 
-	// 4. Close persistence layer
+	// 4. Stop queue expiry timers so no TTL callback races the persistence
+	// layer teardown below.
+	s.mu.RLock()
+	for _, vh := range s.vhosts {
+		vh.mu.RLock()
+		for _, q := range vh.queues {
+			q.mu.Lock()
+			q.stopExpiryTimerLocked()
+			q.mu.Unlock()
+		}
+		vh.mu.RUnlock()
+	}
+	s.mu.RUnlock()
+
+	// 5. Close persistence layer
 	if s.persistenceManager != nil {
 		if err := s.persistenceManager.Close(); err != nil {
 			s.Err("Error closing persistence manager: %v", err)
@@ -849,10 +878,15 @@ func (s *server) recoverVHostEntities(vhostName string) error {
 
 			if exists {
 				queue.mu.Lock()
+				now := time.Now()
 				for _, msgRec := range messageRecords {
 					message := RecordToMessage(msgRec)
+					// TTL clocks restart on recovery: original arrival times
+					// are not persisted.
+					message.expiresAt = queue.args.messageDeadline(message, now)
 					queue.Messages = append(queue.Messages, *message)
 				}
+				s.scheduleExpiryLocked(vhost, queue)
 				queue.mu.Unlock()
 
 				s.Info("Recovered %d messages for queue %s in vhost %s",
@@ -1703,84 +1737,11 @@ func (c *connection) handleBody(frame *frame) {
 	c.deliverMessage(messageToDeliver, frame.Channel)
 }
 
-// RouteMessage handles all exchange type routing logic
+// RouteMessage handles all exchange type routing logic. The actual logic
+// lives in routeInVHost so server-side republishing (dead-lettering) can
+// route without a client connection.
 func (c *connection) routeMessage(msg *message) ([]string, error) {
-	vhost := c.vhost
-
-	if msg.Exchange == "" { // Default exchange routes directly to queue by name
-		vhost.mu.RLock()
-		_, exists := vhost.queues[msg.RoutingKey]
-		vhost.mu.RUnlock()
-
-		if exists {
-			return []string{msg.RoutingKey}, nil
-		}
-		return nil, nil
-	}
-
-	vhost.mu.RLock()
-	exchange := vhost.exchanges[msg.Exchange]
-	vhost.mu.RUnlock()
-
-	if exchange == nil {
-		return nil, fmt.Errorf("exchange '%s' not found", msg.Exchange)
-	}
-
-	exchange.mu.RLock()
-	defer exchange.mu.RUnlock()
-
-	switch exchange.Type {
-	case "direct":
-		return c.routeDirect(exchange, msg.RoutingKey), nil
-	case "fanout":
-		return c.routeFanout(exchange), nil
-	case "topic":
-		return c.routeTopic(exchange, msg.RoutingKey), nil
-	// case "headers": // Not implemented yet
-	default:
-		return nil, fmt.Errorf("unknown exchange type: %s", exchange.Type)
-	}
-}
-
-// routeDirect returns queues bound with exact routing key match
-func (c *connection) routeDirect(exchange *exchange, routingKey string) []string {
-	return exchange.Bindings[routingKey]
-}
-
-// routeFanout returns all queues bound to the exchange
-func (c *connection) routeFanout(exchange *exchange) []string {
-	queues := make([]string, 0)
-	queueSet := make(map[string]bool)
-
-	for _, boundQueues := range exchange.Bindings {
-		for _, queueName := range boundQueues {
-			if !queueSet[queueName] {
-				queueSet[queueName] = true
-				queues = append(queues, queueName)
-			}
-		}
-	}
-
-	return queues
-}
-
-// routeTopic returns queues with topic pattern matching
-func (c *connection) routeTopic(exchange *exchange, routingKey string) []string {
-	queues := make([]string, 0)
-	queueSet := make(map[string]bool)
-
-	for pattern, boundQueues := range exchange.Bindings {
-		if topicMatch(pattern, routingKey) {
-			for _, queueName := range boundQueues {
-				if !queueSet[queueName] {
-					queueSet[queueName] = true
-					queues = append(queues, queueName)
-				}
-			}
-		}
-	}
-
-	return queues
+	return routeInVHost(c.vhost, msg.Exchange, msg.RoutingKey)
 }
 
 func (c *connection) deliverMessage(msg *message, channelId uint16) {
@@ -2183,47 +2144,11 @@ func (c *connection) deliverToQueue(queueName string, msg *message) error {
 		return fmt.Errorf("queue %s not found", queueName)
 	}
 
-	msgCopy := msg.DeepCopy()
-
-	// For persistent messages to durable queues, use transactions
-	if c.server.persistenceManager != nil &&
-		msg.Properties.DeliveryMode == 2 &&
-		queue.Durable {
-
-		// Start transaction
-		tx, err := c.server.persistenceManager.BeginTransaction()
-		if err != nil {
-			return fmt.Errorf("beginning transaction: %w", err)
-		}
-
-		// Prepare message record
-		messageId := GetMessageIdentifier(msgCopy)
-		record := MessageToRecord(msgCopy, messageId, 0)
-
-		// Save to transaction
-		if err := tx.SaveMessage(vhost.name, queueName, record); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("saving message to transaction: %w", err)
-		}
-
-		// Commit persistence
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("committing message: %w", err)
-		}
-
-		// Only add to memory after successful persistence
-		queue.mu.Lock()
-		queue.Messages = append(queue.Messages, *msgCopy)
-		queue.mu.Unlock()
-	} else {
-		// Non-persistent or non-durable: just add to memory
-		queue.mu.Lock()
-		queue.Messages = append(queue.Messages, *msgCopy)
-		queue.mu.Unlock()
+	// Central enqueue: persistence, x-max-length enforcement, TTL stamping,
+	// and consumer wakeup all live in enqueueMessage.
+	if err := c.server.enqueueMessage(vhost, queue, msg); err != nil {
+		return err
 	}
-
-	// Wake an idle consumer immediately instead of letting it wait out the poll.
-	queue.wake()
 
 	// Read the count under the lock: deliverMessages mutates queue.Messages
 	// concurrently, and immediate wakeup makes that overlap the common case.
@@ -2333,6 +2258,14 @@ func (c *connection) deliverMessages(channelId uint16, consumerTag string, consu
 			queue.mu.Unlock()
 			c.server.Info("Consumer %s no longer registered, stopping delivery", consumerTag)
 			return
+		}
+
+		// Never deliver a message whose TTL passed before the expiry timer
+		// collected it: dead-letter it and look at the next one.
+		if expired, ok := takeExpiredHeadLocked(queue, time.Now()); ok {
+			queue.mu.Unlock()
+			c.server.deadLetterExpiredFromQueue(c.vhost, queue, &expired)
+			continue
 		}
 
 		// Peek at the first message to check if it would exceed size limit
